@@ -88,6 +88,8 @@ const INDEX: &str = r##"<!doctype html>
   .pill.warn { color: var(--warn); border-color: var(--warn); }
   .pill.ok { color: var(--ok); border-color: var(--ok); }
   .pill.busy { color: var(--accent); border-color: var(--accent); }
+  .cmdid { cursor: pointer; border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; margin-left: 6px; }
+  .cmdid:hover { color: var(--accent); border-color: var(--accent); }
   .pill.busy::before {
     content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 5px;
     border-radius: 50%; background: var(--accent); animation: pulse 1.1s ease-in-out infinite;
@@ -576,6 +578,11 @@ function scanCard(issues, held, id, connected) {
         <h3><span class="pill bad">${esc(i.backend)}</span> ${esc(i.problem)}</h3>
         ${i.remedy ? `<pre>${esc(i.remedy)}</pre>` : ""}
       </div>`).join("")}
+      ${issues.some((i) => i.backend === "winget" || i.backend === "windowsupdate")
+        ? `<button class="act" ${connected ? "" : "disabled"} style="margin-top:10px"
+             title="Installs the NuGet provider, PSWindowsUpdate, and repairs winget for all users. Downloads from the PowerShell Gallery."
+             onclick="installPrereqs('${id}')">Install the missing tooling</button>`
+        : ""}
     </div>` : ""}
     ${held.length ? `<div class="step">
       <h3><span class="pill warn">held back</span> ${held.length} upgrade(s) apt will not apply</h3>
@@ -783,7 +790,7 @@ async function loadAgent(id) {
         const out = (c.detail || c.progress || "").trim();
         return `<div style="padding:10px 14px;border-bottom:1px solid var(--line)">
           <div>${st} <b>${esc(c.kind)}</b>
-            <span class="msg">&middot; ${new Date(c.created_at).toLocaleString()} &middot; ${ago(c.created_at)}</span></div>
+            <span class="msg">&middot; ${new Date(c.created_at).toLocaleString()} &middot; ${ago(c.created_at)}</span><span class="mono msg cmdid" title="${esc(c.id)} - click to copy" onclick="copyText('${esc(c.id)}', this)">${esc(c.id.slice(0, 8))}</span></div>
           ${c.summary ? `<div class="mono" style="margin-top:4px">${esc(c.summary)}</div>` : ""}
           ${out ? `<details data-k="${esc(c.id)}"><summary>output</summary><pre>${esc(out)}</pre></details>` : ""}
         </div>`;
@@ -897,6 +904,26 @@ async function loadAdd() {
 
 // The async clipboard API needs a secure context, and this portal is plain
 // HTTP, so fall back to the old selection trick rather than silently failing.
+function copyText(text, el) {
+  const flash = () => {
+    const o = el.textContent;
+    el.textContent = "copied";
+    setTimeout(() => (el.textContent = o), 900);
+  };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(flash);
+    return;
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand("copy"); flash(); } catch (e) { /* select manually */ }
+  document.body.removeChild(ta);
+}
+
 function copyCmd(id) {
   const text = $(id).textContent;
   const done = (btn) => { const o = btn.textContent; btn.textContent = "Copied"; setTimeout(() => (btn.textContent = o), 1200); };
@@ -961,7 +988,7 @@ async function loadActivity() {
     const body = (c.detail || c.progress || "").trim();
     return `<div style="padding:10px 14px;border-bottom:1px solid var(--line)">
       <div>${state} <b>${esc(c.kind)}</b> on ${esc(host(c.agent_id))}
-        <span class="msg">· ${ago(c.created_at)}</span></div>
+        <span class="msg">· ${ago(c.created_at)}</span><span class="mono msg cmdid" title="${esc(c.id)} - click to copy" onclick="copyText('${esc(c.id)}', this)">${esc(c.id.slice(0, 8))}</span></div>
       ${c.summary ? `<div class="mono" style="margin-top:4px">${esc(c.summary)}</div>` : ""}
       ${body ? `<details data-k="${esc(c.id)}"><summary>output</summary><pre>${esc(body)}</pre></details>` : ""}
     </div>`;
@@ -971,6 +998,12 @@ async function loadActivity() {
 
 // Patching restarts services and can demand a reboot, so it is the one
 // per-machine action that asks first.
+async function installPrereqs(id) {
+  const warn = "Install the missing update tooling on this machine? This downloads PSWindowsUpdate and the WinGet client from the PowerShell Gallery and repairs winget for all users. Restart the agent service afterwards so the new backends are detected.";
+  if (!confirm(warn)) return;
+  await cmd(id, "install_prerequisites");
+}
+
 async function fullUpgrade(id) {
   const warn = "Run a FULL upgrade? This can install new packages and remove existing ones. It is how held-back upgrades such as a kernel get applied.";
   if (!confirm(warn)) return;
