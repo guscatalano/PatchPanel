@@ -6,6 +6,7 @@
 //! customer sites at all.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -19,6 +20,14 @@ use crate::state::AppState;
 /// An agent that connects and then says nothing is either broken or hostile;
 /// either way it should not hold a slot.
 const HELLO_TIMEOUT_SECS: u64 = 15;
+
+/// Drop a connection that has gone quiet for this long.
+///
+/// A hung agent keeps its socket open, so without this the portal reports it as
+/// connected indefinitely and happily dispatches commands nothing will ever
+/// run. Agents heartbeat every 30s and ping every 20s, so silence this long
+/// means the far end is not working even if TCP still believes in it.
+const AGENT_SILENCE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub async fn handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
     ws.on_upgrade(move |socket| async move {
@@ -220,7 +229,21 @@ async fn read_loop(
     state: &Arc<AppState>,
     agent_id: AgentId,
 ) -> anyhow::Result<()> {
-    while let Some(frame) = stream.next().await {
+    loop {
+        // A silent socket is indistinguishable from a healthy idle one at the
+        // TCP layer, so impose a deadline rather than waiting forever.
+        let next = match tokio::time::timeout(AGENT_SILENCE_TIMEOUT, stream.next()).await {
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!(
+                    %agent_id,
+                    seconds = AGENT_SILENCE_TIMEOUT.as_secs(),
+                    "agent went silent; dropping the connection"
+                );
+                break;
+            }
+        };
+        let Some(frame) = next else { break };
         let frame = frame?;
         let text = match frame {
             Message::Text(t) => t,
