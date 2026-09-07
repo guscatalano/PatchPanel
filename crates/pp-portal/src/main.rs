@@ -49,11 +49,31 @@ struct Cli {
     ///
     /// Only for a network you fully trust: the API can publish a manifest that
     /// installs software on every agent, and can reboot the whole fleet.
-    #[arg(long, env = "PATCHPANEL_NO_ADMIN_AUTH")]
+    #[arg(
+        long,
+        env = "PATCHPANEL_NO_ADMIN_AUTH",
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+        value_parser = parse_flag,
+    )]
     no_admin_auth: bool,
 
     #[arg(long, default_value = "info")]
     log: String,
+}
+
+/// Accept the spellings an operator actually types in an env file. Clap's
+/// built-in bool parser takes only "true"/"false", which makes the obvious
+/// `PATCHPANEL_NO_ADMIN_AUTH=1` a startup failure.
+fn parse_flag(s: &str) -> std::result::Result<bool, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!(
+            "expected a boolean (1/0, true/false, yes/no, on/off), got `{other}`"
+        )),
+    }
 }
 
 #[tokio::main]
