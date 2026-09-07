@@ -165,7 +165,7 @@ const INDEX: &str = r##"<!doctype html>
         <h2>Agents</h2>
         <div class="scroll"><table>
           <thead><tr>
-            <th>Host</th><th>OS</th><th>Site</th><th>Agent</th>
+            <th>Host</th><th>IP</th><th>OS</th><th>Hardware</th><th>Site</th>
             <th>Updates</th><th>Drift</th><th>Devices</th><th>Manifest</th><th>Last seen</th><th></th>
           </tr></thead>
           <tbody id="agents"></tbody>
@@ -175,10 +175,14 @@ const INDEX: &str = r##"<!doctype html>
       <div class="card">
         <h2>Fleet actions</h2>
         <div class="bar">
-          <button class="act" onclick="broadcast('collect_inventory')">Collect inventory</button>
-          <button class="act" onclick="broadcast('apply_manifest')">Apply manifest</button>
-          <button class="act" onclick="broadcast('probe_devices')">Probe devices</button>
-          <button class="act" onclick="broadcast('discover')">Run discovery</button>
+          <button class="act" title="Re-read packages and updates on every connected machine. Changes nothing."
+            onclick="broadcast('collect_inventory')">Rescan all</button>
+          <button class="act" title="Make every machine's applications match the manifest."
+            onclick="broadcast('apply_manifest')">Apply manifest to all</button>
+          <button class="act" title="Re-probe every declared IoT device now."
+            onclick="broadcast('probe_devices')">Probe devices</button>
+          <button class="act" title="Sweep the manifest's discovery ranges for undeclared devices."
+            onclick="broadcast('discover')">Run discovery</button>
           <span id="broadcast-msg" class="msg"></span>
         </div>
       </div>
@@ -394,20 +398,35 @@ async function loadFleet() {
     const dev = a.device_count
       ? `${a.device_count}${a.device_problem_count ? ` <span class="pill bad">${a.device_problem_count}</span>` : ""}`
       : "-";
-    return `<tr>
-      <td><span class="dot ${live}"></span>${esc(a.hostname)}${a.reboot_required ? ' <span class="pill warn">reboot</span>' : ""}</td>
+    const hw = a.hardware || {};
+    const cpu = hw.cpu_model
+      ? `${esc(hw.cpu_model)}<div class="msg">${hw.cpu_cores || "?"}c/${hw.cpu_threads || "?"}t · ${hw.memory_mb ? (hw.memory_mb / 1024).toFixed(0) + " GB" : "? GB"}</div>`
+      : "-";
+    const ips = (hw.ip_addresses || []).length
+      ? `${esc(hw.ip_addresses[0])}${hw.ip_addresses.length > 1 ? `<div class="msg">+${hw.ip_addresses.length - 1} more</div>` : ""}`
+      : "-";
+    return `<tr title="${esc(hw.vendor || "")}">
+      <td><span class="dot ${live}"></span>${esc(a.hostname)}${a.reboot_required ? ' <span class="pill warn">reboot</span>' : ""}
+          <div class="msg">agent ${esc(a.agent_version)}</div></td>
+      <td class="mono">${ips}</td>
       <td>${esc(a.os_version)} <span class="mono">${esc(a.arch)}</span></td>
+      <td class="mono">${cpu}</td>
       <td>${esc(a.site) || "-"}</td>
-      <td class="mono">${esc(a.agent_version)}</td>
       <td>${upd}</td>
       <td>${a.drift_count ? `<span class="pill warn">${a.drift_count}</span>` : "-"}</td>
       <td>${dev}</td>
       <td class="mono">${a.applied_revision < REV ? `<span class="pill warn">r${a.applied_revision}</span>` : "r" + a.applied_revision}</td>
       <td>${ago(a.last_seen)}</td>
-      <td style="text-align:right">
-        <button class="act" ${a.connected ? "" : "disabled"} onclick="cmd('${a.id}','collect_inventory')">Scan</button>
-        <button class="act" ${a.connected ? "" : "disabled"} onclick="cmd('${a.id}','apply_patches')">Patch</button>
-        <button class="act" ${a.connected ? "" : "disabled"} onclick="cmd('${a.id}','apply_manifest')">Converge</button>
+      <td style="text-align:right; white-space:nowrap">
+        <button class="act" ${a.connected ? "" : "disabled"}
+          title="Re-read installed packages and check for available updates. Changes nothing."
+          onclick="cmd('${a.id}','collect_inventory')">Rescan</button>
+        <button class="act" ${a.connected ? "" : "disabled"}
+          title="Install this machine's pending OS updates now (apt/dnf on Linux, Windows Update). This changes the system and may require a reboot."
+          onclick="patchNow('${a.id}','${esc(a.hostname)}')">Install updates</button>
+        <button class="act" ${a.connected ? "" : "disabled"}
+          title="Install, upgrade or remove applications so the machine matches the manifest's desired state."
+          onclick="cmd('${a.id}','apply_manifest')">Apply manifest</button>
       </td>
     </tr>`;
   }).join("");
@@ -553,6 +572,15 @@ async function loadActivity() {
       ${body ? `<details><summary>output</summary><pre>${esc(body)}</pre></details>` : ""}
     </div>`;
   }).join("");
+}
+
+// Patching restarts services and can demand a reboot, so it is the one
+// per-machine action that asks first.
+async function patchNow(id, host) {
+  if (!confirm(`Install pending OS updates on ${host}?
+
+This can restart services and may require a reboot.`)) return;
+  await cmd(id, "apply_patches");
 }
 
 async function cmd(id, kind, extra = {}) {

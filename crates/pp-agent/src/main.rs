@@ -4,6 +4,7 @@
 
 mod config;
 mod exec;
+mod hardware;
 mod platform;
 mod probe;
 mod selfupdate;
@@ -404,6 +405,17 @@ async fn local_inventory() -> Result<()> {
     println!("arch:     {}", std::env::consts::ARCH);
     println!("backends: {}", pf.backend_names().join(", "));
     println!("reboot:   {}", pf.reboot_required().await);
+
+    let hw = hardware::collect();
+    println!("
+cpu:      {}", hw.cpu_model);
+    println!("cores:    {} physical / {} logical", hw.cpu_cores, hw.cpu_threads);
+    println!("memory:   {} MB ({:.1} GB)", hw.memory_mb, hw.memory_mb as f64 / 1024.0);
+    println!("ip:       {}", hw.ip_addresses.join(", "));
+    println!("kernel:   {}", hw.kernel);
+    if !hw.vendor.is_empty() {
+        println!("vendor:   {}", hw.vendor);
+    }
 
     let packages = pf.installed_packages(&p).await?;
     println!("\n{} installed package(s)", packages.len());

@@ -75,6 +75,17 @@ pub async fn run(cfg: Config) -> Result<()> {
     let state = Arc::new(Mutex::new(AgentState::load_or_init(&cfg.state_dir)?));
     let cfg = Arc::new(cfg);
 
+    // Static facts, read once: none of this changes while we run.
+    let hardware = Arc::new(crate::hardware::collect());
+    tracing::info!(
+        cpu = %hardware.cpu_model,
+        cores = hardware.cpu_cores,
+        threads = hardware.cpu_threads,
+        memory_mb = hardware.memory_mb,
+        ips = ?hardware.ip_addresses,
+        "hardware"
+    );
+
     {
         let s = state.lock().await;
         tracing::info!(
@@ -89,7 +100,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut backoff = Duration::from_secs(1);
     loop {
         let started = std::time::Instant::now();
-        let outcome = session(cfg.clone(), state.clone(), platform.clone()).await;
+        let outcome = session(cfg.clone(), state.clone(), platform.clone(), hardware.clone()).await;
         // A session that stayed up this long proves the portal is reachable and
         // that our credentials work. How it *ended* says nothing about that — a
         // portal restart severs the socket with "connection reset", which is an
@@ -135,6 +146,7 @@ async fn session(
     cfg: Arc<Config>,
     state: Arc<Mutex<AgentState>>,
     platform: Arc<Platform>,
+    hardware: Arc<pp_proto::Hardware>,
 ) -> Result<Disposition> {
     let (ws, _) = tokio_tungstenite::connect_async(cfg.portal_url.as_str())
         .await
@@ -198,7 +210,7 @@ async fn session(
             enrollment_token: (!cfg.enrollment_token.is_empty() && s.agent_token.is_none())
                 .then(|| cfg.enrollment_token.clone()),
             agent_token: s.agent_token.clone(),
-            system: system_info(&platform, &cfg.site),
+            system: system_info(&platform, &cfg.site, &hardware),
             applied_revision: s.applied_revision,
         });
     }
@@ -407,7 +419,7 @@ fn start_schedules(ctx: Ctx, schedules: &mut JoinSet<()>) {
 // Inventory
 // ---------------------------------------------------------------------------
 
-fn system_info(platform: &Platform, site: &str) -> SystemInfo {
+fn system_info(platform: &Platform, site: &str, hardware: &pp_proto::Hardware) -> SystemInfo {
     SystemInfo {
         hostname: gethostname::gethostname().to_string_lossy().into_owned(),
         os: OsKind::current(),
@@ -416,6 +428,7 @@ fn system_info(platform: &Platform, site: &str) -> SystemInfo {
         agent_version: AGENT_VERSION.to_string(),
         backends: platform.backend_names(),
         site: site.to_string(),
+        hardware: hardware.clone(),
     }
 }
 
