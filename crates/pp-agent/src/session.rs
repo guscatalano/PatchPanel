@@ -168,7 +168,7 @@ pub async fn run(cfg: Config) -> Result<()> {
 
         match outcome {
             Ok(Disposition::Restart) => {
-                tracing::info!("exiting for self-update; supervisor will restart");
+                tracing::info!("exiting so the supervisor restarts us");
                 return Ok(());
             }
             Ok(Disposition::Reconnect) => {
