@@ -17,6 +17,10 @@ pub struct AppState {
     pub enrollment_token: String,
     /// Bearer token for the dashboard and the REST API.
     pub admin_token: String,
+    /// When false, `/api/*` is served without authentication. Only sane on a
+    /// network you fully trust, because the API can install software on and
+    /// reboot every enrolled machine.
+    pub require_admin_auth: bool,
 }
 
 pub type SharedState = Arc<AppState>;

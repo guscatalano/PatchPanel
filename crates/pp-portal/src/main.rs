@@ -45,6 +45,13 @@ struct Cli {
     #[arg(long, env = "PATCHPANEL_ADMIN_TOKEN")]
     admin_token: Option<String>,
 
+    /// Serve the API and dashboard with no authentication at all.
+    ///
+    /// Only for a network you fully trust: the API can publish a manifest that
+    /// installs software on every agent, and can reboot the whole fleet.
+    #[arg(long, env = "PATCHPANEL_NO_ADMIN_AUTH")]
+    no_admin_auth: bool,
+
     #[arg(long, default_value = "info")]
     log: String,
 }
@@ -66,12 +73,17 @@ async fn main() -> Result<()> {
     let enrollment_token = cli.enrollment_token.unwrap_or_else(random_token);
     let admin_token = cli.admin_token.unwrap_or_else(random_token);
 
+    let require_admin_auth = !cli.no_admin_auth;
     let state = Arc::new(AppState {
         db: Db::open(&cli.db).context("opening the portal database")?,
         hub: Hub::new(),
         enrollment_token: enrollment_token.clone(),
         admin_token: admin_token.clone(),
+        require_admin_auth,
     });
+    if !require_admin_auth {
+        tracing::warn!("admin authentication is DISABLED; anyone who can reach this port controls the fleet");
+    }
 
     let manifest = state.db.manifest()?;
     let known = state.db.agents()?.len();
@@ -81,6 +93,7 @@ async fn main() -> Result<()> {
         // this route sits outside the admin-bearer middleware.
         .route("/api/agent/ws", get(ws::handler))
         .with_state(state.clone())
+        .merge(api::public_routes(state.clone()))
         .merge(api::routes(state.clone()))
         .merge(ui::routes())
         .layer(TraceLayer::new_for_http());
@@ -95,6 +108,7 @@ async fn main() -> Result<()> {
         &admin_token,
         generated_enrollment,
         generated_admin,
+        require_admin_auth,
         manifest.revision,
         known,
     );
@@ -119,6 +133,7 @@ fn banner(
     admin: &str,
     generated_enrollment: bool,
     generated_admin: bool,
+    require_admin_auth: bool,
     revision: u64,
     known: usize,
 ) {
@@ -133,7 +148,10 @@ fn banner(
     println!("  agent ws    ws://{host}/api/agent/ws");
     println!("  manifest    revision {revision}, {known} agent(s) on record\n");
 
-    if generated_admin {
+    if !require_admin_auth {
+        println!("  admin auth        DISABLED (--no-admin-auth)");
+        println!("                    anyone who can reach this port controls the fleet");
+    } else if generated_admin {
         // Only printed when generated: an operator-supplied token should not
         // be echoed into logs or a terminal recording.
         println!("  admin token       {admin}");
@@ -150,9 +168,17 @@ fn banner(
         println!("  --enrollment-token (or the matching env vars) to keep them stable.");
     }
 
+    // Never echo an operator-supplied secret: it would land in the journal,
+    // which is exactly what the "(from --enrollment-token)" line above claims
+    // does not happen.
+    let token_hint = if generated_enrollment {
+        enrollment
+    } else {
+        "$PATCHPANEL_ENROLLMENT_TOKEN"
+    };
     println!("\n  Enroll an agent with:");
     println!("    pp-agent enroll --portal ws://{host}/api/agent/ws \\");
-    println!("      --token {enrollment} --site <site>\n");
+    println!("      --token {token_hint} --site <site>\n");
 }
 
 async fn shutdown_signal() {

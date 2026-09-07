@@ -19,6 +19,18 @@ use uuid::Uuid;
 use crate::db::AgentBuild;
 use crate::state::{ApiError, ApiResult, SharedState};
 
+/// Routes served without authentication. Deliberately tiny: it exists so the
+/// dashboard can discover whether it needs to ask for a token at all.
+pub fn public_routes(state: SharedState) -> Router {
+    Router::new()
+        .route("/api/auth-mode", get(auth_mode))
+        .with_state(state)
+}
+
+async fn auth_mode(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    Json(json!({ "required": state.require_admin_auth }))
+}
+
 pub fn routes(state: SharedState) -> Router {
     Router::new()
         .route("/api/fleet", get(fleet))
@@ -43,6 +55,11 @@ async fn require_admin(
     req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    // Auth explicitly turned off by the operator.
+    if !state.require_admin_auth {
+        return next.run(req).await;
+    }
+
     let presented = req
         .headers()
         .get(header::AUTHORIZATION)

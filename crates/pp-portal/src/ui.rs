@@ -228,13 +228,17 @@ let TOKEN = localStorage.getItem("pp_token") || "";
 let TAB = "fleet";
 let AGENTS = [];
 let REV = 0;
+let AUTH_REQUIRED = true;
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
     ...opts,
     headers: { "Authorization": "Bearer " + TOKEN, "Content-Type": "application/json", ...(opts.headers || {}) },
   });
-  if (res.status === 401) { gate("That token was not accepted."); throw new Error("unauthorized"); }
+  if (res.status === 401 && AUTH_REQUIRED) {
+    gate("That token was not accepted.");
+    throw new Error("unauthorized");
+  }
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body.error || res.statusText);
   return body;
@@ -447,13 +451,25 @@ async function refresh() {
   }
 }
 
-if (!TOKEN) {
-  gate();
-  $("gate-msg").className = "msg";
-} else {
-  $("app").hidden = false;
-  refresh();
+// The portal can be run with authentication turned off for a trusted
+// network; ask it before deciding whether to demand a token.
+async function boot() {
+  try {
+    const mode = await fetch("/api/auth-mode").then((r) => r.json());
+    AUTH_REQUIRED = mode.required !== false;
+  } catch (e) {
+    // Unreachable or an older portal: assume auth is on rather than
+    // silently dropping the token from requests.
+  }
+  if (!AUTH_REQUIRED || TOKEN) {
+    $("app").hidden = false;
+    refresh();
+  } else {
+    gate();
+    $("gate-msg").className = "msg";
+  }
 }
+boot();
 // Polling covers both entry paths, and skips itself while the gate is up.
 setInterval(() => { if (!$("app").hidden) refresh(); }, 5000);
 </script>
