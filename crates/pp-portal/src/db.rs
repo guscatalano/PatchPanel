@@ -57,6 +57,11 @@ pub struct AgentRow {
     /// Release-readiness blockers, so the fleet list can warn before someone
     /// presses a button that would break the machine.
     pub release_blockers: usize,
+    /// Backends that could not be scanned. Non-zero means `update_count` is a
+    /// floor, not a total, and must not be shown as "clean".
+    pub scan_issue_count: usize,
+    /// Upgrades apt will not apply without a full upgrade.
+    pub held_back_count: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -338,6 +343,8 @@ impl Db {
                 drift_count: drift,
                 device_count: devices,
                 device_problem_count: device_problems,
+                scan_issue_count: inv.as_ref().map(|i| i.scan_issues.len()).unwrap_or(0),
+                held_back_count: inv.as_ref().map(|i| i.held_back.len()).unwrap_or(0),
                 release_blockers: inv
                     .as_ref()
                     .and_then(|i| i.release.as_ref())

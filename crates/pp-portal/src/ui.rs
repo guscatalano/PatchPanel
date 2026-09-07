@@ -455,11 +455,18 @@ async function loadFleet() {
     const unsafe_ = a.release_blockers > 0
       ? ` <span class="pill bad" title="This machine's package sources are misconfigured; installing updates could break it. Open the machine for details.">unsafe</span>`
       : "";
-    const upd = a.update_count
-      ? `${a.update_count}${a.security_count
-          ? ` <span class="pill bad" title="${a.security_count} of these are security updates - patch these first">${a.security_count} security</span>`
-          : ""}`
-      : `<span class="msg">none</span>`;
+    const held = a.held_back_count
+      ? ` <span class="pill warn" title="${a.held_back_count} upgrade(s) apt will not apply without a full upgrade - often a kernel">${a.held_back_count} held</span>`
+      : "";
+    // Zero updates from a machine we could not scan is not "clean", it is
+    // "unknown". Showing 0 there is the most dangerous thing this table could do.
+    const upd = a.scan_issue_count
+      ? `<span class="pill bad" title="Some package backends could not be scanned on this machine, so the real number is unknown. Open the machine for details.">not scanned</span>`
+      : (a.update_count
+          ? `${a.update_count}${a.security_count
+              ? ` <span class="pill bad" title="${a.security_count} of these are security updates - patch these first">${a.security_count} security</span>`
+              : ""}${held}`
+          : `<span class="msg">none</span>${held}`);
     const dev = a.device_count
       ? `${a.device_count}${a.device_problem_count ? ` <span class="pill bad">${a.device_problem_count}</span>` : ""}`
       : "-";
@@ -517,6 +524,51 @@ function kv(rows) {
     .filter(([, v]) => v !== null && v !== undefined && v !== "")
     .map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`)
     .join("") + `</dl>`;
+}
+
+function scanCard(issues, held, id, connected) {
+  if (!issues.length && !held.length) return "";
+  return `<div class="card">
+    <h2>Coverage</h2>
+    ${issues.length ? `<div class="step">
+      <div class="note" style="border-color:var(--bad)">
+        <b>This machine's update count is incomplete.</b> ${issues.length} backend(s)
+        could not be scanned, so treat the number as a floor, not a total.
+      </div>
+      ${issues.map((i) => `<div style="margin-top:10px">
+        <h3><span class="pill bad">${esc(i.backend)}</span> ${esc(i.problem)}</h3>
+        ${i.remedy ? `<pre>${esc(i.remedy)}</pre>` : ""}
+      </div>`).join("")}
+    </div>` : ""}
+    ${held.length ? `<div class="step">
+      <h3><span class="pill warn">held back</span> ${held.length} upgrade(s) apt will not apply</h3>
+      <p>A plain <code>apt upgrade</code> refuses anything needing new packages installed &mdash;
+         typically a kernel metapackage. These stay pending forever until a full upgrade runs,
+         which may also remove packages, so it is a deliberate action.</p>
+      <pre>${esc(held.join("
+"))}</pre>
+      <button class="act" ${connected ? "" : "disabled"}
+        title="Runs apt full-upgrade. This can install new packages and remove existing ones."
+        onclick="fullUpgrade('${id}')">Run full upgrade</button>
+    </div>` : ""}
+  </div>`;
+}
+
+function cleanupCard(c, id, connected) {
+  if (!c || (!(c.packages || []).length && !c.cache_bytes)) return "";
+  const mb = (n) => `${(n / 1e6).toFixed(0)} MB`;
+  return `<div class="card">
+    <h2>Cleanup</h2>
+    <div class="step">
+      <p>${(c.packages || []).length} package(s) are installed only as dependencies nothing
+         needs any more${c.reclaim_bytes ? `, holding ${mb(c.reclaim_bytes)}` : ""}.
+         The package cache holds a further ${mb(c.cache_bytes || 0)}, which is always safe to delete.</p>
+      ${(c.packages || []).length ? `<pre>${esc(c.packages.join(" "))}</pre>` : ""}
+      <button class="act" ${connected ? "" : "disabled"}
+        title="Runs apt autoremove and empties the package cache."
+        onclick="cleanupNow('${id}')">Clean up</button>
+    </div>
+  </div>`;
 }
 
 function releaseCard(rel) {
@@ -698,6 +750,10 @@ async function loadAgent(id) {
       }).join("") : `<div class="empty">Nothing has changed this machine yet.</div>`}
     </div>
 
+    ${scanCard(inv.scan_issues || [], inv.held_back || [], d.id, d.connected)}
+
+    ${cleanupCard(inv.cleanup, d.id, d.connected)}
+
     ${releaseCard(inv.release)}
 
     ${repoCard(inv.repositories || [], d.repo_diff || {})}
@@ -875,6 +931,18 @@ async function loadActivity() {
 
 // Patching restarts services and can demand a reboot, so it is the one
 // per-machine action that asks first.
+async function fullUpgrade(id) {
+  if (!confirm("Run a FULL upgrade?
+
+This can install new packages and remove existing ones. It is how held-back upgrades such as a kernel get applied.")) return;
+  await cmd(id, "apply_patches", { full: true });
+}
+
+async function cleanupNow(id) {
+  if (!confirm("Remove packages nothing depends on, and empty the package cache?")) return;
+  await cmd(id, "cleanup");
+}
+
 async function patchNow(id, host) {
   if (!confirm(`Install pending OS updates on ${host}?
 

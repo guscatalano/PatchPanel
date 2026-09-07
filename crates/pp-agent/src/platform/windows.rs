@@ -310,7 +310,7 @@ pub async fn apply_patches(
         // run deliberately skips it and leaves apps alone.
         if only.is_empty() {
             let o = exec::run(
-                "winget.exe",
+                &winget_path().unwrap_or_else(|| "winget.exe".into()),
                 &[
                     "upgrade",
                     "--all",
