@@ -96,7 +96,10 @@ struct FleetSummary {
     agents: usize,
     online: usize,
     offline: usize,
+    /// Updates that could be installed right now, fleet-wide.
     pending_updates: usize,
+    /// Counted but not installable: phased rollouts and the like.
+    deferred_updates: usize,
     pending_security: usize,
     needs_reboot: usize,
     app_drift: usize,
@@ -130,7 +133,8 @@ async fn fleet(State(state): State<SharedState>) -> ApiResult<Json<FleetResponse
             } else {
                 summary.offline += 1;
             }
-            summary.pending_updates += row.update_count;
+            summary.pending_updates += row.actionable_count;
+            summary.deferred_updates += row.deferred_count;
             summary.pending_security += row.security_count;
             summary.needs_reboot += row.reboot_required as usize;
             summary.app_drift += row.drift_count;

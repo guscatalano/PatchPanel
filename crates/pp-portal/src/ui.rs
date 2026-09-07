@@ -472,7 +472,8 @@ async function loadFleet() {
     tile(s.online, "online") +
     tile(s.offline, "offline", "warn") +
     tile(s.pending_security, "security updates", "bad") +
-    tile(s.pending_updates, "updates pending", "warn") +
+    tile(s.pending_updates, "updates to install", "warn") +
+    (s.deferred_updates ? tile(s.deferred_updates, "phased, not yet offered") : "") +
     tile(s.needs_reboot, "need reboot", "warn") +
     tile(s.app_drift, "app drift", "warn") +
     tile(s.stale_manifest, "stale manifest", "warn") +
@@ -494,8 +495,9 @@ async function loadFleet() {
     const unsafe_ = a.release_blockers > 0
       ? ` <span class="pill bad" title="This machine's package sources are misconfigured; installing updates could break it. Open the machine for details.">unsafe</span>`
       : "";
+    const actionable = a.actionable_count;
     const stuck = a.deferred_count
-      ? ` <span class="pill" title="${a.deferred_count} update(s) that even a full upgrade will not install - usually a phased rollout. The pending count cannot reach zero until the archive releases them.">${a.deferred_count} deferred</span>`
+      ? ` <span class="msg" title="${a.deferred_count} update(s) the archive is withholding from this machine - a phased rollout. Nothing to do; they arrive on their own.">+${a.deferred_count} phased</span>`
       : "";
     const held = a.held_back_count
       ? ` <span class="pill warn" title="${a.held_back_count} upgrade(s) apt will not apply without a full upgrade - often a kernel">${a.held_back_count} held</span>`
@@ -504,11 +506,15 @@ async function loadFleet() {
     // "unknown". Showing 0 there is the most dangerous thing this table could do.
     const upd = a.scan_issue_count
       ? `<span class="pill bad" title="Some package backends could not be scanned on this machine, so the real number is unknown. Open the machine for details.">not scanned</span>`
-      : (a.update_count
-          ? `${a.update_count}${a.security_count
+      : (actionable
+          ? `${actionable}${a.security_count
               ? ` <span class="pill bad" title="${a.security_count} of these are security updates - patch these first">${a.security_count} security</span>`
               : ""}${held}`
-          : `<span class="msg">none</span>${held}`);
+          : (a.deferred_count
+              // Everything pending is withheld by the archive, so there is
+              // nothing to install and the button is deliberately dead.
+              ? `<span class="msg">nothing to install</span>`
+              : `<span class="msg">none</span>${held}`));
     const dev = a.device_count
       ? `${a.device_count}${a.device_problem_count ? ` <span class="pill bad">${a.device_problem_count}</span>` : ""}`
       : "-";
@@ -540,8 +546,14 @@ async function loadFleet() {
         <button class="act" ${canAct ? "" : "disabled"}
           title="${busy ? "Busy: " + esc(KIND_LABEL[busy] || busy) : "Re-read installed packages and check for available updates. Changes nothing."}"
           onclick="cmd('${a.id}','collect_inventory')">Rescan</button>
-        <button class="act" ${canAct ? "" : "disabled"}
-          title="${busy ? "Busy: " + esc(KIND_LABEL[busy] || busy) : "Install this machine's pending OS updates now. This changes the system and may require a reboot."}"
+        <button class="act" ${canAct && actionable ? "" : "disabled"}
+          title="${busy
+            ? "Busy: " + esc(KIND_LABEL[busy] || busy)
+            : (actionable
+                ? "Install this machine's pending OS updates now. This changes the system and may require a reboot."
+                : (a.deferred_count
+                    ? "Nothing to install: the " + a.deferred_count + " pending update(s) are phased and the archive is withholding them from this machine."
+                    : "Nothing to install."))}"
           onclick="patchNow('${a.id}','${esc(a.hostname)}')">Install updates</button>
         <button class="act" ${canAct ? "" : "disabled"}
           title="${busy ? "Busy: " + esc(KIND_LABEL[busy] || busy) : "Install, upgrade or remove applications so the machine matches the manifest."}"
@@ -718,6 +730,12 @@ async function loadAgent(id) {
   const inv = d.inventory || {};
   const updates = inv.updates || [];
   const sec = updates.filter((u) => u.security);
+  // Separate what a button press would actually install from what the archive
+  // is withholding, so the page never implies there is work to do when there
+  // is not.
+  const stuckNames = new Set(inv.deferred || []);
+  const canInstall = updates.filter((u) => !stuckNames.has(u.name));
+  const phased = updates.filter((u) => stuckNames.has(u.name));
   const busy = isBusy(d);
   const state = d.connected
     ? '<span class="pill ok">connected</span>'
@@ -768,18 +786,29 @@ async function loadAgent(id) {
     </div>
 
     <div class="card">
-      <h2>Pending updates &mdash; ${updates.length}${sec.length ? `, ${sec.length} security` : ""}</h2>
+      <h2>Pending updates &mdash; ${canInstall.length} to install${phased.length ? `, ${phased.length} phased` : ""}${sec.length ? `, ${sec.length} security` : ""}</h2>
+      ${phased.length && !canInstall.length ? `<div class="step"><div class="note">
+        <b>Nothing to install.</b> All ${phased.length} pending update(s) are phased: the archive is
+        withholding them from this machine until the rollout completes. Pressing Install updates
+        will correctly do nothing. They will arrive on their own.
+      </div></div>` : ""}
       ${updates.length ? `<div class="scroll"><table>
-        <thead><tr><th>Package</th><th>Installed</th><th>Available</th><th>Source</th></tr></thead>
-        <tbody>${updates.map((u) => `<tr>
+        <thead><tr><th>Package</th><th>Installed</th><th>Available</th><th>Source</th><th></th></tr></thead>
+        <tbody>${canInstall.concat(phased).map((u) => {
+          const stuck = stuckNames.has(u.name);
+          return `<tr${stuck ? ' style="opacity:.55"' : ""}>
           <td>${esc(u.name)}${u.security ? ' <span class="pill bad">security</span>' : ""}</td>
           <td class="mono">${esc(u.current_version) || "-"}</td>
           <td class="mono">${esc(u.new_version)}</td>
-          <td class="mono">${esc(u.source)}</td></tr>`).join("")}</tbody>
+          <td class="mono">${esc(u.source)}</td>
+          <td>${stuck ? '<span class="pill" title="Phased: the archive is withholding this from this machine. Nothing to do.">phased</span>' : ""}</td></tr>`;
+        }).join("")}</tbody>
       </table></div>` : `<div class="empty">Nothing pending${inv.collected_at ? ` as of ${ago(inv.collected_at)}` : ""}.</div>`}
       <div class="bar">
         <button class="act" ${busy ? "disabled" : (d.connected ? "" : "disabled")} onclick="cmd('${d.id}','collect_inventory')">Rescan</button>
-        <button class="act" ${busy ? "disabled" : (d.connected ? "" : "disabled")} onclick="patchNow('${d.id}','${esc(d.hostname)}')">Install updates</button>
+        <button class="act" ${busy || !canInstall.length ? "disabled" : (d.connected ? "" : "disabled")}
+          title="${canInstall.length ? "Install the pending updates" : "Nothing to install - everything pending is phased"}"
+          onclick="patchNow('${d.id}','${esc(d.hostname)}')">Install updates</button>
         <button class="act" ${busy ? "disabled" : (d.connected ? "" : "disabled")} onclick="cmd('${d.id}','apply_manifest')">Apply manifest</button>
         <span class="msg">${busy
           ? `waiting for ${esc(KIND_LABEL[busy] || busy)} to finish`

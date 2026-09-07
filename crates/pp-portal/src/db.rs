@@ -64,6 +64,11 @@ pub struct AgentRow {
     pub held_back_count: usize,
     /// Upgrades nothing will apply, so the pending count can never reach zero.
     pub deferred_count: usize,
+    /// Updates that pressing the button would actually install. This is the
+    /// number worth showing: a total that includes updates the archive is
+    /// withholding just invites someone to keep clicking a button that
+    /// correctly does nothing.
+    pub actionable_count: usize,
     /// A command dispatched to this agent that has not reported back yet.
     /// Present means work is in flight and the machine should not be given
     /// more, which is the difference between one patch run and two.
@@ -408,6 +413,11 @@ impl Db {
                 scan_issue_count: inv.as_ref().map(|i| i.scan_issues.len()).unwrap_or(0),
                 held_back_count: inv.as_ref().map(|i| i.held_back.len()).unwrap_or(0),
                 deferred_count: inv.as_ref().map(|i| i.deferred.len()).unwrap_or(0),
+                actionable_count: {
+                    let total = updates;
+                    let stuck = inv.as_ref().map(|i| i.deferred.len()).unwrap_or(0);
+                    total.saturating_sub(stuck)
+                },
                 running: running.get(&id).cloned(),
                 release_blockers: inv
                     .as_ref()
