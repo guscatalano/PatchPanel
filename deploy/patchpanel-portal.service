@@ -5,7 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/pp-portal --bind 0.0.0.0:8080 --db /var/lib/patchpanel-portal/portal.db
+# Bind address and tokens come from the environment file, so changing the port
+# does not mean editing a unit file.
+ExecStart=/usr/local/bin/pp-portal --db /var/lib/patchpanel-portal/portal.db
 
 # The portal needs no privileges: it talks to agents and to SQLite, nothing else.
 User=patchpanel
@@ -22,6 +24,12 @@ StateDirectory=patchpanel-portal
 #   PATCHPANEL_ADMIN_TOKEN=...
 #   PATCHPANEL_ENROLLMENT_TOKEN=...
 EnvironmentFile=/etc/patchpanel/portal.env
+
+# Port 80 is privileged, but nothing else here needs root. Grant exactly the
+# one capability that binding it requires and drop the rest, rather than
+# running the whole service as root or setcap-ing a binary that self-updates.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 NoNewPrivileges=yes
 ProtectSystem=strict
