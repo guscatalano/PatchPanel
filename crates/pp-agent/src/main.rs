@@ -206,19 +206,38 @@ fn main() -> Result<()> {
 /// This exists because "--portal patchpanel" is what people try first, and
 /// making that work removes the most common install-time mistake.
 fn normalize_portal(input: &str) -> Result<(String, String)> {
-    let s = input.trim().trim_end_matches('/');
-    let (secure, rest) = match s {
-        _ if s.starts_with("wss://") => (true, &s[6..]),
-        _ if s.starts_with("ws://") => (false, &s[5..]),
-        _ if s.starts_with("https://") => (true, &s[8..]),
-        _ if s.starts_with("http://") => (false, &s[7..]),
-        _ => (false, s),
+    let s = input.trim();
+
+    // Strip the scheme *before* touching slashes. Trimming them first turns
+    // "http://" into "http:", which then looks like a perfectly good hostname
+    // and yields "ws://http:/api/agent/ws".
+    let (secure, rest) = if let Some(r) = s.strip_prefix("wss://") {
+        (true, r)
+    } else if let Some(r) = s.strip_prefix("ws://") {
+        (false, r)
+    } else if let Some(r) = s.strip_prefix("https://") {
+        (true, r)
+    } else if let Some(r) = s.strip_prefix("http://") {
+        (false, r)
+    } else {
+        (false, s)
     };
+
     // Drop any path the operator pasted; we know the endpoint we need.
-    let host = rest.split('/').next().unwrap_or(rest);
-    if host.is_empty() {
+    let host = rest.split('/').next().unwrap_or("").trim();
+    let (name, port) = match host.split_once(':') {
+        Some((n, p)) => (n, Some(p)),
+        None => (host, None),
+    };
+    if name.is_empty() {
         anyhow::bail!("`{input}` has no hostname");
     }
+    if let Some(p) = port {
+        if p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()) {
+            anyhow::bail!("`{input}` has an invalid port");
+        }
+    }
+
     let (ws, http) = if secure { ("wss", "https") } else { ("ws", "http") };
     Ok((
         format!("{ws}://{host}/api/agent/ws"),
@@ -464,4 +483,41 @@ async fn probe_once(target: String, kind: String, arg: Option<String>) -> Result
         println!("detail:    {}", report.detail);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_portal;
+
+    #[test]
+    fn accepts_whatever_an_operator_types() {
+        let cases = [
+            // what they type                     ws url                            http base
+            ("patchpanel", "ws://patchpanel/api/agent/ws", "http://patchpanel"),
+            ("patchpanel/", "ws://patchpanel/api/agent/ws", "http://patchpanel"),
+            ("http://patchpanel", "ws://patchpanel/api/agent/ws", "http://patchpanel"),
+            ("http://patchpanel/", "ws://patchpanel/api/agent/ws", "http://patchpanel"),
+            ("ws://patchpanel/api/agent/ws", "ws://patchpanel/api/agent/ws", "http://patchpanel"),
+            ("patchpanel:8080", "ws://patchpanel:8080/api/agent/ws", "http://patchpanel:8080"),
+            ("https://pp.example.com", "wss://pp.example.com/api/agent/ws", "https://pp.example.com"),
+            ("wss://pp.example.com/api/agent/ws", "wss://pp.example.com/api/agent/ws", "https://pp.example.com"),
+            ("  patchpanel  ", "ws://patchpanel/api/agent/ws", "http://patchpanel"),
+            ("192.168.6.59", "ws://192.168.6.59/api/agent/ws", "http://192.168.6.59"),
+        ];
+        for (input, want_ws, want_http) in cases {
+            let (ws, http) = normalize_portal(input).expect(input);
+            assert_eq!(ws, want_ws, "ws url for `{input}`");
+            assert_eq!(http, want_http, "http base for `{input}`");
+        }
+    }
+
+    #[test]
+    fn rejects_input_with_no_host() {
+        for bad in [
+            "", "   ", "http://", "https://", "ws://", "ws:///api/agent/ws",
+            "http:", ":8080", "patchpanel:", "patchpanel:abc", "patchpanel:80x",
+        ] {
+            assert!(normalize_portal(bad).is_err(), "`{bad}` should be rejected");
+        }
+    }
 }
