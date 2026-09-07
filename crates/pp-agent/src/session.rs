@@ -17,7 +17,7 @@ use pp_proto::{
     ClientMsg, Command, CommandEnvelope, CommandResult, Drift, Inventory, Manifest, OsKind,
     ServerMsg, SystemInfo, PROTOCOL_VERSION,
 };
-use tokio::sync::{mpsc, Mutex, Notify, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -63,7 +63,14 @@ struct Ctx {
     last: Arc<RwLock<Option<Inventory>>>,
     tx: mpsc::UnboundedSender<ClientMsg>,
     progress_tx: mpsc::UnboundedSender<(Uuid, String)>,
-    restart: Arc<Notify>,
+    /// Signals that a new binary is in place and this process should exit.
+    ///
+    /// A channel rather than a `Notify`: `select!` rebuilds its futures on
+    /// every iteration, and a `Notified` that is woken but dropped because a
+    /// sibling branch also became ready swallows the notification. That made
+    /// self-update replace the binary and then never restart. `recv()` is
+    /// cancel-safe, so a message queued here cannot be lost.
+    restart_tx: mpsc::UnboundedSender<()>,
 }
 
 impl Ctx {
@@ -206,6 +213,7 @@ async fn session(
         });
     }
 
+    let (restart_tx, mut restart_rx) = mpsc::unbounded_channel::<()>();
     let writer_failed = Arc::new(AtomicBool::new(false));
     let writer = {
         let writer_failed = writer_failed.clone();
@@ -235,7 +243,7 @@ async fn session(
         last: Arc::new(RwLock::new(None)),
         tx: tx.clone(),
         progress_tx,
-        restart: Arc::new(Notify::new()),
+        restart_tx,
     };
 
     // Hello first: the portal will not accept any other frame before it.
@@ -253,13 +261,12 @@ async fn session(
     }
 
     let mut schedules = JoinSet::new();
-    let restart = ctx.restart.clone();
     let mut disposition = Disposition::Reconnect;
 
     loop {
         tokio::select! {
             // A self-update finished; leave so the new binary takes over.
-            _ = restart.notified() => {
+            _ = restart_rx.recv() => {
                 disposition = Disposition::Restart;
                 break;
             }
@@ -677,7 +684,11 @@ async fn run_command(env: CommandEnvelope, ctx: Ctx) {
         // Give the writer a moment to flush the result before we tear the
         // connection down; the portal should record the update before we go.
         tokio::time::sleep(Duration::from_millis(500)).await;
-        ctx.restart.notify_one();
+        tracing::info!("self-update installed; signalling restart");
+        if ctx.restart_tx.send(()).is_err() {
+            // The session is already ending, which achieves the same thing.
+            tracing::warn!("restart channel closed; the next reconnect will run the new binary");
+        }
     }
 }
 
