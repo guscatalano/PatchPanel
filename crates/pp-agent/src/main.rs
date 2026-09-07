@@ -355,7 +355,14 @@ async fn setup(cfg: config::Config, config_path: &std::path::Path) -> Result<()>
 
         let p = exec::Progress::detached();
         exec::run("systemctl", &["daemon-reload"], &p).await?.require(&[])?;
-        exec::run("systemctl", &["enable", "--now", "patchpanel-agent"], &p)
+        exec::run("systemctl", &["enable", "patchpanel-agent"], &p)
+            .await?
+            .require(&[])?;
+        // `enable --now` starts a stopped service but leaves a running one
+        // alone, so re-running the installer would not pick up the new binary.
+        // Restart is correct whether or not it was running, and makes this
+        // command a reliable way to recover a stuck agent.
+        exec::run("systemctl", &["restart", "patchpanel-agent"], &p)
             .await?
             .require(&[])?;
         println!("==> service started");
