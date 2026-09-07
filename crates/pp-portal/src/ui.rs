@@ -138,6 +138,16 @@ const INDEX: &str = r##"<!doctype html>
   }
   .note { padding: 10px 12px; border-radius: 8px; font-size: 12.5px; border: 1px solid var(--line); background: var(--bg); margin-bottom: 12px; }
 
+  .diff { font-family: var(--mono); font-size: 12px; line-height: 1.5; border: 1px solid var(--line);
+    border-radius: 8px; overflow: auto; max-height: 320px; background: var(--bg); margin: 8px 0; }
+  .diff div { padding: 1px 10px; white-space: pre-wrap; word-break: break-word; }
+  .diff .del { background: color-mix(in srgb, var(--bad) 16%, transparent); color: var(--bad); }
+  .diff .add { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
+  .diff .same { color: var(--muted); }
+  .status { font-size: 12.5px; margin-left: 8px; }
+  .status.run { color: var(--accent); }
+  .status.ok { color: var(--ok); }
+  .status.bad { color: var(--bad); }
   .section { border: 1px solid var(--line); border-radius: 12px; padding: 0 12px 4px; margin-bottom: 20px; background: color-mix(in srgb, var(--panel) 45%, transparent); }
   .section-h { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 14px 4px 10px; }
   .section .card { margin-bottom: 12px; }
@@ -432,12 +442,6 @@ function isEditing() {
   return [...document.querySelectorAll("textarea[data-dirty=\"1\"]")].length > 0;
 }
 
-function markDirty(el) {
-  el.dataset.dirty = el.value === el.dataset.original ? "0" : "1";
-  const banner = document.getElementById("edit-banner");
-  if (banner) banner.hidden = !isEditing();
-}
-
 function setHTML(el, html) {
   if (!el || el.__lastHTML === html) return false;
   const open = new Set(
@@ -697,6 +701,32 @@ function releaseCard(rel) {
 // into something the fleet view can do. The agent validates every write with
 // apt-get update and reverts if apt rejects it, so a wrong edit undoes itself
 // rather than leaving a machine that cannot install anything.
+// A positional line diff.
+//
+// `suggest` rewrites lines in place and never reorders them, so comparing line
+// by line is exact here and far easier to read than a generic diff would be.
+function lineDiff(before, after) {
+  const A = before.replace(/\s+$/, "").split("\n");
+  const B = after.replace(/\s+$/, "").split("\n");
+  const rows = [];
+  for (let i = 0; i < Math.max(A.length, B.length); i++) {
+    const x = A[i], y = B[i];
+    if (x === y) { rows.push({ t: "same", s: x ?? "" }); continue; }
+    if (x !== undefined && x !== "") rows.push({ t: "del", s: x });
+    if (y !== undefined && y !== "") rows.push({ t: "add", s: y });
+  }
+  return rows;
+}
+
+function renderDiff(before, after) {
+  const rows = lineDiff(before, after);
+  const changed = rows.filter((r) => r.t !== "same").length;
+  if (!changed) return `<div class="msg">No differences.</div>`;
+  return `<div class="diff">${rows.map((r) =>
+    `<div class="${r.t}">${r.t === "del" ? "- " : r.t === "add" ? "+ " : "  "}${esc(r.s)}</div>`
+  ).join("")}</div>`;
+}
+
 function sourceEditor(files, id, connected) {
   if (!files.length) return "";
 
@@ -708,8 +738,9 @@ function sourceEditor(files, id, connected) {
       ? `<div class="note" style="border-color:var(--accent)">
            <b>PatchPanel can correct this file.</b>
            ${notes}
-           <button class="act" onclick="useSuggestion('src-${i}')">Load the suggestion</button>
-           <span class="msg">then review, edit if you want, and Save</span>
+           <div id="sugdiff-${i}">${renderDiff(f.content, f.suggested)}</div>
+           <button class="act" onclick="useSuggestion('${i}')">Apply this to the editor</button>
+           <span class="msg">nothing is written until you press Save</span>
            <textarea id="sug-${i}" hidden>${esc(f.suggested)}</textarea>
          </div>`
       : "";
@@ -719,54 +750,127 @@ function sourceEditor(files, id, connected) {
         ${suggestion}
         <textarea id="src-${i}" spellcheck="false" style="min-height:130px"
           data-original="${esc(f.content)}" data-dirty="0"
-          oninput="markDirty(this)">${esc(f.content)}</textarea>
+          oninput="onEdit(${i})">${esc(f.content)}</textarea>
+        <div id="pending-${i}" hidden>
+          <div class="msg" style="margin-top:8px">Unsaved changes &mdash; this is what Save will write:</div>
+          <div id="editdiff-${i}"></div>
+        </div>
         <div class="bar" style="padding-left:0;padding-right:0">
-          <button class="act primary" ${connected ? "" : "disabled"}
-            onclick="saveSource('${id}', ${JSON.stringify(f.path)}, 'src-${i}')">Save and validate</button>
-          <button class="act" onclick="revertSource('src-${i}')">Revert</button>
+          <button class="act primary" ${connected ? "" : "disabled"} id="save-${i}"
+            onclick="saveSource('${id}', ${JSON.stringify(f.path)}, ${i})">Save and validate</button>
+          <button class="act" onclick="revertSource(${i})">Revert</button>
           <button class="act" ${connected ? "" : "disabled"}
             onclick="deleteSource('${id}', ${JSON.stringify(f.path)})">Delete file</button>
+          <span class="status" id="status-${i}"></span>
         </div>
       </div>`;
   };
 
   const fixable = files.filter((f) => f.suggested).length;
   return `<div class="card">
-    <h2>Apt source files${fixable ? ` &mdash; ${fixable} with a suggested fix` : ""}</h2>
+    <h2>Apt sources${fixable ? ` &mdash; ${fixable} file(s) with a suggested fix` : ""}</h2>
     <div class="step"><div class="note">
-      Saving runs <code>apt-get update</code> to check the result. If apt rejects the new
-      contents the agent restores the previous file, so a bad edit undoes itself. A copy is
+      Saving runs <code>apt-get update</code> on the machine. If apt rejects the new contents the
+      agent puts the previous file back and tells you why, so a bad edit undoes itself. A copy is
       kept beside each file as <code>.patchpanel-bak</code>.
     </div></div>
     ${files.map(block).join("")}
   </div>`;
 }
 
-function useSuggestion(id) {
-  const ta = document.getElementById(id);
-  const sug = document.getElementById(id.replace("src-", "sug-"));
-  if (!ta || !sug) return;
-  ta.value = sug.value;
-  markDirty(ta);
-  ta.focus();
-}
+// Show what the current editor content would change, so "apply the fix" is
+// never a leap of faith.
+function onEdit(i) {
+  const ta = document.getElementById("src-" + i);
+  const dirty = ta.value !== ta.dataset.original;
+  ta.dataset.dirty = dirty ? "1" : "0";
 
-function revertSource(id) {
-  const ta = document.getElementById(id);
-  if (!ta) return;
-  ta.value = ta.dataset.original;
-  markDirty(ta);
-}
-
-async function saveSource(id, path, textareaId) {
-  const ta = document.getElementById(textareaId);
-  const content = ta.value;
-  if (!confirm("Replace " + path + " on this machine? apt will validate it, and the old file is restored if it is rejected.")) return;
-  ta.dataset.dirty = "0";
-  ta.dataset.original = content;
+  const pending = document.getElementById("pending-" + i);
+  if (pending) {
+    pending.hidden = !dirty;
+    if (dirty) {
+      document.getElementById("editdiff-" + i).innerHTML =
+        renderDiff(ta.dataset.original, ta.value);
+    }
+  }
   const banner = document.getElementById("edit-banner");
   if (banner) banner.hidden = !isEditing();
-  await cmd(id, "write_source", { path, content });
+}
+
+function useSuggestion(i) {
+  const ta = document.getElementById("src-" + i);
+  const sug = document.getElementById("sug-" + i);
+  if (!ta || !sug) return;
+  ta.value = sug.value;
+  onEdit(i);
+  ta.scrollIntoView({ block: "nearest" });
+}
+
+function revertSource(i) {
+  const ta = document.getElementById("src-" + i);
+  if (!ta) return;
+  ta.value = ta.dataset.original;
+  onEdit(i);
+  setStatus(i, "", "");
+}
+
+function setStatus(i, text, cls) {
+  const el = document.getElementById("status-" + i);
+  if (el) { el.textContent = text; el.className = "status " + cls; }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Wait for the agent to report on a dispatched command, so Save says what
+// actually happened instead of silently returning.
+async function awaitCommand(agentId, cmdId, timeoutMs = 90000) {
+  const until = Date.now() + timeoutMs;
+  while (Date.now() < until) {
+    await sleep(1500);
+    try {
+      const rows = await api(`/api/commands?agent=${agentId}&limit=15`);
+      const c = rows.find((r) => r.id === cmdId);
+      if (c && c.ok !== null && c.ok !== undefined) return c;
+    } catch (e) {
+      // Keep waiting; a transient failure to poll is not a failed command.
+    }
+  }
+  return null;
+}
+
+async function saveSource(id, path, i) {
+  const ta = document.getElementById("src-" + i);
+  const content = ta.value;
+  if (!confirm("Replace " + path + " on this machine? apt validates it, and the old file is restored if it is rejected.")) return;
+
+  const btn = document.getElementById("save-" + i);
+  if (btn) btn.disabled = true;
+  setStatus(i, "writing and running apt-get update...", "run");
+
+  let res;
+  try {
+    res = await cmd(id, "write_source", { path, content });
+  } catch (e) {
+    setStatus(i, e.message, "bad");
+    if (btn) btn.disabled = false;
+    return;
+  }
+
+  const done = await awaitCommand(id, res && res.id);
+  if (btn) btn.disabled = false;
+
+  if (!done) {
+    setStatus(i, "still running - see History below", "run");
+    return;
+  }
+  if (done.ok) {
+    // Only now does the editor match what is on disk.
+    ta.dataset.original = content;
+    onEdit(i);
+    setStatus(i, done.summary || "saved, and apt accepted it", "ok");
+  } else {
+    setStatus(i, done.summary || "rejected and reverted", "bad");
+  }
 }
 
 async function deleteSource(id, path) {
@@ -951,14 +1055,15 @@ async function loadAgent(id) {
 
     ${scanCard(inv.scan_issues || [], inv.held_back || [], inv.deferred || [], d.id, d.connected)}
 
-    ${(inv.source_files || []).length || inv.release ? `
+    ${sourceEditor(inv.source_files || [], d.id, d.connected)}
+
+    ${inv.release || (inv.repositories || []).length || inv.cleanup ? `
       <div class="section">
-        <h2 class="section-h">Packages &amp; sources</h2>
+        <h2 class="section-h">Packages</h2>
         ${releaseCard(inv.release)}
-        ${sourceEditor(inv.source_files || [], d.id, d.connected)}
         ${repoCard(inv.repositories || [], d.repo_diff || {})}
         ${cleanupCard(inv.cleanup, d.id, d.connected)}
-      </div>` : cleanupCard(inv.cleanup, d.id, d.connected)}
+      </div>` : ""}
 
     <div class="card">
       <h2>Installed packages &mdash; ${(inv.packages || []).length}</h2>
@@ -1188,11 +1293,12 @@ async function cmd(id, kind, extra = {}) {
   JUST_SENT.set(id, Date.now());
   refresh();
   try {
-    await api(`/api/agents/${id}/commands`, {
+    const res = await api(`/api/agents/${id}/commands`, {
       method: "POST",
       body: JSON.stringify({ command: { kind, ...extra } }),
     });
     setTimeout(refresh, 400);
+    return res;
   } catch (e) {
     JUST_SENT.delete(id);
     refresh();
