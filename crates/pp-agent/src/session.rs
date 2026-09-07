@@ -33,6 +33,10 @@ pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// fleet recovering promptly after a portal restart without stampeding it.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
+/// How long a session must survive before we treat it as proof that the portal
+/// is healthy, and reset the reconnect backoff no matter how it ended.
+const HEALTHY_SESSION: Duration = Duration::from_secs(30);
+
 /// Why a session ended.
 enum Disposition {
     /// Normal drop — reconnect.
@@ -84,7 +88,17 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     let mut backoff = Duration::from_secs(1);
     loop {
-        match session(cfg.clone(), state.clone(), platform.clone()).await {
+        let started = std::time::Instant::now();
+        let outcome = session(cfg.clone(), state.clone(), platform.clone()).await;
+        // A session that stayed up this long proves the portal is reachable and
+        // that our credentials work. How it *ended* says nothing about that — a
+        // portal restart severs the socket with "connection reset", which is an
+        // error — so the next attempt starts from a clean backoff either way.
+        // Without this, every portal restart ratchets the whole fleet toward
+        // the 60s cap and leaves it there.
+        let was_healthy = started.elapsed() >= HEALTHY_SESSION;
+
+        match outcome {
             Ok(Disposition::Restart) => {
                 tracing::info!("exiting for self-update; supervisor will restart");
                 return Ok(());
@@ -95,8 +109,12 @@ pub async fn run(cfg: Config) -> Result<()> {
             }
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "session failed");
+                if was_healthy {
+                    backoff = Duration::from_secs(1);
+                }
             }
         }
+
         tokio::time::sleep(jitter(backoff)).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
