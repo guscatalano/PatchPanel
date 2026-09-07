@@ -200,7 +200,7 @@ pub async fn held_back(pf: &Platform, p: &Progress) -> Vec<String> {
             if t.is_empty() || t.chars().next().is_some_and(|c| c.is_ascii_digit()) {
                 break;
             }
-            if line.starts_with(' ') || line.starts_with('\t') {
+            if line.starts_with(char::is_whitespace) {
                 out.extend(t.split_whitespace().map(str::to_string));
             } else {
                 break;
@@ -344,7 +344,7 @@ fn parse_apt_autoremove(text: &str) -> (Vec<String>, u64) {
             // The block ends at the summary line, which starts with a count.
             if t.is_empty() || t.chars().next().is_some_and(|c| c.is_ascii_digit()) {
                 in_block = false;
-            } else if line.starts_with(' ') || line.starts_with('	') {
+            } else if line.starts_with(char::is_whitespace) {
                 pkgs.extend(t.split_whitespace().map(|w| w.trim_end_matches('*').to_string()));
                 continue;
             } else {
