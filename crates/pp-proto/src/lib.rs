@@ -118,6 +118,14 @@ pub struct SystemInfo {
 pub struct SourceFile {
     pub path: String,
     pub content: String,
+    /// A corrected version of this file, when the agent can see something
+    /// wrong with it. Offered rather than applied: the operator reviews and
+    /// edits before anything is written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested: Option<String>,
+    /// One line per change, explaining why.
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 /// A configured package source. Knowing which repositories a machine trusts is

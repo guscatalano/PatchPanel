@@ -138,6 +138,11 @@ const INDEX: &str = r##"<!doctype html>
   }
   .note { padding: 10px 12px; border-radius: 8px; font-size: 12.5px; border: 1px solid var(--line); background: var(--bg); margin-bottom: 12px; }
 
+  .section { border: 1px solid var(--line); border-radius: 12px; padding: 0 12px 4px; margin-bottom: 20px; background: color-mix(in srgb, var(--panel) 45%, transparent); }
+  .section-h { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 14px 4px 10px; }
+  .section .card { margin-bottom: 12px; }
+  #edit-banner { position: sticky; top: 56px; z-index: 5; margin-bottom: 12px; padding: 8px 12px; border-radius: 8px;
+    border: 1px solid var(--accent); color: var(--accent); background: var(--panel); font-size: 12.5px; }
   .back { display: inline-block; margin-bottom: 14px; color: var(--accent); cursor: pointer; font-size: 13px; }
   .back:hover { text-decoration: underline; }
   .hdr { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
@@ -420,6 +425,19 @@ window.addEventListener("hashchange", () => {
 // Re-rendering on a timer is what makes the dashboard live, and also what
 // closes an <details> you were reading. Two defences: skip the write entirely
 // when nothing changed, and carry the open ones across when it did.
+// True while the operator has unsaved text in any editor on the page.
+// Re-rendering under them would discard it, and this page refreshes every few
+// seconds, which made editing a sources file effectively impossible.
+function isEditing() {
+  return [...document.querySelectorAll("textarea[data-dirty=\"1\"]")].length > 0;
+}
+
+function markDirty(el) {
+  el.dataset.dirty = el.value === el.dataset.original ? "0" : "1";
+  const banner = document.getElementById("edit-banner");
+  if (banner) banner.hidden = !isEditing();
+}
+
 function setHTML(el, html) {
   if (!el || el.__lastHTML === html) return false;
   const open = new Set(
@@ -678,34 +696,73 @@ function releaseCard(rel) {
 // rather than leaving a machine that cannot install anything.
 function sourceEditor(files, id, connected) {
   if (!files.length) return "";
-  const rows = files.map((f, i) => `
-    <div class="step">
-      <h3 class="mono">${esc(f.path)}</h3>
-      <textarea id="src-${i}" spellcheck="false" style="min-height:120px">${esc(f.content)}</textarea>
-      <div class="bar" style="padding-left:0;padding-right:0">
-        <button class="act" ${connected ? "" : "disabled"}
-          onclick="saveSource('${id}', ${JSON.stringify(f.path)}, 'src-${i}')">Save</button>
-        <button class="act" ${connected ? "" : "disabled"}
-          onclick="deleteSource('${id}', ${JSON.stringify(f.path)})">Delete file</button>
-        <span class="msg" id="src-msg-${i}"></span>
-      </div>
-    </div>`).join("");
 
+  const block = (f, i) => {
+    const notes = (f.notes || []).length
+      ? `<ul style="margin:6px 0 10px 18px">${f.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>`
+      : "";
+    const suggestion = f.suggested
+      ? `<div class="note" style="border-color:var(--accent)">
+           <b>PatchPanel can correct this file.</b>
+           ${notes}
+           <button class="act" onclick="useSuggestion('src-${i}')">Load the suggestion</button>
+           <span class="msg">then review, edit if you want, and Save</span>
+           <textarea id="sug-${i}" hidden>${esc(f.suggested)}</textarea>
+         </div>`
+      : "";
+    return `
+      <div class="step">
+        <h3 class="mono">${esc(f.path)}${f.suggested ? ' <span class="pill warn">fix available</span>' : ""}</h3>
+        ${suggestion}
+        <textarea id="src-${i}" spellcheck="false" style="min-height:130px"
+          data-original="${esc(f.content)}" data-dirty="0"
+          oninput="markDirty(this)">${esc(f.content)}</textarea>
+        <div class="bar" style="padding-left:0;padding-right:0">
+          <button class="act primary" ${connected ? "" : "disabled"}
+            onclick="saveSource('${id}', ${JSON.stringify(f.path)}, 'src-${i}')">Save and validate</button>
+          <button class="act" onclick="revertSource('src-${i}')">Revert</button>
+          <button class="act" ${connected ? "" : "disabled"}
+            onclick="deleteSource('${id}', ${JSON.stringify(f.path)})">Delete file</button>
+        </div>
+      </div>`;
+  };
+
+  const fixable = files.filter((f) => f.suggested).length;
   return `<div class="card">
-    <h2>Apt sources</h2>
+    <h2>Apt source files${fixable ? ` &mdash; ${fixable} with a suggested fix` : ""}</h2>
     <div class="step"><div class="note">
       Saving runs <code>apt-get update</code> to check the result. If apt rejects the new
-      contents the agent puts the old file back, so a bad edit cannot leave this machine
-      unable to install anything. A copy is kept beside each file as
-      <code>.patchpanel-bak</code>.
+      contents the agent restores the previous file, so a bad edit undoes itself. A copy is
+      kept beside each file as <code>.patchpanel-bak</code>.
     </div></div>
-    ${rows}
+    ${files.map(block).join("")}
   </div>`;
 }
 
+function useSuggestion(id) {
+  const ta = document.getElementById(id);
+  const sug = document.getElementById(id.replace("src-", "sug-"));
+  if (!ta || !sug) return;
+  ta.value = sug.value;
+  markDirty(ta);
+  ta.focus();
+}
+
+function revertSource(id) {
+  const ta = document.getElementById(id);
+  if (!ta) return;
+  ta.value = ta.dataset.original;
+  markDirty(ta);
+}
+
 async function saveSource(id, path, textareaId) {
-  const content = document.getElementById(textareaId).value;
-  if (!confirm("Replace " + path + " on this machine?")) return;
+  const ta = document.getElementById(textareaId);
+  const content = ta.value;
+  if (!confirm("Replace " + path + " on this machine? apt will validate it, and the old file is restored if it is rejected.")) return;
+  ta.dataset.dirty = "0";
+  ta.dataset.original = content;
+  const banner = document.getElementById("edit-banner");
+  if (banner) banner.hidden = !isEditing();
   await cmd(id, "write_source", { path, content });
 }
 
@@ -788,8 +845,12 @@ async function loadAgent(id) {
   const CHANGED = ["apply_patches", "apply_manifest", "self_update", "reboot"];
   const history = (d.commands || []).filter((c) => CHANGED.includes(c.kind));
 
+  // Never redraw over unsaved edits.
+  if (isEditing()) return;
+
   const html = `
     <div class="back" onclick="showTab('fleet')">&larr; Fleet</div>
+    <div id="edit-banner" hidden>Editing &mdash; live updates are paused for this page until you save or revert.</div>
     <div class="hdr">
       <h2>${esc(d.hostname)}</h2>${state}
       ${busy ? `<span class="pill busy">${esc(KIND_LABEL[busy] || busy)}</span>` : ""}
@@ -882,13 +943,14 @@ async function loadAgent(id) {
 
     ${scanCard(inv.scan_issues || [], inv.held_back || [], inv.deferred || [], d.id, d.connected)}
 
-    ${cleanupCard(inv.cleanup, d.id, d.connected)}
-
-    ${releaseCard(inv.release)}
-
-    ${repoCard(inv.repositories || [], d.repo_diff || {})}
-
-    ${sourceEditor(inv.source_files || [], d.id, d.connected)}
+    ${(inv.source_files || []).length || inv.release ? `
+      <div class="section">
+        <h2 class="section-h">Packages &amp; sources</h2>
+        ${releaseCard(inv.release)}
+        ${sourceEditor(inv.source_files || [], d.id, d.connected)}
+        ${repoCard(inv.repositories || [], d.repo_diff || {})}
+        ${cleanupCard(inv.cleanup, d.id, d.connected)}
+      </div>` : cleanupCard(inv.cleanup, d.id, d.connected)}
 
     <div class="card">
       <h2>Installed packages &mdash; ${(inv.packages || []).length}</h2>

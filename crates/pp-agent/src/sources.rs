@@ -16,12 +16,25 @@ const APT_DIR: &str = "/etc/apt";
 
 /// Read every apt source file, so the portal can show and edit the real text
 /// rather than a parsed approximation of it.
+fn make(path: String, content: String) -> SourceFile {
+    let (suggested, notes) = match suggest(&content) {
+        Some((text, notes)) if text.trim() != content.trim() => (Some(text), notes),
+        _ => (None, Vec::new()),
+    };
+    SourceFile {
+        path,
+        content,
+        suggested,
+        notes,
+    }
+}
+
 pub fn read_all() -> Vec<SourceFile> {
     let mut out = Vec::new();
 
     let main = format!("{APT_DIR}/sources.list");
     if let Ok(content) = std::fs::read_to_string(&main) {
-        out.push(SourceFile { path: main, content });
+        out.push(make(main, content));
     }
 
     if let Ok(dir) = std::fs::read_dir(format!("{APT_DIR}/sources.list.d")) {
@@ -33,14 +46,187 @@ pub fn read_all() -> Vec<SourceFile> {
                 continue;
             }
             if let Ok(content) = std::fs::read_to_string(&path) {
-                out.push(SourceFile {
-                    path: path.to_string_lossy().into_owned(),
-                    content,
-                });
+                out.push(make(path.to_string_lossy().into_owned(), content));
             }
         }
     }
     out
+}
+
+/// Debian releases whose archives have moved off the main mirrors.
+const DEBIAN_EOL: &[&str] = &["jessie", "stretch", "buster", "bullseye"];
+
+/// Suites that mean "whatever is current" rather than a fixed release.
+const MOVING: &[&str] = &["stable", "testing", "unstable", "oldstable", "sid"];
+
+/// Read the distribution id and codename this machine is actually running.
+fn running_release() -> (String, String) {
+    let Ok(os) = std::fs::read_to_string("/etc/os-release") else {
+        return (String::new(), String::new());
+    };
+    let field = |key: &str| -> String {
+        os.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .map(|v| v.trim_matches(|c| c == '=' || c == '"' || c == '\'').trim().to_string())
+            .unwrap_or_default()
+    };
+    (field("ID"), field("VERSION_CODENAME"))
+}
+
+/// Propose a corrected version of a source file.
+///
+/// Every rule here encodes a mistake seen on a real machine in this fleet: a
+/// suite that moves underneath the release, the security suite rename Debian
+/// made at 12, a third-party repo pointing at the wrong distribution entirely,
+/// and archives that have moved after end-of-life. Returning the whole file
+/// rather than a patch means the operator can read exactly what they are about
+/// to apply.
+pub fn suggest(content: &str) -> Option<(String, Vec<String>)> {
+    let (distro, codename) = running_release();
+    suggest_for(content, &distro, &codename)
+}
+
+/// The rules, with the release passed in so they can be tested anywhere rather
+/// than only on the machine being corrected.
+pub fn suggest_for(content: &str, distro: &str, codename: &str) -> Option<(String, Vec<String>)> {
+    if distro.is_empty() || codename.is_empty() {
+        return None;
+    }
+    let codename = codename.to_string();
+
+    let mut notes: Vec<String> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    let eol = distro == "debian" && DEBIAN_EOL.contains(&codename.as_str());
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let commented = trimmed.starts_with('#');
+        let body = if commented {
+            trimmed.trim_start_matches('#').trim()
+        } else {
+            trimmed
+        };
+
+        if !(body.starts_with("deb ") || body.starts_with("deb-src ")) {
+            out.push(line.to_string());
+            continue;
+        }
+
+        let mut fields: Vec<String> = body.split_whitespace().map(str::to_string).collect();
+        // Locate the URI and the suite that follows it, skipping any [options].
+        let uri_at = fields.iter().position(|f| f.contains("://"));
+        let Some(ui) = uri_at else {
+            out.push(line.to_string());
+            continue;
+        };
+        if fields.len() <= ui + 1 {
+            out.push(line.to_string());
+            continue;
+        }
+
+        let original = fields.join(" ");
+        let is_security = fields[ui].contains("security");
+
+        // 1. A moving suite pins nothing; name the release actually installed.
+        {
+            let suite = fields[ui + 1].clone();
+            // Split on both separators: `stable-updates` and `stable/updates`
+            // are the same moving suite wearing different clothes, and missing
+            // the hyphenated form leaves half the file unpinned.
+            let base = suite
+                .split(['/', '-'])
+                .next()
+                .unwrap_or(&suite)
+                .to_string();
+            if MOVING.contains(&base.as_str()) {
+                let want = if is_security {
+                    format!("{codename}-security")
+                } else if suite.contains("-updates") {
+                    format!("{codename}-updates")
+                } else {
+                    codename.clone()
+                };
+                notes.push(format!(
+                    "`{suite}` follows whatever release is current; pinned to `{want}`"
+                ));
+                fields[ui + 1] = want;
+            }
+        }
+
+        // 2. Debian renamed the security suite at 12: `<name>/updates` became
+        //    `<name>-security`. Leftovers from an upgrade break apt outright.
+        {
+            let suite = fields[ui + 1].clone();
+            if is_security && suite.ends_with("/updates") {
+                let want = format!("{codename}-security");
+                notes.push(format!(
+                    "security suite `{suite}` uses the pre-Debian-12 form; changed to `{want}`"
+                ));
+                fields[ui + 1] = want;
+            }
+        }
+
+        // 3. A third-party repo built for another distribution will never
+        //    resolve. Docker publishing under /linux/ubuntu on a Debian box is
+        //    the usual case.
+        if distro == "debian" && fields[ui].contains("/ubuntu") && !fields[ui].contains("debian") {
+            let fixed = fields[ui].replace("/ubuntu", "/debian");
+            notes.push(format!(
+                "`{}` is the Ubuntu archive; switched to `{fixed}`",
+                fields[ui]
+            ));
+            fields[ui] = fixed;
+        }
+
+        // 4. A third-party suite naming a different release.
+        {
+            let suite = fields[ui + 1].clone();
+            let known = [
+                "stretch", "buster", "bullseye", "bookworm", "trixie", "forky",
+            ];
+            let base = suite.split('-').next().unwrap_or(&suite);
+            if distro == "debian" && known.contains(&base) && base != codename {
+                let want = suite.replacen(base, &codename, 1);
+                notes.push(format!("`{suite}` names another release; changed to `{want}`"));
+                fields[ui + 1] = want;
+            }
+        }
+
+        // 5. After end-of-life the packages move to the archive host.
+        if eol && (fields[ui].contains("deb.debian.org") || fields[ui].contains("/debian")) {
+            let host_ok = fields[ui].contains("archive.debian.org");
+            if !host_ok {
+                let want = if is_security {
+                    "http://archive.debian.org/debian-security".to_string()
+                } else {
+                    "http://archive.debian.org/debian".to_string()
+                };
+                notes.push(format!(
+                    "{codename} is end-of-life; `{}` moved to `{want}`",
+                    fields[ui]
+                ));
+                fields[ui] = want;
+            }
+        }
+
+        let rebuilt = fields.join(" ");
+        if rebuilt == original {
+            out.push(line.to_string());
+        } else {
+            // Preserve whether the operator had this line disabled.
+            out.push(if commented {
+                format!("# {rebuilt}")
+            } else {
+                rebuilt
+            });
+        }
+    }
+
+    if notes.is_empty() {
+        return None;
+    }
+    notes.dedup();
+    Some((out.join("\n") + "\n", notes))
 }
 
 /// Reject anything outside the apt source files.
@@ -185,4 +371,77 @@ pub async fn remove(path: &str, p: &Progress) -> Result<String> {
         target.display(),
         backup.display()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::suggest_for;
+
+    fn fix(line: &str, codename: &str) -> String {
+        suggest_for(line, "debian", codename)
+            .map(|(text, _)| text.trim().to_string())
+            .unwrap_or_else(|| line.trim().to_string())
+    }
+
+    #[test]
+    fn renames_the_pre_debian_12_security_suite() {
+        // Exactly what broke `bit`: apt refuses the whole run over this.
+        let got = fix(
+            "deb http://security.debian.org/debian-security bookworm/updates main",
+            "bookworm",
+        );
+        assert_eq!(
+            got,
+            "deb http://security.debian.org/debian-security bookworm-security main"
+        );
+    }
+
+    #[test]
+    fn repoints_a_repo_built_for_another_distribution() {
+        // `bit` again: Docker published under /linux/ubuntu on a Debian box.
+        let got = fix("deb https://download.docker.com/linux/ubuntu buster stable", "bookworm");
+        assert!(got.contains("/linux/debian"), "{got}");
+        assert!(got.contains("bookworm"), "{got}");
+    }
+
+    #[test]
+    fn pins_a_moving_suite_to_the_installed_release() {
+        // `hub`: `stable` had silently become Debian 13 under a Debian 11 box.
+        assert_eq!(
+            fix("deb http://mirrors.example.org/debian/ stable main", "bullseye"),
+            "deb http://archive.debian.org/debian bullseye main"
+        );
+        assert_eq!(
+            fix("deb http://mirrors.example.org/debian/ stable-updates main", "bookworm"),
+            "deb http://mirrors.example.org/debian/ bookworm-updates main"
+        );
+    }
+
+    #[test]
+    fn moves_an_end_of_life_release_to_the_archive() {
+        let got = fix("deb http://deb.debian.org/debian bullseye main", "bullseye");
+        assert_eq!(got, "deb http://archive.debian.org/debian bullseye main");
+    }
+
+    #[test]
+    fn leaves_a_correct_file_alone() {
+        let good = "deb http://deb.debian.org/debian bookworm main
+                    deb http://security.debian.org/debian-security bookworm-security main
+";
+        assert!(suggest_for(good, "debian", "bookworm").is_none());
+    }
+
+    #[test]
+    fn keeps_disabled_lines_disabled() {
+        let got = fix("# deb http://security.debian.org/debian-security bookworm/updates main", "bookworm");
+        assert!(got.starts_with('#'), "{got}");
+        assert!(got.contains("bookworm-security"), "{got}");
+    }
+
+    #[test]
+    fn ignores_comments_and_blank_lines() {
+        assert!(suggest_for("# just a note
+
+", "debian", "bookworm").is_none());
+    }
 }
