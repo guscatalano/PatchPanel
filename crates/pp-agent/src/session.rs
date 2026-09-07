@@ -43,6 +43,19 @@ const HEALTHY_SESSION: Duration = Duration::from_secs(30);
 /// orphan part of the fleet with no way back.
 const OVERRIDE_FAILURES_BEFORE_FALLBACK: u32 = 3;
 
+/// How often to ping the portal.
+///
+/// A TCP connection whose peer vanished without a FIN - a portal that was
+/// killed, a NAT table that forgot us - stays readable-but-silent forever, so
+/// `stream.next()` never returns and the session cannot notice it is dead.
+/// Only regular traffic and a deadline can tell the difference between a quiet
+/// portal and an absent one.
+const PING_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Drop the session if nothing at all has arrived in this long. Comfortably
+/// more than PING_INTERVAL so an occasional slow reply is not fatal.
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(75);
+
 /// Why a session ended.
 enum Disposition {
     /// Normal drop — reconnect.
@@ -61,7 +74,7 @@ struct Ctx {
     /// Last full snapshot, so a device-only or package-only refresh can still
     /// send the portal a complete picture.
     last: Arc<RwLock<Option<Inventory>>>,
-    tx: mpsc::UnboundedSender<ClientMsg>,
+    tx: mpsc::UnboundedSender<Message>,
     progress_tx: mpsc::UnboundedSender<(Uuid, String)>,
     /// Signals that a new binary is in place and this process should exit.
     ///
@@ -75,9 +88,14 @@ struct Ctx {
 
 impl Ctx {
     fn send(&self, msg: ClientMsg) {
-        // A closed channel means the session is already tearing down; the
-        // next connection will resend a fresh snapshot anyway.
-        let _ = self.tx.send(msg);
+        match serde_json::to_string(&msg) {
+            // A closed channel means the session is already tearing down; the
+            // next connection will resend a fresh snapshot anyway.
+            Ok(text) => {
+                let _ = self.tx.send(Message::Text(text.into()));
+            }
+            Err(e) => tracing::error!(error = %e, "failed to encode outbound frame"),
+        }
     }
 }
 
@@ -198,7 +216,7 @@ async fn session(
     tracing::info!(portal = %portal_url, "connected");
 
     let (mut sink, mut stream) = ws.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<(Uuid, String)>();
 
     // Fold live command output into the single outbound stream.
@@ -206,7 +224,11 @@ async fn session(
         let tx = tx.clone();
         tokio::spawn(async move {
             while let Some((id, line)) = progress_rx.recv().await {
-                if tx.send(ClientMsg::CommandProgress { id, line }).is_err() {
+                let msg = ClientMsg::CommandProgress { id, line };
+                let Ok(text) = serde_json::to_string(&msg) else {
+                    continue;
+                };
+                if tx.send(Message::Text(text.into())).is_err() {
                     break;
                 }
             }
@@ -218,15 +240,8 @@ async fn session(
     let writer = {
         let writer_failed = writer_failed.clone();
         tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                let text = match serde_json::to_string(&msg) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::error!(error = %e, "failed to encode outbound frame");
-                        continue;
-                    }
-                };
-                if sink.send(Message::Text(text.into())).await.is_err() {
+            while let Some(frame) = rx.recv().await {
+                if sink.send(frame).await.is_err() {
                     writer_failed.store(true, Ordering::SeqCst);
                     break;
                 }
@@ -263,8 +278,31 @@ async fn session(
     let mut schedules = JoinSet::new();
     let mut disposition = Disposition::Reconnect;
 
+    // Liveness. Without this the loop can park on `stream.next()` against a
+    // peer that is gone, and nothing ever wakes it.
+    let mut ping = tokio::time::interval(PING_INTERVAL);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_rx = std::time::Instant::now();
+
     loop {
         tokio::select! {
+            _ = ping.tick() => {
+                if writer_failed.load(Ordering::SeqCst) {
+                    tracing::warn!("outbound stream failed; reconnecting");
+                    break;
+                }
+                if last_rx.elapsed() > LIVENESS_TIMEOUT {
+                    tracing::warn!(
+                        silent_for_s = last_rx.elapsed().as_secs(),
+                        "portal stopped responding; reconnecting"
+                    );
+                    break;
+                }
+                // Any reply counts as proof of life; axum answers pings itself.
+                if tx.send(Message::Ping(Vec::new().into())).is_err() {
+                    break;
+                }
+            }
             // A self-update finished; leave so the new binary takes over.
             _ = restart_rx.recv() => {
                 disposition = Disposition::Restart;
@@ -273,6 +311,7 @@ async fn session(
             frame = stream.next() => {
                 let Some(frame) = frame else { break };
                 let frame = frame.context("reading from portal")?;
+                last_rx = std::time::Instant::now();
                 match frame {
                     Message::Text(text) => {
                         match serde_json::from_str::<ServerMsg>(text.as_str()) {
@@ -361,8 +400,20 @@ async fn apply_manifest_update(manifest: Manifest, ctx: &Ctx) {
 
     // The portal can name its canonical address, typically to move a fleet from
     // a short hostname onto an FQDN without touching every machine by hand.
-    if let Some(want) = manifest.portal_url.as_deref().map(str::trim) {
-        if !want.is_empty() {
+    {
+        let want = manifest.portal_url.as_deref().map(str::trim).unwrap_or("");
+        if want.is_empty() {
+            // Cleared in the manifest, so go back to the bootstrap address.
+            // Without this, a revert would leave the fleet pinned to whatever
+            // was published last and there would be no way to undo it.
+            let mut s = ctx.state.lock().await;
+            if s.portal_url_override.take().is_some() {
+                tracing::info!("manifest cleared the portal URL; reverting to bootstrap");
+                if let Err(e) = s.save(&ctx.cfg.state_dir) {
+                    tracing::error!(error = %e, "failed to persist portal URL");
+                }
+            }
+        } else {
             let normalised = crate::normalize_portal(want)
                 .map(|(ws, _)| ws)
                 .unwrap_or_else(|_| want.to_string());
