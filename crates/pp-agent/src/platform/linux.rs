@@ -1,7 +1,7 @@
 //! Debian/Ubuntu (apt) and RHEL-family (dnf) backends.
 
 use anyhow::Result;
-use pp_proto::{AppSource, AvailableUpdate, Ensure, Package};
+use pp_proto::{AppSource, AvailableUpdate, Cleanup, Ensure, Package, ScanIssue};
 
 use super::{AppOutcome, Backend, Platform};
 use crate::exec::{self, Progress};
@@ -163,11 +163,59 @@ fn parse_dnf_check_update(text: &str) -> Vec<AvailableUpdate> {
     out
 }
 
+pub fn scan_issues(pf: &Platform) -> Vec<ScanIssue> {
+    if pf.has(Backend::Apt) || pf.has(Backend::Dnf) {
+        return Vec::new();
+    }
+    vec![ScanIssue {
+        backend: "linux".into(),
+        problem: "no supported package manager was found (looked for apt-get and dnf)".into(),
+        remedy: "This machine's updates cannot be counted. If it uses another package \
+                 manager, PatchPanel does not support it yet."
+            .into(),
+    }]
+}
+
+/// Packages a plain `upgrade` will not touch because they need new packages
+/// installed - a kernel metapackage being the usual one. They are pending
+/// updates that will never apply until someone runs a full upgrade, so they
+/// deserve to be visible rather than silently skipped.
+pub async fn held_back(pf: &Platform, p: &Progress) -> Vec<String> {
+    if !pf.has(Backend::Apt) {
+        return Vec::new();
+    }
+    let Ok(o) = exec::run("apt-get", &["-s", "upgrade"], p).await else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    let mut in_block = false;
+    for line in o.text.lines() {
+        let t = line.trim();
+        if t.starts_with("The following packages have been kept back") {
+            in_block = true;
+            continue;
+        }
+        if in_block {
+            if t.is_empty() || t.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                break;
+            }
+            if line.starts_with(' ') || line.starts_with('\t') {
+                out.extend(t.split_whitespace().map(str::to_string));
+            } else {
+                break;
+            }
+        }
+    }
+    out
+}
+
 pub async fn apply_patches(
     pf: &Platform,
     security_only: bool,
     only: &[String],
     exclude: &[String],
+    full: bool,
     p: &Progress,
 ) -> Result<String> {
     let mut log = Vec::new();
@@ -208,6 +256,11 @@ pub async fn apply_patches(
                 args.push("--only-upgrade".into());
                 args.extend(names);
             }
+        } else if full {
+            // dist-upgrade/full-upgrade resolves changed dependencies, which is
+            // what moves a held-back kernel metapackage. It can also remove
+            // packages, so it is never the default.
+            args.push("full-upgrade".into());
         } else {
             args.push("upgrade".into());
         }
@@ -228,6 +281,7 @@ pub async fn apply_patches(
         if security_only {
             args.push("--security".into());
         }
+        let _ = full;
         for ex in exclude {
             args.push(format!("--exclude={ex}"));
         }
@@ -243,6 +297,121 @@ pub async fn apply_patches(
         anyhow::bail!("no Linux patch backend available");
     }
     Ok(log.join("\n"))
+}
+
+/// What `autoremove` would take, without taking it. `-s` simulates.
+pub async fn cleanup_preview(pf: &Platform, p: &Progress) -> Cleanup {
+    let mut out = Cleanup {
+        cache_bytes: dir_size("/var/cache/apt/archives") + dir_size("/var/cache/dnf"),
+        ..Default::default()
+    };
+
+    if pf.has(Backend::Apt) {
+        if let Ok(o) = exec::run("apt-get", &["-s", "autoremove"], p).await {
+            let (pkgs, bytes) = parse_apt_autoremove(&o.text);
+            out.packages.extend(pkgs);
+            out.reclaim_bytes += bytes;
+        }
+    }
+    if pf.has(Backend::Dnf) {
+        if let Ok(o) = exec::run("dnf", &["-q", "repoquery", "--unneeded"], p).await {
+            out.packages.extend(
+                o.text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(|l| l.split(':').next().unwrap_or(l).to_string()),
+            );
+        }
+    }
+    out
+}
+
+/// apt prints the set as an indented block, then a summary line carrying the
+/// size in human units.
+fn parse_apt_autoremove(text: &str) -> (Vec<String>, u64) {
+    let mut pkgs = Vec::new();
+    let mut bytes = 0u64;
+    let mut in_block = false;
+
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with("The following packages will be REMOVED") {
+            in_block = true;
+            continue;
+        }
+        if in_block {
+            // The block ends at the summary line, which starts with a count.
+            if t.is_empty() || t.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                in_block = false;
+            } else if line.starts_with(' ') || line.starts_with('	') {
+                pkgs.extend(t.split_whitespace().map(|w| w.trim_end_matches('*').to_string()));
+                continue;
+            } else {
+                in_block = false;
+            }
+        }
+        if let Some(rest) = t.strip_prefix("After this operation, ") {
+            if let Some(freed) = rest.split(" disk space will be freed").next() {
+                bytes = parse_size(freed);
+            }
+        }
+    }
+    (pkgs, bytes)
+}
+
+/// apt reports "12.3 MB" / "980 kB"; SI units, as apt uses them.
+fn parse_size(s: &str) -> u64 {
+    let s = s.trim();
+    let (num, unit): (String, String) = s
+        .chars()
+        .partition(|c| c.is_ascii_digit() || *c == '.' || *c == ',');
+    let n: f64 = num.replace(',', "").parse().unwrap_or(0.0);
+    let mult = match unit.trim().to_ascii_lowercase().as_str() {
+        "kb" => 1_000.0,
+        "mb" => 1_000_000.0,
+        "gb" => 1_000_000_000.0,
+        _ => 1.0,
+    };
+    (n * mult) as u64
+}
+
+fn dir_size(path: &str) -> u64 {
+    let Ok(dir) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    dir.filter_map(|e| e.ok())
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum()
+}
+
+pub async fn cleanup(pf: &Platform, purge: bool, p: &Progress) -> Result<String> {
+    let mut log = Vec::new();
+
+    if pf.has(Backend::Apt) {
+        let mut args = vec!["-y", "autoremove"];
+        if purge {
+            args.push("--purge");
+        }
+        let o = exec::run("apt-get", &args, p).await?.require(&[])?;
+        log.push(exec::tail(&o.text, 3000));
+        // Emptying the cache reclaims space with no risk at all.
+        let o = exec::run("apt-get", &["-y", "clean"], p).await?.require(&[])?;
+        log.push(exec::tail(&o.text, 200));
+    }
+    if pf.has(Backend::Dnf) {
+        let o = exec::run("dnf", &["-y", "autoremove"], p).await?.require(&[])?;
+        log.push(exec::tail(&o.text, 3000));
+        let _ = exec::run("dnf", &["-y", "clean", "packages"], p).await;
+    }
+
+    if log.is_empty() {
+        anyhow::bail!("no cleanup backend available");
+    }
+    Ok(log.join("
+"))
 }
 
 pub async fn reboot_required() -> bool {

@@ -174,6 +174,41 @@ impl ReleaseInfo {
     }
 }
 
+/// A reason this machine's update count cannot be trusted.
+///
+/// The dangerous failure for a patch tool is reporting zero because nothing
+/// could be scanned - indistinguishable, on a dashboard, from a machine that
+/// is fully patched. Anything that stops a scan is recorded here so the number
+/// can be shown as unknown rather than good.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanIssue {
+    /// Which backend could not run: "winget", "windowsupdate", "apt", ...
+    pub backend: String,
+    pub problem: String,
+    /// What an operator should do about it.
+    #[serde(default)]
+    pub remedy: String,
+}
+
+/// Reclaimable space: packages kept only as dependencies nothing needs any
+/// more, plus the downloaded-package cache.
+///
+/// Reported before it is acted on, because `autoremove` occasionally proposes
+/// something load-bearing - an old kernel you are still booting, a library a
+/// hand-installed binary links against - and that is worth a human glance.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Cleanup {
+    /// Packages `autoremove` would take.
+    #[serde(default)]
+    pub packages: Vec<String>,
+    /// Bytes those packages occupy.
+    #[serde(default)]
+    pub reclaim_bytes: u64,
+    /// Downloaded .deb/.rpm files. Deleting these is always safe.
+    #[serde(default)]
+    pub cache_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Package {
     pub name: String,
@@ -215,6 +250,17 @@ pub struct Inventory {
     /// Distribution release state and upgrade readiness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release: Option<ReleaseInfo>,
+    /// What could be cleaned up, without having done it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<Cleanup>,
+    /// Backends that could not be scanned. Non-empty means `updates` is a
+    /// floor, not a total.
+    #[serde(default)]
+    pub scan_issues: Vec<ScanIssue>,
+    /// Upgrades apt declined to perform because they need new packages
+    /// installed - `upgrade` will never take these, only `full-upgrade` will.
+    #[serde(default)]
+    pub held_back: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,6 +288,11 @@ pub enum Command {
         /// Empty means "everything the policy allows".
         #[serde(default)]
         only: Vec<String>,
+        /// Use `full-upgrade`, which may install new packages and remove
+        /// existing ones. Required to move held-back upgrades such as a kernel
+        /// metapackage, and deliberately not the default.
+        #[serde(default)]
+        full: bool,
     },
     /// Replace the agent binary with the one at `url`, then restart.
     SelfUpdate {
@@ -261,6 +312,13 @@ pub enum Command {
     },
     /// Sweep the configured CIDRs for undeclared devices.
     Discover,
+    /// Remove packages nothing depends on any more, and empty the package
+    /// cache. Reports exactly what it took.
+    Cleanup {
+        /// Also delete configuration files belonging to removed packages.
+        #[serde(default)]
+        purge: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

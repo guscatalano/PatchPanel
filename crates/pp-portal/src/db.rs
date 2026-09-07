@@ -542,6 +542,7 @@ pub fn command_kind(cmd: &Command) -> &'static str {
         Command::Reboot { .. } => "reboot",
         Command::ProbeDevices { .. } => "probe_devices",
         Command::Discover => "discover",
+        Command::Cleanup { .. } => "cleanup",
     }
 }
 

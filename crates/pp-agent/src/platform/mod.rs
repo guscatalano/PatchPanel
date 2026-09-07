@@ -5,7 +5,7 @@
 //! new OS means adding a module and three match arms, not touching the loop.
 
 use anyhow::{Context, Result};
-use pp_proto::{AppSource, AvailableUpdate, Ensure, Package};
+use pp_proto::{AppSource, AvailableUpdate, Cleanup, Ensure, Package, ScanIssue};
 
 use crate::exec::{self, Progress};
 
@@ -135,15 +135,56 @@ impl Platform {
         security_only: bool,
         only: &[String],
         exclude: &[String],
+        full: bool,
         p: &Progress,
     ) -> Result<String> {
-        let _ = (security_only, only, exclude, p);
+        let _ = (security_only, only, exclude, full, p);
         #[cfg(target_os = "linux")]
-        return linux::apply_patches(self, security_only, only, exclude, p).await;
+        return linux::apply_patches(self, security_only, only, exclude, full, p).await;
         #[cfg(windows)]
         return windows::apply_patches(self, security_only, only, exclude, p).await;
         #[cfg(not(any(target_os = "linux", windows)))]
         anyhow::bail!("no patch backend on this platform");
+    }
+
+    /// Backends this machine cannot scan, and why.
+    ///
+    /// Reported so a zero update count can be shown as "unknown" rather than
+    /// "clean" - the difference between a patched machine and a blind one.
+    pub fn scan_issues(&self) -> Vec<ScanIssue> {
+        #[cfg(target_os = "linux")]
+        return linux::scan_issues(self);
+        #[cfg(windows)]
+        return windows::scan_issues(self);
+        #[cfg(not(any(target_os = "linux", windows)))]
+        return Vec::new();
+    }
+
+    /// Upgrades apt is refusing to perform with a plain `upgrade`.
+    pub async fn held_back(&self, p: &Progress) -> Vec<String> {
+        let _ = p;
+        #[cfg(target_os = "linux")]
+        return linux::held_back(self, p).await;
+        #[cfg(not(target_os = "linux"))]
+        return Vec::new();
+    }
+
+    /// What could be freed, without freeing it.
+    pub async fn cleanup_preview(&self, p: &Progress) -> Cleanup {
+        let _ = p;
+        #[cfg(target_os = "linux")]
+        return linux::cleanup_preview(self, p).await;
+        #[cfg(not(target_os = "linux"))]
+        return Cleanup::default();
+    }
+
+    /// Remove orphaned packages and empty the package cache.
+    pub async fn cleanup(&self, purge: bool, p: &Progress) -> Result<String> {
+        let _ = (purge, p);
+        #[cfg(target_os = "linux")]
+        return linux::cleanup(self, purge, p).await;
+        #[cfg(not(target_os = "linux"))]
+        anyhow::bail!("no package cleanup is available on this platform");
     }
 
     pub async fn reboot_required(&self) -> bool {

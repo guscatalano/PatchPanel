@@ -508,7 +508,7 @@ fn start_schedules(ctx: Ctx, schedules: &mut JoinSet<()>) {
                     let p = Progress::detached();
                     match ctx
                         .platform
-                        .apply_patches(policy.security_only, &[], &policy.exclude, &p)
+                        .apply_patches(policy.security_only, &[], &policy.exclude, false, &p)
                         .await
                     {
                         Ok(log) => tracing::info!(summary = %crate::exec::tail(&log, 300), "auto-patch run"),
@@ -574,6 +574,15 @@ async fn refresh_packages(ctx: &Ctx) {
     });
     let repositories = crate::repos::collect();
     let release = crate::release::collect(&repositories);
+    let cleanup = Some(ctx.platform.cleanup_preview(&p).await);
+    let scan_issues = ctx.platform.scan_issues();
+    let held_back = ctx.platform.held_back(&p).await;
+    if !scan_issues.is_empty() {
+        tracing::warn!(
+            count = scan_issues.len(),
+            "some backends could not be scanned; the update count is a floor, not a total"
+        );
+    }
     let drift = compute_drift(ctx, &p).await;
     let reboot_required = ctx.platform.reboot_required().await;
 
@@ -593,6 +602,9 @@ async fn refresh_packages(ctx: &Ctx) {
         discovered,
         repositories,
         release,
+        cleanup,
+        scan_issues,
+        held_back,
     };
     *last = Some(inv.clone());
     drop(last);
@@ -646,6 +658,9 @@ async fn refresh_devices(ctx: &Ctx, only: &[String]) -> usize {
         discovered: Vec::new(),
         repositories: Vec::new(),
         release: None,
+        cleanup: None,
+        scan_issues: Vec::new(),
+        held_back: Vec::new(),
     });
 
     // A narrowed probe updates only the devices it touched.
@@ -782,11 +797,12 @@ async fn execute(cmd: Command, ctx: &Ctx, p: &Progress) -> Result<String> {
         Command::ApplyPatches {
             security_only,
             only,
+            full,
         } => {
             let policy = ctx.manifest.read().await.patch_policy.clone();
             let log = ctx
                 .platform
-                .apply_patches(security_only, &only, &policy.exclude, p)
+                .apply_patches(security_only, &only, &policy.exclude, full, p)
                 .await?;
             refresh_packages(ctx).await;
             Ok(log)
@@ -806,6 +822,12 @@ async fn execute(cmd: Command, ctx: &Ctx, p: &Progress) -> Result<String> {
         Command::ProbeDevices { only } => {
             let n = refresh_devices(ctx, &only).await;
             Ok(format!("probed {n} device(s)"))
+        }
+
+        Command::Cleanup { purge } => {
+            let log = ctx.platform.cleanup(purge, p).await?;
+            refresh_packages(ctx).await;
+            Ok(log)
         }
 
         Command::Discover => {

@@ -6,7 +6,7 @@
 //! without it still reports full inventory, it just cannot apply OS patches.
 
 use anyhow::{Context, Result};
-use pp_proto::{AppSource, AvailableUpdate, Ensure, Package};
+use pp_proto::{AppSource, AvailableUpdate, Ensure, Package, ScanIssue};
 use serde::Deserialize;
 
 use super::{AppOutcome, Backend, Platform};
@@ -48,10 +48,62 @@ fn ps_json<T: for<'de> Deserialize<'de>>(text: &str) -> Result<Vec<T>> {
     }
 }
 
+/// Locate winget.
+///
+/// It ships as a per-user MSIX (App Installer), so a service running as
+/// LocalSystem does not get it on PATH and `where winget.exe` fails. That made
+/// every service-mode Windows agent silently report zero app updates. Fall back
+/// to the versioned WindowsApps directory where the package actually lives.
+pub fn winget_path() -> Option<String> {
+    if exec::have("winget.exe") {
+        return Some("winget.exe".to_string());
+    }
+    let base = std::env::var("ProgramFiles").ok()?;
+    let dir = std::path::Path::new(&base).join("WindowsApps");
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("Microsoft.DesktopAppInstaller_")
+        })
+        .map(|e| e.path().join("winget.exe"))
+        .filter(|p| p.exists())
+        .collect();
+    // Several versions can be installed side by side; the newest sorts last.
+    found.sort();
+    found.pop().map(|p| p.to_string_lossy().into_owned())
+}
+
+pub fn scan_issues(pf: &Platform) -> Vec<ScanIssue> {
+    let mut out = Vec::new();
+    if !pf.has(Backend::Winget) {
+        out.push(ScanIssue {
+            backend: "winget".into(),
+            problem: "winget was not found, so application updates are not being scanned".into(),
+            remedy: "Install the App Installer package for all users, or run the agent as a \
+                     user that has winget. Note winget ships per-user, so a LocalSystem \
+                     service often cannot see it."
+                .into(),
+        });
+    }
+    if !pf.has(Backend::WindowsUpdate) {
+        out.push(ScanIssue {
+            backend: "windowsupdate".into(),
+            problem: "the PSWindowsUpdate module is missing, so operating system updates are \
+                      not being scanned"
+                .into(),
+            remedy: "Install-Module PSWindowsUpdate -Force -Scope AllUsers".into(),
+        });
+    }
+    out
+}
+
 pub fn detect() -> Vec<Backend> {
     // Every Windows machine has the registry inventory path.
     let mut v = vec![Backend::Registry];
-    if exec::have("winget.exe") {
+    if winget_path().is_some() {
         v.push(Backend::Winget);
     }
     if has_pswindowsupdate() {
@@ -135,7 +187,7 @@ pub async fn available_updates(pf: &Platform, p: &Progress) -> Result<Vec<Availa
 
     if pf.has(Backend::Winget) {
         let o = exec::run(
-            "winget.exe",
+            &winget_path().unwrap_or_else(|| "winget.exe".into()),
             &[
                 "upgrade",
                 "--include-unknown",
@@ -275,7 +327,7 @@ pub async fn apply_patches(
         } else {
             for id in only.iter().filter(|i| !exclude.contains(i)) {
                 let o = exec::run(
-                    "winget.exe",
+                    &winget_path().unwrap_or_else(|| "winget.exe".into()),
                     &[
                         "upgrade",
                         "--id",
@@ -367,7 +419,7 @@ pub async fn ensure_app(
             }
             let mut args = vec!["uninstall", "--id", id];
             args.extend_from_slice(&base[..3]);
-            exec::run("winget.exe", &args, p).await?.require(&[])?;
+            exec::run(&winget_path().unwrap_or_else(|| "winget.exe".into()), &args, p).await?.require(&[])?;
             Ok(AppOutcome::changed(format!("removed `{name}`"), None))
         }
         Ensure::Present => {
@@ -385,7 +437,7 @@ pub async fn ensure_app(
                 args.push("--version");
                 args.push(v);
             }
-            exec::run("winget.exe", &args, p).await?.require(&[])?;
+            exec::run(&winget_path().unwrap_or_else(|| "winget.exe".into()), &args, p).await?.require(&[])?;
             let now = winget_installed_version(id, p).await;
             Ok(AppOutcome::changed(format!("installed `{name}`"), now))
         }
@@ -393,7 +445,7 @@ pub async fn ensure_app(
             let verb = if installed.is_some() { "upgrade" } else { "install" };
             let mut args = vec![verb, "--id", id];
             args.extend_from_slice(&base);
-            let o = exec::run("winget.exe", &args, p).await?;
+            let o = exec::run(&winget_path().unwrap_or_else(|| "winget.exe".into()), &args, p).await?;
             // 0x8A15002B / "No applicable upgrade found" surfaces as a non-zero
             // exit even though the machine is already in the desired state.
             let already_current = o.text.contains("No applicable")
@@ -429,7 +481,7 @@ pub async fn observed_version(pf: &Platform, source: &AppSource, p: &Progress) -
 
 async fn winget_installed_version(id: &str, p: &Progress) -> Option<String> {
     let o = exec::run(
-        "winget.exe",
+        &winget_path().unwrap_or_else(|| "winget.exe".into()),
         &[
             "list",
             "--id",
