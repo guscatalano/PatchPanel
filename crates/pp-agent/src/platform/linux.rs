@@ -222,10 +222,30 @@ pub async fn held_back(pf: &Platform, p: &Progress) -> Vec<String> {
     let Ok(o) = exec::run("apt-get", &["-s", "upgrade"], p).await else {
         return Vec::new();
     };
+    parse_kept_back(&o.text)
+}
 
+/// Upgrades that even `full-upgrade` will not perform.
+///
+/// A package kept back by `upgrade` is usually just waiting for a dependency
+/// change. One kept back by `full-upgrade` as well is stuck for another
+/// reason - most often Ubuntu's phased rollouts, which withhold an update from
+/// a share of machines. Those stay in the pending count forever, and without
+/// naming them a patch run looks like it silently did nothing.
+pub async fn deferred(pf: &Platform, p: &Progress) -> Vec<String> {
+    if !pf.has(Backend::Apt) {
+        return Vec::new();
+    }
+    let Ok(o) = exec::run("apt-get", &["-s", "full-upgrade"], p).await else {
+        return Vec::new();
+    };
+    parse_kept_back(&o.text)
+}
+
+fn parse_kept_back(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut in_block = false;
-    for line in o.text.lines() {
+    for line in text.lines() {
         let t = line.trim();
         if t.starts_with("The following packages have been kept back") {
             in_block = true;

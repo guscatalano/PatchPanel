@@ -62,6 +62,8 @@ pub struct AgentRow {
     pub scan_issue_count: usize,
     /// Upgrades apt will not apply without a full upgrade.
     pub held_back_count: usize,
+    /// Upgrades nothing will apply, so the pending count can never reach zero.
+    pub deferred_count: usize,
     /// A command dispatched to this agent that has not reported back yet.
     /// Present means work is in flight and the machine should not be given
     /// more, which is the difference between one patch run and two.
@@ -405,6 +407,7 @@ impl Db {
                 device_problem_count: device_problems,
                 scan_issue_count: inv.as_ref().map(|i| i.scan_issues.len()).unwrap_or(0),
                 held_back_count: inv.as_ref().map(|i| i.held_back.len()).unwrap_or(0),
+                deferred_count: inv.as_ref().map(|i| i.deferred.len()).unwrap_or(0),
                 running: running.get(&id).cloned(),
                 release_blockers: inv
                     .as_ref()

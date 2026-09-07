@@ -584,6 +584,7 @@ async fn refresh_packages(ctx: &Ctx) {
     let cleanup = Some(ctx.platform.cleanup_preview(&p).await);
     scan_issues.extend(ctx.platform.scan_issues());
     let held_back = ctx.platform.held_back(&p).await;
+    let deferred = ctx.platform.deferred(&p).await;
     if !scan_issues.is_empty() {
         tracing::warn!(
             count = scan_issues.len(),
@@ -612,6 +613,7 @@ async fn refresh_packages(ctx: &Ctx) {
         cleanup,
         scan_issues,
         held_back,
+        deferred,
     };
     *last = Some(inv.clone());
     drop(last);
@@ -668,6 +670,7 @@ async fn refresh_devices(ctx: &Ctx, only: &[String]) -> usize {
         cleanup: None,
         scan_issues: Vec::new(),
         held_back: Vec::new(),
+        deferred: Vec::new(),
     });
 
     // A narrowed probe updates only the devices it touched.

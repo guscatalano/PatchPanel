@@ -194,6 +194,15 @@ impl Platform {
         return Vec::new();
     }
 
+    /// Upgrades that even a full upgrade will not apply.
+    pub async fn deferred(&self, p: &Progress) -> Vec<String> {
+        let _ = p;
+        #[cfg(target_os = "linux")]
+        return linux::deferred(self, p).await;
+        #[cfg(not(target_os = "linux"))]
+        return Vec::new();
+    }
+
     /// What could be freed, without freeing it.
     pub async fn cleanup_preview(&self, p: &Progress) -> Cleanup {
         let _ = p;

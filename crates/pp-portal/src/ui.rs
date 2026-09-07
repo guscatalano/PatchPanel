@@ -494,6 +494,9 @@ async function loadFleet() {
     const unsafe_ = a.release_blockers > 0
       ? ` <span class="pill bad" title="This machine's package sources are misconfigured; installing updates could break it. Open the machine for details.">unsafe</span>`
       : "";
+    const stuck = a.deferred_count
+      ? ` <span class="pill" title="${a.deferred_count} update(s) that even a full upgrade will not install - usually a phased rollout. The pending count cannot reach zero until the archive releases them.">${a.deferred_count} deferred</span>`
+      : "";
     const held = a.held_back_count
       ? ` <span class="pill warn" title="${a.held_back_count} upgrade(s) apt will not apply without a full upgrade - often a kernel">${a.held_back_count} held</span>`
       : "";
@@ -528,7 +531,7 @@ async function loadFleet() {
       <td title="${esc(a.os_version)} ${esc(a.arch)}">${esc(a.os_version.length > 22 ? a.os_version.slice(0, 21) + "…" : a.os_version)}
           <div class="msg mono">${esc(a.arch)}</div></td>
       <td>${esc(a.site) || "-"}</td>
-      <td>${upd}${unsafe_}${busyPill}</td>
+      <td>${upd}${unsafe_}${held ? "" : ""}${stuck}${busyPill}</td>
       <td>${a.drift_count ? `<span class="pill warn">${a.drift_count}</span>` : "-"}</td>
       <td>${dev}</td>
       <td class="mono">${a.applied_revision < REV ? `<span class="pill warn">r${a.applied_revision}</span>` : "r" + a.applied_revision}</td>
@@ -565,8 +568,8 @@ function kv(rows) {
     .join("") + `</dl>`;
 }
 
-function scanCard(issues, held, id, connected) {
-  if (!issues.length && !held.length) return "";
+function scanCard(issues, held, deferred, id, connected) {
+  if (!issues.length && !held.length && !deferred.length) return "";
   return `<div class="card">
     <h2>Coverage</h2>
     ${issues.length ? `<div class="step">
@@ -583,6 +586,15 @@ function scanCard(issues, held, id, connected) {
              title="Installs the NuGet provider, PSWindowsUpdate, and repairs winget for all users. Downloads from the PowerShell Gallery."
              onclick="installPrereqs('${id}')">Install the missing tooling</button>`
         : ""}
+    </div>` : ""}
+    ${deferred.length ? `<div class="step">
+      <h3><span class="pill">deferred</span> ${deferred.length} update(s) nothing will install yet</h3>
+      <p>Even <code>apt full-upgrade</code> refuses these. On Ubuntu that almost always means a
+         <b>phased rollout</b>: the archive withholds an update from a percentage of machines
+         until it has proven itself, and this machine is not in the cohort yet. There is nothing
+         to fix &mdash; but the pending count cannot reach zero until the archive releases them,
+         so a patch run that appears to do nothing is in fact correct.</p>
+      <pre>${esc(deferred.join(" "))}</pre>
     </div>` : ""}
     ${held.length ? `<div class="step">
       <h3><span class="pill warn">held back</span> ${held.length} upgrade(s) apt will not apply</h3>
@@ -797,7 +809,7 @@ async function loadAgent(id) {
       }).join("") : `<div class="empty">Nothing has changed this machine yet.</div>`}
     </div>
 
-    ${scanCard(inv.scan_issues || [], inv.held_back || [], d.id, d.connected)}
+    ${scanCard(inv.scan_issues || [], inv.held_back || [], inv.deferred || [], d.id, d.connected)}
 
     ${cleanupCard(inv.cleanup, d.id, d.connected)}
 

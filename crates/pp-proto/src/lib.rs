@@ -261,6 +261,12 @@ pub struct Inventory {
     /// installed - `upgrade` will never take these, only `full-upgrade` will.
     #[serde(default)]
     pub held_back: Vec<String>,
+    /// Upgrades that even a full upgrade refuses. On Ubuntu these are usually
+    /// phased: the archive deliberately withholds them from a fraction of
+    /// machines until the rollout completes. They are counted as pending and
+    /// will never install, which looks exactly like a broken patch run.
+    #[serde(default)]
+    pub deferred: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
