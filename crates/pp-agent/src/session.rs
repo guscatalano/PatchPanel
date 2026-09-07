@@ -339,8 +339,17 @@ async fn session(
     }
 
     schedules.shutdown().await;
+
+    // Do NOT await the writer. It ends only when every sender is dropped, and
+    // `ctx` holds one - as does any command task still in flight - so awaiting
+    // it waits on a channel that can never close. That hang is what wedged
+    // agents: the loop exited, teardown blocked here forever, and the process
+    // sat holding an open socket while doing nothing at all. The connection is
+    // being discarded either way, so abort it.
+    drop(ctx);
     drop(tx);
-    let _ = writer.await;
+    writer.abort();
+
     Ok(disposition)
 }
 
