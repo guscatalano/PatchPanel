@@ -445,12 +445,12 @@ async function loadAdd() {
   $("cmd-linux").textContent =
     `curl -fsSL http://${host}/install.sh | sh -s -- --token ${token} --site ${site}`;
 
-  // No temp file and no backslashes: a path in the command line is one stray
-  // copy-paste away from `$env:TEMPpp.ps1`, and PowerShell's error for that is
-  // baffling. Creating a scriptblock from the response sidesteps it entirely.
+  // Two plain commands beat one clever one. No scriptblock, no temp path, and
+  // `./` rather than `.\` so a mangled backslash cannot break it.
   $("cmd-win").textContent =
-    `& ([scriptblock]::Create((irm http://${host}/install.ps1))) ` +
-    `-Token ${token} -Site ${site}`;
+    `irm http://${host}/download/pp-agent.exe -OutFile pp-agent.exe
+` +
+    `./pp-agent.exe setup --portal ws://${host}/api/agent/ws --token ${token} --site ${site}`;
 
   // A bare IP works until DHCP moves the portal, and then every enrolled agent
   // is pointing at nothing. Say so once, here, rather than in a runbook.

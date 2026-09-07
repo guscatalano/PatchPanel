@@ -110,20 +110,9 @@ curl -fsSL "http://$PORTAL/download/pp-agent" -o /usr/local/bin/.pp-agent.new
 chmod 0755 /usr/local/bin/.pp-agent.new
 mv /usr/local/bin/.pp-agent.new /usr/local/bin/pp-agent
 
-echo "==> enrolling with $PORTAL as site '$SITE'"
-install -d -m 0755 /etc/patchpanel /var/lib/patchpanel
-/usr/local/bin/pp-agent --config /etc/patchpanel/agent.json enroll \
-  --portal "ws://$PORTAL/api/agent/ws" \
-  --token "$TOKEN" \
-  --site "$SITE" \
-  --state-dir /var/lib/patchpanel >/dev/null
-chmod 600 /etc/patchpanel/agent.json
-
-echo "==> installing service"
-curl -fsSL "http://$PORTAL/download/patchpanel-agent.service" \
-  -o /etc/systemd/system/patchpanel-agent.service
-systemctl daemon-reload
-systemctl enable --now patchpanel-agent
+# The agent installs itself: writes config, drops the unit, enables and starts.
+# Keeping that logic in the binary means the shell script cannot get it wrong.
+/usr/local/bin/pp-agent setup   --portal "ws://$PORTAL/api/agent/ws"   --token "$TOKEN"   --site "$SITE"   --state-dir /var/lib/patchpanel
 
 sleep 2
 if systemctl is-active --quiet patchpanel-agent; then
@@ -194,20 +183,9 @@ New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 Invoke-WebRequest -UseBasicParsing -Uri "http://$Portal/download/pp-agent.exe" -OutFile "$target.new"
 Move-Item -Force "$target.new" $target
 
-Write-Host "==> enrolling with $Portal as site '$Site'"
-& $target enroll --portal "ws://$Portal/api/agent/ws" --token $Token --site $Site
-if ($LASTEXITCODE -ne 0) {{ throw "Enrollment failed ($LASTEXITCODE)." }}
-
-$config = Join-Path $env:ProgramData 'PatchPanel\agent.json'
-if (Test-Path $config) {{
-  icacls $config /inheritance:r /grant:r "SYSTEM:(F)" "Administrators:(F)" | Out-Null
-}}
-
-if (-not (Get-Service -Name $service -ErrorAction SilentlyContinue)) {{
-  Write-Host '==> registering service'
-  & $target install-service
-  if ($LASTEXITCODE -ne 0) {{ throw "Service registration failed ($LASTEXITCODE)." }}
-}}
+# The agent installs itself from here: config, service registration, start.
+& $target setup --portal "ws://$Portal/api/agent/ws" --token $Token --site $Site
+if ($LASTEXITCODE -ne 0) {{ throw "Setup failed ($LASTEXITCODE)." }}
 
 Start-Service -Name $service
 Start-Sleep -Seconds 2

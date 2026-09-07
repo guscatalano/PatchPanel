@@ -57,6 +57,22 @@ enum Cmd {
         state_dir: Option<PathBuf>,
     },
 
+    /// Enroll, install the service, and start it - the whole install in one go.
+    ///
+    /// This is what the portal's one-line installers call. It exists so adding
+    /// a machine never depends on getting shell quoting right.
+    Setup {
+        #[arg(long)]
+        portal: String,
+        #[arg(long, default_value = "")]
+        token: String,
+        /// Defaults to this machine's hostname.
+        #[arg(long, default_value = "")]
+        site: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+
     /// Print what this machine looks like, without contacting the portal.
     Inventory,
 
@@ -137,6 +153,29 @@ fn main() -> Result<()> {
                 Ok(())
             }
 
+            Cmd::Setup {
+                portal,
+                token,
+                site,
+                state_dir,
+            } => {
+                let site = if site.is_empty() {
+                    gethostname::gethostname().to_string_lossy().into_owned()
+                } else {
+                    site
+                };
+                let mut cfg = config::Config {
+                    portal_url: portal,
+                    enrollment_token: token,
+                    site,
+                    ..Default::default()
+                };
+                if let Some(dir) = state_dir {
+                    cfg.state_dir = dir;
+                }
+                setup(cfg, &config_path).await
+            }
+
             Cmd::Inventory => local_inventory().await,
 
             Cmd::Probe { target, kind, arg } => probe_once(target, kind, arg).await,
@@ -149,6 +188,110 @@ fn main() -> Result<()> {
             Cmd::RunService => service::run_as_service(),
         }
     })
+}
+
+/// Where the agent must live for a service to reference it reliably.
+fn canonical_binary_path() -> PathBuf {
+    if cfg!(windows) {
+        let base = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
+        PathBuf::from(base).join("PatchPanel").join("pp-agent.exe")
+    } else {
+        PathBuf::from("/usr/local/bin/pp-agent")
+    }
+}
+
+/// The systemd unit, embedded so a Linux install needs nothing but the binary.
+#[cfg(unix)]
+const SYSTEMD_UNIT: &str = include_str!("../../../deploy/patchpanel-agent.service");
+
+/// Write the config, register the service, and start it. Idempotent: running
+/// it again upgrades in place and keeps the machine's existing identity.
+async fn setup(cfg: config::Config, config_path: &std::path::Path) -> Result<()> {
+    use anyhow::Context as _;
+
+    // The service records an absolute path to its binary, so the agent must
+    // live somewhere permanent before we register it. A one-line installer
+    // downloads to a temp directory or the current folder, and neither of those
+    // survives; relocate ourselves first.
+    let canonical = canonical_binary_path();
+    let current = std::env::current_exe().context("locating current executable")?;
+    let relocated = current != canonical;
+
+    if relocated {
+        if let Some(dir) = canonical.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        // On Windows a running service holds its image open, so stop it before
+        // overwriting. Harmless when no service exists yet.
+        #[cfg(windows)]
+        {
+            let p = exec::Progress::detached();
+            let _ = exec::run("sc.exe", &["stop", service::SERVICE_NAME], &p).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        std::fs::copy(&current, &canonical)
+            .with_context(|| format!("installing agent to {}", canonical.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&canonical, std::fs::Permissions::from_mode(0o755))?;
+        }
+        println!("==> installed agent to {}", canonical.display());
+    }
+
+    cfg.save(config_path)?;
+    println!("==> wrote {}", config_path.display());
+
+    // Restrict the config: until the portal issues a per-agent token, it holds
+    // the shared enrollment secret.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(config_path)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(config_path, perms)?;
+    }
+
+    std::fs::create_dir_all(&cfg.state_dir)?;
+    println!("==> enrolling with {} as site '{}'", cfg.portal_url, cfg.site);
+
+    #[cfg(unix)]
+    {
+        let unit = std::path::Path::new("/etc/systemd/system/patchpanel-agent.service");
+        std::fs::write(unit, SYSTEMD_UNIT)
+            .with_context(|| format!("writing {}", unit.display()))?;
+        println!("==> installed {}", unit.display());
+
+        let p = exec::Progress::detached();
+        exec::run("systemctl", &["daemon-reload"], &p).await?.require(&[])?;
+        exec::run("systemctl", &["enable", "--now", "patchpanel-agent"], &p)
+            .await?
+            .require(&[])?;
+        println!("==> service started");
+        println!("    logs: journalctl -u patchpanel-agent -f");
+    }
+
+    #[cfg(windows)]
+    {
+        let p = exec::Progress::detached();
+        // Register via the installed copy, so the service points at the
+        // permanent path rather than wherever this process was launched from.
+        let bin = canonical.to_string_lossy().to_string();
+        let out = exec::run(&bin, &["install-service"], &p).await?;
+        if !out.ok() {
+            // Already registered is fine; anything else is not.
+            println!("==> service already registered");
+        }
+        let _ = exec::run("sc.exe", &["stop", service::SERVICE_NAME], &p).await;
+        exec::run("sc.exe", &["start", service::SERVICE_NAME], &p)
+            .await?
+            .require(&[])?;
+        println!("==> service started");
+        println!("    check: Get-Service {}", service::SERVICE_NAME);
+    }
+
+    println!("==> done");
+    Ok(())
 }
 
 fn init_logging(filter: &str) {
