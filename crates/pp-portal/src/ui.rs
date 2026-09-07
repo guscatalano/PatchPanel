@@ -72,7 +72,8 @@ const INDEX: &str = r##"<!doctype html>
   .card > h2 { font-size: 13px; margin: 0; padding: 11px 14px; border-bottom: 1px solid var(--line); color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
   .scroll { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; font-size: 13px; }
-  th, td { text-align: left; padding: 8px 14px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; vertical-align: top; }
+  td .msg { font-size: 11px; }
   th { color: var(--muted); font-weight: 600; font-size: 12px; }
   tr:last-child td { border-bottom: none; }
   tbody tr:hover { background: var(--bg); }
@@ -88,7 +89,7 @@ const INDEX: &str = r##"<!doctype html>
   .pill.ok { color: var(--ok); border-color: var(--ok); }
 
   button.act {
-    font: inherit; font-size: 12px; padding: 3px 9px; margin-right: 4px;
+    font: inherit; font-size: 12px; padding: 3px 8px; margin-right: 3px;
     background: var(--bg); color: var(--ink);
     border: 1px solid var(--line); border-radius: 6px; cursor: pointer;
   }
@@ -176,8 +177,8 @@ const INDEX: &str = r##"<!doctype html>
         <h2>Agents</h2>
         <div class="scroll"><table>
           <thead><tr>
-            <th>Host</th><th>IP</th><th>OS</th><th>Hardware</th><th>Site</th>
-            <th>Updates</th><th>Drift</th><th>Devices</th><th>Manifest</th><th>Last seen</th><th></th>
+            <th>Host</th><th>IP</th><th>OS</th><th>Site</th>
+            <th>Updates</th><th>Drift</th><th>Devices</th><th>Rev</th><th>Seen</th><th></th>
           </tr></thead>
           <tbody id="agents"></tbody>
         </table></div>
@@ -455,18 +456,23 @@ async function loadFleet() {
       ? `${a.device_count}${a.device_problem_count ? ` <span class="pill bad">${a.device_problem_count}</span>` : ""}`
       : "-";
     const hw = a.hardware || {};
-    const cpu = hw.cpu_model
-      ? `${esc(hw.cpu_model)}<div class="msg">${hw.cpu_cores || "?"}c/${hw.cpu_threads || "?"}t · ${hw.memory_mb ? (hw.memory_mb / 1024).toFixed(0) + " GB" : "? GB"}</div>`
-      : "-";
+    // Hardware lives on the machine's own page; in a fleet list it is a very
+    // wide column nobody scans. Keep it reachable as a tooltip.
+    const spec = [
+      hw.cpu_model,
+      hw.cpu_threads ? `${hw.cpu_cores || "?"}c/${hw.cpu_threads}t` : "",
+      hw.memory_mb ? `${(hw.memory_mb / 1024).toFixed(0)} GB` : "",
+      hw.vendor,
+    ].filter(Boolean).join(" · ");
     const ips = (hw.ip_addresses || []).length
       ? `${esc(hw.ip_addresses[0])}${hw.ip_addresses.length > 1 ? `<div class="msg">+${hw.ip_addresses.length - 1} more</div>` : ""}`
       : "-";
-    return `<tr title="${esc(hw.vendor || "")}">
+    return `<tr title="${esc(spec)}">
       <td><span class="dot ${live}"></span><a href="#agent/${a.id}" style="color:inherit">${esc(a.hostname)}</a>${a.reboot_required ? ' <span class="pill warn">reboot</span>' : ""}
           <div class="msg">agent ${esc(a.agent_version)}</div></td>
       <td class="mono">${ips}</td>
-      <td>${esc(a.os_version)} <span class="mono">${esc(a.arch)}</span></td>
-      <td class="mono">${cpu}</td>
+      <td title="${esc(a.os_version)} ${esc(a.arch)}">${esc(a.os_version.length > 22 ? a.os_version.slice(0, 21) + "…" : a.os_version)}
+          <div class="msg mono">${esc(a.arch)}</div></td>
       <td>${esc(a.site) || "-"}</td>
       <td>${upd}</td>
       <td>${a.drift_count ? `<span class="pill warn">${a.drift_count}</span>` : "-"}</td>
