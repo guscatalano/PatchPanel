@@ -218,9 +218,16 @@ fn banner(
     } else {
         "$PATCHPANEL_ENROLLMENT_TOKEN"
     };
-    println!("\n  Enroll an agent with:");
-    println!("    pp-agent enroll --portal ws://{host}/api/agent/ws \\");
-    println!("      --token {token_hint} --site <site>\n");
+    println!("\n  Add a machine (run as root / elevated):");
+    println!("    linux    curl -fsSL http://{host}/install.sh | sh -s -- --token {token_hint}");
+    // Deliberately no temp-file path: a backslash in a copied command line is
+    // one paste away from `$env:TEMPpp.ps1`, and PowerShell's error for that
+    // names neither the path nor the cause.
+    println!(
+        "    windows  & ([scriptblock]::Create((irm http://{host}/install.ps1))) -Token {token_hint}"
+    );
+    println!("\n  Both accept an optional --site / -Site; it defaults to the hostname.");
+    println!("  The dashboard's \"Add machine\" tab has these with the token filled in.\n");
 }
 
 async fn shutdown_signal() {
