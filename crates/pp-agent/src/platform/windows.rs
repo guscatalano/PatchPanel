@@ -182,8 +182,65 @@ $u = Get-WindowsUpdate -MicrosoftUpdate -ErrorAction Stop
   ConvertTo-Json -Depth 3 -Compress
 "#;
 
-pub async fn available_updates(pf: &Platform, p: &Progress) -> Result<Vec<AvailableUpdate>> {
+/// Bring a machine up to the point where it can actually be scanned.
+///
+/// Both of these are missing by default on a fresh Windows box, and a service
+/// running as LocalSystem cannot see a per-user winget at all - which is why a
+/// Windows agent so often reports a confident and completely wrong zero.
+pub async fn install_prerequisites(p: &Progress) -> Result<String> {
+    let mut log = Vec::new();
+
+    p.line("installing the NuGet provider and trusting PSGallery");
+    let bootstrap = "\
+        [Net.ServicePointManager]::SecurityProtocol = \
+          [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; \
+        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope AllUsers \
+          -ErrorAction SilentlyContinue | Out-Null; \
+        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue; \
+        'ok'";
+    let o = ps(bootstrap, p).await?;
+    log.push(format!("bootstrap: {}", exec::tail(&o.text, 400)));
+
+    p.line("installing PSWindowsUpdate");
+    let o = ps(
+        "Install-Module PSWindowsUpdate -Force -Scope AllUsers -AllowClobber; \
+         (Get-Module -ListAvailable PSWindowsUpdate | Select-Object -First 1).Version.ToString()",
+        p,
+    )
+    .await?;
+    if o.ok() {
+        log.push(format!("PSWindowsUpdate: {}", o.text.trim()));
+    } else {
+        log.push(format!("PSWindowsUpdate FAILED: {}", exec::tail(&o.text, 500)));
+    }
+
+    p.line("repairing winget for all users");
+    // Repair-WinGetPackageManager is Microsoft's supported way to get a
+    // working winget outside a user session; installing the MSIX by hand is
+    // fragile and version-specific.
+    let o = ps(
+        "Install-Module Microsoft.WinGet.Client -Force -Scope AllUsers -AllowClobber; \
+         Import-Module Microsoft.WinGet.Client; \
+         Repair-WinGetPackageManager -AllUsers -Force; 'winget repaired'",
+        p,
+    )
+    .await?;
+    if o.ok() {
+        log.push(format!("winget: {}", exec::tail(&o.text, 300)));
+    } else {
+        log.push(format!("winget FAILED: {}", exec::tail(&o.text, 500)));
+    }
+
+    log.push("restart the agent service for the new backends to be detected".into());
+    Ok(log.join("\n"))
+}
+
+pub async fn available_updates(
+    pf: &Platform,
+    p: &Progress,
+) -> Result<(Vec<AvailableUpdate>, Vec<ScanIssue>)> {
     let mut out = Vec::new();
+    let issues = Vec::new();
 
     if pf.has(Backend::Winget) {
         let o = exec::run(
@@ -225,7 +282,7 @@ pub async fn available_updates(pf: &Platform, p: &Progress) -> Result<Vec<Availa
         }
     }
 
-    Ok(out)
+    Ok((out, issues))
 }
 
 /// winget prints a fixed-width table with no machine-readable alternative for

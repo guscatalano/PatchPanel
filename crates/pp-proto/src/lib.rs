@@ -312,6 +312,10 @@ pub enum Command {
     },
     /// Sweep the configured CIDRs for undeclared devices.
     Discover,
+    /// Install whatever this machine is missing in order to be scannable at
+    /// all - on Windows, the PSWindowsUpdate module and a system-wide winget.
+    InstallPrerequisites,
+
     /// Remove packages nothing depends on any more, and empty the package
     /// cache. Reports exactly what it took.
     Cleanup {

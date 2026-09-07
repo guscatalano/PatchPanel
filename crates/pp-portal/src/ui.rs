@@ -87,6 +87,12 @@ const INDEX: &str = r##"<!doctype html>
   .pill.bad { color: var(--bad); border-color: var(--bad); }
   .pill.warn { color: var(--warn); border-color: var(--warn); }
   .pill.ok { color: var(--ok); border-color: var(--ok); }
+  .pill.busy { color: var(--accent); border-color: var(--accent); }
+  .pill.busy::before {
+    content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 5px;
+    border-radius: 50%; background: var(--accent); animation: pulse 1.1s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
 
   button.act {
     font: inherit; font-size: 12px; padding: 3px 8px; margin-right: 3px;
@@ -325,6 +331,32 @@ let TAB = ROUTE.tab;
 let AGENTS = [];
 let REV = 0;
 let AUTH_REQUIRED = true;
+// Agents we have just sent a command to. The portal only learns a command is
+// running once it records it, and the table refreshes every few seconds, so
+// without a local latch the same button can be pressed twice in that window.
+const JUST_SENT = new Map();
+const SENT_GRACE_MS = 20000;
+
+function isBusy(a) {
+  if (a.running) return a.running.kind;
+  const t = JUST_SENT.get(a.id);
+  if (t && Date.now() - t < SENT_GRACE_MS) return "dispatching";
+  if (t) JUST_SENT.delete(a.id);
+  return null;
+}
+
+// Human wording for a command kind.
+const KIND_LABEL = {
+  collect_inventory: "scanning",
+  apply_patches: "installing updates",
+  apply_manifest: "applying manifest",
+  self_update: "updating agent",
+  probe_devices: "probing devices",
+  discover: "discovering",
+  cleanup: "cleaning up",
+  reboot: "rebooting",
+  dispatching: "dispatching",
+};
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -449,6 +481,11 @@ async function loadFleet() {
   $("agents-empty").hidden = d.agents.length > 0;
   const agentRows = d.agents.map((a) => {
     const live = a.connected ? "on" : (a.online ? "on" : "off");
+    const busy = isBusy(a);
+    const canAct = a.connected && !busy;
+    const busyPill = busy
+      ? ` <span class="pill busy" title="A command is already running on this machine. Wait for it to finish before starting another.">${esc(KIND_LABEL[busy] || busy)}</span>`
+      : "";
     // Show the total, then flag the security subset in full words. The old
     // form rendered "1 sec 0" - which reads as a duration, and buried the
     // total behind an unexplained subtraction.
@@ -489,20 +526,20 @@ async function loadFleet() {
       <td title="${esc(a.os_version)} ${esc(a.arch)}">${esc(a.os_version.length > 22 ? a.os_version.slice(0, 21) + "…" : a.os_version)}
           <div class="msg mono">${esc(a.arch)}</div></td>
       <td>${esc(a.site) || "-"}</td>
-      <td>${upd}${unsafe_}</td>
+      <td>${upd}${unsafe_}${busyPill}</td>
       <td>${a.drift_count ? `<span class="pill warn">${a.drift_count}</span>` : "-"}</td>
       <td>${dev}</td>
       <td class="mono">${a.applied_revision < REV ? `<span class="pill warn">r${a.applied_revision}</span>` : "r" + a.applied_revision}</td>
       <td>${ago(a.last_seen)}</td>
       <td style="text-align:right; white-space:nowrap">
-        <button class="act" ${a.connected ? "" : "disabled"}
-          title="Re-read installed packages and check for available updates. Changes nothing."
+        <button class="act" ${canAct ? "" : "disabled"}
+          title="${busy ? "Busy: " + esc(KIND_LABEL[busy] || busy) : "Re-read installed packages and check for available updates. Changes nothing."}"
           onclick="cmd('${a.id}','collect_inventory')">Rescan</button>
-        <button class="act" ${a.connected ? "" : "disabled"}
-          title="Install this machine's pending OS updates now (apt/dnf on Linux, Windows Update). This changes the system and may require a reboot."
+        <button class="act" ${canAct ? "" : "disabled"}
+          title="${busy ? "Busy: " + esc(KIND_LABEL[busy] || busy) : "Install this machine's pending OS updates now. This changes the system and may require a reboot."}"
           onclick="patchNow('${a.id}','${esc(a.hostname)}')">Install updates</button>
-        <button class="act" ${a.connected ? "" : "disabled"}
-          title="Install, upgrade or remove applications so the machine matches the manifest's desired state."
+        <button class="act" ${canAct ? "" : "disabled"}
+          title="${busy ? "Busy: " + esc(KIND_LABEL[busy] || busy) : "Install, upgrade or remove applications so the machine matches the manifest."}"
           onclick="cmd('${a.id}','apply_manifest')">Apply manifest</button>
       </td>
     </tr>`;
@@ -662,6 +699,7 @@ async function loadAgent(id) {
   const inv = d.inventory || {};
   const updates = inv.updates || [];
   const sec = updates.filter((u) => u.security);
+  const busy = isBusy(d);
   const state = d.connected
     ? '<span class="pill ok">connected</span>'
     : (d.online ? '<span class="pill warn">recently seen</span>' : '<span class="pill bad">offline</span>');
@@ -675,6 +713,7 @@ async function loadAgent(id) {
     <div class="back" onclick="showTab('fleet')">&larr; Fleet</div>
     <div class="hdr">
       <h2>${esc(d.hostname)}</h2>${state}
+      ${busy ? `<span class="pill busy">${esc(KIND_LABEL[busy] || busy)}</span>` : ""}
       ${d.reboot_required ? '<span class="pill warn">reboot required</span>' : ""}
       <span class="msg">${esc(d.os_version)} &middot; ${esc(d.site) || "no site"}</span>
     </div>
@@ -720,10 +759,12 @@ async function loadAgent(id) {
           <td class="mono">${esc(u.source)}</td></tr>`).join("")}</tbody>
       </table></div>` : `<div class="empty">Nothing pending${inv.collected_at ? ` as of ${ago(inv.collected_at)}` : ""}.</div>`}
       <div class="bar">
-        <button class="act" ${d.connected ? "" : "disabled"} onclick="cmd('${d.id}','collect_inventory')">Rescan</button>
-        <button class="act" ${d.connected ? "" : "disabled"} onclick="patchNow('${d.id}','${esc(d.hostname)}')">Install updates</button>
-        <button class="act" ${d.connected ? "" : "disabled"} onclick="cmd('${d.id}','apply_manifest')">Apply manifest</button>
-        <span class="msg">${inv.collected_at ? `inventory collected ${ago(inv.collected_at)}` : ""}</span>
+        <button class="act" ${busy ? "disabled" : (d.connected ? "" : "disabled")} onclick="cmd('${d.id}','collect_inventory')">Rescan</button>
+        <button class="act" ${busy ? "disabled" : (d.connected ? "" : "disabled")} onclick="patchNow('${d.id}','${esc(d.hostname)}')">Install updates</button>
+        <button class="act" ${busy ? "disabled" : (d.connected ? "" : "disabled")} onclick="cmd('${d.id}','apply_manifest')">Apply manifest</button>
+        <span class="msg">${busy
+          ? `waiting for ${esc(KIND_LABEL[busy] || busy)} to finish`
+          : (inv.collected_at ? `inventory collected ${ago(inv.collected_at)}` : "")}</span>
       </div>
     </div>
 
@@ -949,6 +990,10 @@ This can restart services and may require a reboot.`)) return;
 }
 
 async function cmd(id, kind, extra = {}) {
+  // Latch before awaiting: the click that starts the request is the one we
+  // need to stop happening twice.
+  JUST_SENT.set(id, Date.now());
+  refresh();
   try {
     await api(`/api/agents/${id}/commands`, {
       method: "POST",
@@ -956,6 +1001,8 @@ async function cmd(id, kind, extra = {}) {
     });
     setTimeout(refresh, 400);
   } catch (e) {
+    JUST_SENT.delete(id);
+    refresh();
     alert(e.message);
   }
 }

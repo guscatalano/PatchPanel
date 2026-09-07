@@ -568,14 +568,21 @@ async fn refresh_packages(ctx: &Ctx) {
             tracing::error!(error = %format!("{e:#}"), "package inventory failed");
             Vec::new()
         });
-    let updates = ctx.platform.available_updates(&p).await.unwrap_or_else(|e| {
+    let (updates, mut scan_issues) = ctx.platform.available_updates(&p).await.unwrap_or_else(|e| {
         tracing::error!(error = %format!("{e:#}"), "update scan failed");
-        Vec::new()
+        (
+            Vec::new(),
+            vec![pp_proto::ScanIssue {
+                backend: "updates".into(),
+                problem: format!("the update scan failed: {e:#}"),
+                remedy: "The pending update count for this machine is unknown.".into(),
+            }],
+        )
     });
     let repositories = crate::repos::collect();
     let release = crate::release::collect(&repositories);
     let cleanup = Some(ctx.platform.cleanup_preview(&p).await);
-    let scan_issues = ctx.platform.scan_issues();
+    scan_issues.extend(ctx.platform.scan_issues());
     let held_back = ctx.platform.held_back(&p).await;
     if !scan_issues.is_empty() {
         tracing::warn!(
@@ -822,6 +829,12 @@ async fn execute(cmd: Command, ctx: &Ctx, p: &Progress) -> Result<String> {
         Command::ProbeDevices { only } => {
             let n = refresh_devices(ctx, &only).await;
             Ok(format!("probed {n} device(s)"))
+        }
+
+        Command::InstallPrerequisites => {
+            let log = ctx.platform.install_prerequisites(p).await?;
+            refresh_packages(ctx).await;
+            Ok(log)
         }
 
         Command::Cleanup { purge } => {

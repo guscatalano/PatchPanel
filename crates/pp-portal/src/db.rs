@@ -62,6 +62,18 @@ pub struct AgentRow {
     pub scan_issue_count: usize,
     /// Upgrades apt will not apply without a full upgrade.
     pub held_back_count: usize,
+    /// A command dispatched to this agent that has not reported back yet.
+    /// Present means work is in flight and the machine should not be given
+    /// more, which is the difference between one patch run and two.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub running: Option<RunningCommand>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunningCommand {
+    pub id: Uuid,
+    pub kind: String,
+    pub started_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -286,8 +298,56 @@ impl Db {
         Ok(raw.flatten().and_then(|t| serde_json::from_str(&t).ok()))
     }
 
+    /// Commands dispatched but not yet reported on, keyed by agent.
+    ///
+    /// Only the most recent per agent: an agent runs commands one at a time
+    /// from the operator's point of view, and showing the newest is what tells
+    /// them whether pressing the button again would duplicate work.
+    fn running_commands(
+        conn: &Connection,
+    ) -> rusqlite::Result<std::collections::HashMap<String, RunningCommand>> {
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, id, kind, created_at FROM commands
+             WHERE ok IS NULL ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let agent: String = r.get(0)?;
+            let id: String = r.get(1)?;
+            let created: String = r.get(3)?;
+            Ok((
+                agent,
+                RunningCommand {
+                    id: id.parse().unwrap_or_default(),
+                    kind: r.get(2)?,
+                    started_at: parse_time(&created),
+                },
+            ))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (agent, cmd) = row?;
+            map.insert(agent, cmd);
+        }
+        Ok(map)
+    }
+
+    /// Close out a disconnected agent's in-flight commands.
+    ///
+    /// Without this they stay unfinished forever and the machine looks busy
+    /// permanently, which would block every future action on it.
+    pub fn fail_unfinished(&self, id: AgentId, reason: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE commands SET ok = 0, summary = ?2, finished_at = ?3
+             WHERE agent_id = ?1 AND ok IS NULL",
+            params![id.to_string(), reason, Utc::now().to_rfc3339()],
+        )?;
+        Ok(n)
+    }
+
     pub fn agents(&self) -> Result<Vec<AgentRow>> {
         let conn = self.conn.lock().unwrap();
+        let running = Self::running_commands(&conn)?;
         let mut stmt = conn.prepare(
             "SELECT id, hostname, os, os_version, arch, agent_version, site, backends,
                     applied_revision, reboot_required, first_seen, last_seen, inventory,
@@ -345,6 +405,7 @@ impl Db {
                 device_problem_count: device_problems,
                 scan_issue_count: inv.as_ref().map(|i| i.scan_issues.len()).unwrap_or(0),
                 held_back_count: inv.as_ref().map(|i| i.held_back.len()).unwrap_or(0),
+                running: running.get(&id).cloned(),
                 release_blockers: inv
                     .as_ref()
                     .and_then(|i| i.release.as_ref())
@@ -549,6 +610,7 @@ pub fn command_kind(cmd: &Command) -> &'static str {
         Command::Reboot { .. } => "reboot",
         Command::ProbeDevices { .. } => "probe_devices",
         Command::Discover => "discover",
+        Command::InstallPrerequisites => "install_prerequisites",
         Command::Cleanup { .. } => "cleanup",
     }
 }

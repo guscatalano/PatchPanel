@@ -125,14 +125,32 @@ impl Platform {
         return Ok(Vec::new());
     }
 
-    pub async fn available_updates(&self, p: &Progress) -> Result<Vec<AvailableUpdate>> {
+    /// Pending updates, plus anything that stopped a backend from answering.
+    ///
+    /// The two travel together on purpose: a caller that takes the list without
+    /// the problems will report "no updates" for a machine whose package
+    /// manager is broken, which is the single most dangerous thing this tool
+    /// can say.
+    pub async fn available_updates(
+        &self,
+        p: &Progress,
+    ) -> Result<(Vec<AvailableUpdate>, Vec<ScanIssue>)> {
         let _ = p;
         #[cfg(target_os = "linux")]
         return linux::available_updates(self, p).await;
         #[cfg(windows)]
         return windows::available_updates(self, p).await;
         #[cfg(not(any(target_os = "linux", windows)))]
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    /// Install what this machine needs in order to be scannable.
+    pub async fn install_prerequisites(&self, p: &Progress) -> Result<String> {
+        let _ = p;
+        #[cfg(windows)]
+        return windows::install_prerequisites(p).await;
+        #[cfg(not(windows))]
+        Ok("nothing to install: this platform's package tooling is part of the OS".into())
     }
 
     /// Install pending OS updates. `only` narrows to named packages; `exclude`

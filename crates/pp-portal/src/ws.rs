@@ -137,6 +137,14 @@ async fn serve(socket: WebSocket, state: Arc<AppState>) -> anyhow::Result<()> {
 
     // Only clear the hub slot if it still points at this connection: a slow
     // teardown must not evict the reconnect that already replaced it.
+    // Anything still in flight will never report now, so retire it rather than
+    // leaving the machine looking permanently busy.
+    match state.db.fail_unfinished(agent_id, "agent disconnected before reporting") {
+        Ok(n) if n > 0 => tracing::info!(%agent_id, count = n, "retired unfinished commands"),
+        Ok(_) => {}
+        Err(e) => tracing::error!(error = %e, "failed to retire unfinished commands"),
+    }
+
     state.hub.disconnect(agent_id, &hub_tx);
     drop(hub_tx);
     writer.abort();

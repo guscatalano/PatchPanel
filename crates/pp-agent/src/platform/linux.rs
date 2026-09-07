@@ -64,13 +64,48 @@ pub async fn installed_packages(pf: &Platform, p: &Progress) -> Result<Vec<Packa
     Ok(out)
 }
 
-pub async fn available_updates(pf: &Platform, p: &Progress) -> Result<Vec<AvailableUpdate>> {
+/// apt reports a broken source on stderr and then carries on with a non-zero
+/// exit, so its output is the only place the failure exists. A repository that
+/// will not refresh means the update list is incomplete - or, when apt bails
+/// entirely, that patching this machine cannot work at all.
+fn parse_apt_errors(text: &str) -> Vec<ScanIssue> {
     let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim().trim_start_matches("stderr:").trim();
+        let is_err = t.starts_with("E:")
+            || t.contains("does not have a Release file")
+            || t.contains("Failed to fetch");
+        if !is_err {
+            continue;
+        }
+        let msg = t.trim_start_matches("E:").trim().to_string();
+        if out.iter().any(|i: &ScanIssue| i.problem == msg) {
+            continue;
+        }
+        out.push(ScanIssue {
+            backend: "apt".into(),
+            problem: msg,
+            remedy: "Fix or disable this source. Until it resolves, apt refuses to \
+                     apply updates and the pending list is incomplete."
+                .into(),
+        });
+    }
+    out
+}
+
+pub async fn available_updates(
+    pf: &Platform,
+    p: &Progress,
+) -> Result<(Vec<AvailableUpdate>, Vec<ScanIssue>)> {
+    let mut out = Vec::new();
+    let mut issues = Vec::new();
 
     if pf.has(Backend::Apt) {
         // Refresh metadata first, or `apt list --upgradable` reports whatever
         // was true the last time someone happened to run an update.
-        let _ = exec::run("apt-get", &["-qq", "update"], p).await;
+        if let Ok(o) = exec::run("apt-get", &["-qq", "update"], p).await {
+            issues.extend(parse_apt_errors(&o.text));
+        }
         let o = exec::run("apt", &["list", "--upgradable"], p)
             .await?
             .require(&[])?;
@@ -99,7 +134,7 @@ pub async fn available_updates(pf: &Platform, p: &Progress) -> Result<Vec<Availa
         out.extend(updates);
     }
 
-    Ok(out)
+    Ok((out, issues))
 }
 
 /// Lines look like:
@@ -244,6 +279,7 @@ pub async fn apply_patches(
             // Narrow to the packages apt attributes to a security suite.
             let names: Vec<String> = available_updates(pf, p)
                 .await?
+                .0
                 .into_iter()
                 .filter(|u| u.security && u.source == "apt" && !exclude.contains(&u.name))
                 .map(|u| u.name)

@@ -453,7 +453,18 @@ release:  {} {} ({})", rel.distro, rel.version_id, rel.codename);
         }
     }
 
-    let updates = pf.available_updates(&p).await?;
+    let (updates, mut issues) = pf.available_updates(&p).await?;
+    issues.extend(pf.scan_issues());
+    if !issues.is_empty() {
+        println!(
+            "\n{} backend(s) could not be scanned, so the count below is a floor:",
+            issues.len()
+        );
+        for i in &issues {
+            println!("  [{}] {}", i.backend, i.problem);
+        }
+    }
+
     println!("\n{} pending update(s)", updates.len());
     for u in &updates {
         let flag = if u.security { " [security]" } else { "" };
