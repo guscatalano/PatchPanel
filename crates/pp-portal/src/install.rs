@@ -97,7 +97,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ -n "$TOKEN" ] || {{ echo "error: --token is required" >&2; exit 64; }}
+# No --token is fine: the agent asks the portal for one, which works when the
+# portal runs without admin auth. It fails with a clear message otherwise.
 [ "$(id -u)" = "0" ] || {{ echo "error: run this as root" >&2; exit 1; }}
 [ -n "$SITE" ] || SITE="$(hostname)"
 
@@ -112,7 +113,11 @@ mv /usr/local/bin/.pp-agent.new /usr/local/bin/pp-agent
 
 # The agent installs itself: writes config, drops the unit, enables and starts.
 # Keeping that logic in the binary means the shell script cannot get it wrong.
-/usr/local/bin/pp-agent setup   --portal "ws://$PORTAL/api/agent/ws"   --token "$TOKEN"   --site "$SITE"   --state-dir /var/lib/patchpanel
+if [ -n "$TOKEN" ]; then
+  /usr/local/bin/pp-agent setup --portal "$PORTAL" --token "$TOKEN"     --site "$SITE" --state-dir /var/lib/patchpanel
+else
+  /usr/local/bin/pp-agent setup --portal "$PORTAL"     --site "$SITE" --state-dir /var/lib/patchpanel
+fi
 
 sleep 2
 if systemctl is-active --quiet patchpanel-agent; then

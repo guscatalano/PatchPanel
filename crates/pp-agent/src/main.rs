@@ -62,8 +62,12 @@ enum Cmd {
     /// This is what the portal's one-line installers call. It exists so adding
     /// a machine never depends on getting shell quoting right.
     Setup {
+        /// Portal address. A bare hostname is enough ("patchpanel"); a full
+        /// http:// or ws:// URL also works.
         #[arg(long)]
         portal: String,
+        /// Enrollment secret. Omitted, the agent asks the portal for it, which
+        /// works when the portal has admin auth disabled.
         #[arg(long, default_value = "")]
         token: String,
         /// Defaults to this machine's hostname.
@@ -159,13 +163,19 @@ fn main() -> Result<()> {
                 site,
                 state_dir,
             } => {
+                let (ws_url, http_base) = normalize_portal(&portal)?;
+                let token = if token.is_empty() {
+                    fetch_enrollment_token(&http_base).await?
+                } else {
+                    token
+                };
                 let site = if site.is_empty() {
                     gethostname::gethostname().to_string_lossy().into_owned()
                 } else {
                     site
                 };
                 let mut cfg = config::Config {
-                    portal_url: portal,
+                    portal_url: ws_url,
                     enrollment_token: token,
                     site,
                     ..Default::default()
@@ -188,6 +198,66 @@ fn main() -> Result<()> {
             Cmd::RunService => service::run_as_service(),
         }
     })
+}
+
+/// Accept whatever an operator types: a bare host, an http(s) URL, or a full
+/// ws:// endpoint. Returns the agent websocket URL and the matching http base.
+///
+/// This exists because "--portal patchpanel" is what people try first, and
+/// making that work removes the most common install-time mistake.
+fn normalize_portal(input: &str) -> Result<(String, String)> {
+    let s = input.trim().trim_end_matches('/');
+    let (secure, rest) = match s {
+        _ if s.starts_with("wss://") => (true, &s[6..]),
+        _ if s.starts_with("ws://") => (false, &s[5..]),
+        _ if s.starts_with("https://") => (true, &s[8..]),
+        _ if s.starts_with("http://") => (false, &s[7..]),
+        _ => (false, s),
+    };
+    // Drop any path the operator pasted; we know the endpoint we need.
+    let host = rest.split('/').next().unwrap_or(rest);
+    if host.is_empty() {
+        anyhow::bail!("`{input}` has no hostname");
+    }
+    let (ws, http) = if secure { ("wss", "https") } else { ("ws", "http") };
+    Ok((
+        format!("{ws}://{host}/api/agent/ws"),
+        format!("{http}://{host}"),
+    ))
+}
+
+/// Ask the portal for the shared enrollment secret. Only succeeds when the
+/// portal is running without admin auth; otherwise the operator must supply it.
+async fn fetch_enrollment_token(http_base: &str) -> Result<String> {
+    use anyhow::Context as _;
+
+    let url = format!("{http_base}/api/enrollment");
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("asking {url} for an enrollment token"))?;
+
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        anyhow::bail!(
+            "this portal requires authentication, so it will not hand out the              enrollment token. Pass it explicitly:  --token <enrollment-token>
+             You can copy the whole command from the portal's \"Add machine\" tab."
+        );
+    }
+    let resp = resp.error_for_status()?;
+
+    #[derive(serde::Deserialize)]
+    struct Enrollment {
+        token: String,
+    }
+    let body: Enrollment = resp.json().await.context("reading the enrollment token")?;
+    if body.token.is_empty() {
+        anyhow::bail!("the portal returned an empty enrollment token");
+    }
+    println!("==> got an enrollment token from {http_base}");
+    Ok(body.token)
 }
 
 /// Where the agent must live for a service to reference it reliably.

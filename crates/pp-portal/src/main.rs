@@ -227,12 +227,23 @@ fn banner(
         "$PATCHPANEL_ENROLLMENT_TOKEN"
     };
     println!("\n  Add a machine (run as root / elevated):");
-    println!("    linux    curl -fsSL http://{host}/install.sh | sh -s -- --token {token_hint}");
+    // Without admin auth the agent can ask us for the token itself, so the
+    // command needs nothing else. With auth on, it has to be supplied.
+    let tok = if require_admin_auth {
+        format!(" -- --token {token_hint}")
+    } else {
+        String::new()
+    };
+    let wtok = if require_admin_auth {
+        format!(" --token {token_hint}")
+    } else {
+        String::new()
+    };
+    println!("    linux    curl -fsSL http://{host}/install.sh | sh{tok}");
     // Deliberately no temp-file path: a backslash in a copied command line is
     // one paste away from `$env:TEMPpp.ps1`, and PowerShell's error for that
     // names neither the path nor the cause.
-    println!("    windows  irm http://{host}/download/pp-agent.exe -OutFile pp-agent.exe");
-    println!("             ./pp-agent.exe setup --portal ws://{host}/api/agent/ws --token {token_hint}");
+    println!("    windows  irm http://{host}/download/pp-agent.exe -OutFile pp-agent.exe; ./pp-agent.exe setup --portal {host}{wtok}");
     println!("\n  Both accept an optional --site / -Site; it defaults to the hostname.");
     println!("  The dashboard's \"Add machine\" tab has these with the token filled in.\n");
 }
