@@ -624,6 +624,8 @@ pub fn command_kind(cmd: &Command) -> &'static str {
         Command::ProbeDevices { .. } => "probe_devices",
         Command::Discover => "discover",
         Command::InstallPrerequisites => "install_prerequisites",
+        Command::WriteSource { .. } => "write_source",
+        Command::RemoveSource { .. } => "remove_source",
         Command::Cleanup { .. } => "cleanup",
     }
 }

@@ -11,6 +11,7 @@ mod release;
 mod repos;
 mod selfupdate;
 mod session;
+mod sources;
 
 #[cfg(windows)]
 mod service;

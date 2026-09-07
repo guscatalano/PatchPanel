@@ -585,6 +585,7 @@ async fn refresh_packages(ctx: &Ctx) {
     scan_issues.extend(ctx.platform.scan_issues());
     let held_back = ctx.platform.held_back(&p).await;
     let deferred = ctx.platform.deferred(&p).await;
+    let source_files = crate::sources::read_all();
     if !scan_issues.is_empty() {
         tracing::warn!(
             count = scan_issues.len(),
@@ -614,6 +615,7 @@ async fn refresh_packages(ctx: &Ctx) {
         scan_issues,
         held_back,
         deferred,
+        source_files,
     };
     *last = Some(inv.clone());
     drop(last);
@@ -671,6 +673,7 @@ async fn refresh_devices(ctx: &Ctx, only: &[String]) -> usize {
         scan_issues: Vec::new(),
         held_back: Vec::new(),
         deferred: Vec::new(),
+        source_files: Vec::new(),
     });
 
     // A narrowed probe updates only the devices it touched.
@@ -832,6 +835,18 @@ async fn execute(cmd: Command, ctx: &Ctx, p: &Progress) -> Result<String> {
         Command::ProbeDevices { only } => {
             let n = refresh_devices(ctx, &only).await;
             Ok(format!("probed {n} device(s)"))
+        }
+
+        Command::WriteSource { path, content } => {
+            let msg = crate::sources::write(&path, &content, p).await?;
+            refresh_packages(ctx).await;
+            Ok(msg)
+        }
+
+        Command::RemoveSource { path } => {
+            let msg = crate::sources::remove(&path, p).await?;
+            refresh_packages(ctx).await;
+            Ok(msg)
         }
 
         Command::InstallPrerequisites => {

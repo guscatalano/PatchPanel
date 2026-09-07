@@ -672,6 +672,49 @@ function releaseCard(rel) {
   </div>`;
 }
 
+// Editing apt sources from here is what turns "ssh in and fix it by hand"
+// into something the fleet view can do. The agent validates every write with
+// apt-get update and reverts if apt rejects it, so a wrong edit undoes itself
+// rather than leaving a machine that cannot install anything.
+function sourceEditor(files, id, connected) {
+  if (!files.length) return "";
+  const rows = files.map((f, i) => `
+    <div class="step">
+      <h3 class="mono">${esc(f.path)}</h3>
+      <textarea id="src-${i}" spellcheck="false" style="min-height:120px">${esc(f.content)}</textarea>
+      <div class="bar" style="padding-left:0;padding-right:0">
+        <button class="act" ${connected ? "" : "disabled"}
+          onclick="saveSource('${id}', ${JSON.stringify(f.path)}, 'src-${i}')">Save</button>
+        <button class="act" ${connected ? "" : "disabled"}
+          onclick="deleteSource('${id}', ${JSON.stringify(f.path)})">Delete file</button>
+        <span class="msg" id="src-msg-${i}"></span>
+      </div>
+    </div>`).join("");
+
+  return `<div class="card">
+    <h2>Apt sources</h2>
+    <div class="step"><div class="note">
+      Saving runs <code>apt-get update</code> to check the result. If apt rejects the new
+      contents the agent puts the old file back, so a bad edit cannot leave this machine
+      unable to install anything. A copy is kept beside each file as
+      <code>.patchpanel-bak</code>.
+    </div></div>
+    ${rows}
+  </div>`;
+}
+
+async function saveSource(id, path, textareaId) {
+  const content = document.getElementById(textareaId).value;
+  if (!confirm("Replace " + path + " on this machine?")) return;
+  await cmd(id, "write_source", { path, content });
+}
+
+async function deleteSource(id, path) {
+  if (!confirm("Delete " + path + "?
+A backup is kept beside it.")) return;
+  await cmd(id, "remove_source", { path });
+}
+
 function repoCard(repos, diff) {
   if (!repos.length) return "";
   const odd = new Set(diff.only_here || []);
@@ -845,6 +888,8 @@ async function loadAgent(id) {
     ${releaseCard(inv.release)}
 
     ${repoCard(inv.repositories || [], d.repo_diff || {})}
+
+    ${sourceEditor(inv.source_files || [], d.id, d.connected)}
 
     <div class="card">
       <h2>Installed packages &mdash; ${(inv.packages || []).length}</h2>

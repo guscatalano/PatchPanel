@@ -112,6 +112,14 @@ pub struct SystemInfo {
 // Inventory
 // ---------------------------------------------------------------------------
 
+/// The raw text of one apt source file, so the portal can edit what is
+/// actually on disk rather than a reconstruction of it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceFile {
+    pub path: String,
+    pub content: String,
+}
+
 /// A configured package source. Knowing which repositories a machine trusts is
 /// often the actual answer to "why is this one different" - a box pinned to an
 /// old suite or carrying a third-party repo will never converge on the others.
@@ -261,6 +269,9 @@ pub struct Inventory {
     /// installed - `upgrade` will never take these, only `full-upgrade` will.
     #[serde(default)]
     pub held_back: Vec<String>,
+    /// Editable apt source files, by path.
+    #[serde(default)]
+    pub source_files: Vec<SourceFile>,
     /// Upgrades that even a full upgrade refuses. On Ubuntu these are usually
     /// phased: the archive deliberately withholds them from a fraction of
     /// machines until the rollout completes. They are counted as pending and
@@ -318,6 +329,14 @@ pub enum Command {
     },
     /// Sweep the configured CIDRs for undeclared devices.
     Discover,
+    /// Replace an apt source file. Validated with `apt-get update` and rolled
+    /// back automatically if apt rejects the result, so a bad edit cannot
+    /// leave the machine unable to install anything.
+    WriteSource { path: String, content: String },
+
+    /// Delete an apt source file, keeping a backup beside it.
+    RemoveSource { path: String },
+
     /// Install whatever this machine is missing in order to be scannable at
     /// all - on Windows, the PSWindowsUpdate module and a system-wide winget.
     InstallPrerequisites,
