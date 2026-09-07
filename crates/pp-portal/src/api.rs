@@ -163,6 +163,89 @@ struct AgentDetail {
     connected: bool,
     inventory: Option<pp_proto::Inventory>,
     commands: Vec<crate::db::CommandRow>,
+    repo_diff: RepoDiff,
+}
+
+/// How this machine's package sources compare with its peers.
+///
+/// "Peers" means agents on the same OS, because comparing apt sources against a
+/// Windows box would be noise. A repository present here but nowhere else, or
+/// missing here but present on every peer, is usually the reason one machine
+/// behaves differently.
+#[derive(Default, Serialize)]
+struct RepoDiff {
+    /// How many same-OS agents this was compared against.
+    peers: usize,
+    /// Configured here, on no peer.
+    only_here: Vec<String>,
+    /// Configured on every peer, but not here.
+    missing_here: Vec<String>,
+}
+
+/// Identity of a repository for comparison: where it points and at what suite.
+/// The declaring filename is deliberately excluded - the same repo added under
+/// a different filename is still the same repo.
+fn repo_key(r: &pp_proto::Repository) -> String {
+    format!("{} {} {}", r.source, r.uri.trim_end_matches('/'), r.suite)
+}
+
+fn repo_diff(
+    state: &SharedState,
+    me: pp_proto::AgentId,
+    my_os: &str,
+    mine: &[pp_proto::Repository],
+) -> anyhow::Result<RepoDiff> {
+    use std::collections::HashSet;
+
+    let my_keys: HashSet<String> = mine
+        .iter()
+        .filter(|r| r.enabled)
+        .map(repo_key)
+        .collect();
+
+    let mut peer_sets: Vec<HashSet<String>> = Vec::new();
+    for row in state.db.agents()? {
+        if row.id == me || row.os != my_os {
+            continue;
+        }
+        let Some(inv) = state.db.inventory(row.id)? else {
+            continue;
+        };
+        if inv.repositories.is_empty() {
+            continue;
+        }
+        peer_sets.push(
+            inv.repositories
+                .iter()
+                .filter(|r| r.enabled)
+                .map(repo_key)
+                .collect(),
+        );
+    }
+
+    if peer_sets.is_empty() {
+        return Ok(RepoDiff::default());
+    }
+
+    let mut only_here: Vec<String> = my_keys
+        .iter()
+        .filter(|k| !peer_sets.iter().any(|p| p.contains(*k)))
+        .cloned()
+        .collect();
+    // On every peer but not here.
+    let mut missing_here: Vec<String> = peer_sets[0]
+        .iter()
+        .filter(|k| peer_sets.iter().all(|p| p.contains(*k)) && !my_keys.contains(*k))
+        .cloned()
+        .collect();
+    only_here.sort();
+    missing_here.sort();
+
+    Ok(RepoDiff {
+        peers: peer_sets.len(),
+        only_here,
+        missing_here,
+    })
 }
 
 async fn agent(
@@ -176,10 +259,17 @@ async fn agent(
         .find(|a| a.id == id)
         .ok_or_else(|| ApiError::not_found("no such agent"))?;
 
+    let inventory = state.db.inventory(id)?;
+    let diff = match &inventory {
+        Some(inv) => repo_diff(&state, id, &row.os, &inv.repositories)?,
+        None => RepoDiff::default(),
+    };
+
     Ok(Json(AgentDetail {
         connected: state.hub.is_connected(id),
-        inventory: state.db.inventory(id)?,
         commands: state.db.commands(Some(id), 100)?,
+        inventory,
+        repo_diff: diff,
         row,
     }))
 }

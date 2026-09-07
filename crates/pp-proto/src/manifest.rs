@@ -19,6 +19,14 @@ pub struct Manifest {
     #[serde(default)]
     pub discovery: Vec<DiscoveryScan>,
     pub patch_policy: PatchPolicy,
+    /// The address agents should use to reach the portal. Set this when the
+    /// portal's canonical name differs from whatever an agent was bootstrapped
+    /// with - a short name vs an FQDN, say. Agents switch to it and fall back
+    /// to their bootstrap URL if it does not work, so a typo here cannot
+    /// orphan the fleet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portal_url: Option<String>,
+
     /// Desired agent version. When it differs from what an agent reports,
     /// the portal dispatches a `SelfUpdate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -38,6 +46,7 @@ impl Default for Manifest {
     fn default() -> Self {
         Manifest {
             revision: 1,
+            portal_url: None,
             apps: Vec::new(),
             devices: Vec::new(),
             discovery: Vec::new(),

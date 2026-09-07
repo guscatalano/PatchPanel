@@ -7,6 +7,7 @@ mod exec;
 mod hardware;
 mod platform;
 mod probe;
+mod repos;
 mod selfupdate;
 mod session;
 
@@ -206,7 +207,7 @@ fn main() -> Result<()> {
 ///
 /// This exists because "--portal patchpanel" is what people try first, and
 /// making that work removes the most common install-time mistake.
-fn normalize_portal(input: &str) -> Result<(String, String)> {
+pub fn normalize_portal(input: &str) -> Result<(String, String)> {
     let s = input.trim();
 
     // Strip the scheme *before* touching slashes. Trimming them first turns
@@ -424,6 +425,13 @@ cpu:      {}", hw.cpu_model);
     }
     if packages.len() > 15 {
         println!("  ... and {} more", packages.len() - 15);
+    }
+
+    let repos = repos::collect();
+    println!("\n{} package source(s)", repos.len());
+    for r in &repos {
+        let off = if r.enabled { "" } else { "  [disabled]" };
+        println!("  {:<8} {:<50} {}{}", r.source, r.uri, r.suite, off);
     }
 
     let updates = pf.available_updates(&p).await?;

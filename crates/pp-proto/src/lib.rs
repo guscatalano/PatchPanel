@@ -112,6 +112,28 @@ pub struct SystemInfo {
 // Inventory
 // ---------------------------------------------------------------------------
 
+/// A configured package source. Knowing which repositories a machine trusts is
+/// often the actual answer to "why is this one different" - a box pinned to an
+/// old suite or carrying a third-party repo will never converge on the others.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Repository {
+    /// Backend that owns it: "apt", "dnf", "winget".
+    pub source: String,
+    /// Where the packages come from.
+    pub uri: String,
+    /// Release/suite, e.g. "trixie" or "noble-security". Empty when not
+    /// applicable.
+    #[serde(default)]
+    pub suite: String,
+    #[serde(default)]
+    pub components: Vec<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    /// Which file declares it, for when someone has to go and fix it.
+    #[serde(default)]
+    pub origin_file: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Package {
     pub name: String,
@@ -147,6 +169,9 @@ pub struct Inventory {
     /// Hosts seen by the last discovery sweep, if one is configured.
     #[serde(default)]
     pub discovered: Vec<DiscoveredHost>,
+    /// Package repositories this machine is configured to use.
+    #[serde(default)]
+    pub repositories: Vec<Repository>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

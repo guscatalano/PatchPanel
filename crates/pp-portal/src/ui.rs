@@ -474,6 +474,47 @@ function kv(rows) {
     .join("") + `</dl>`;
 }
 
+function repoCard(repos, diff) {
+  if (!repos.length) return "";
+  const odd = new Set(diff.only_here || []);
+  const key = (r) => `${r.source} ${(r.uri || "").replace(/\/$/, "")} ${r.suite || ""}`;
+
+  const rows = repos.map((r) => {
+    const flags = [];
+    if (!r.enabled) flags.push('<span class="pill">disabled</span>');
+    if (odd.has(key(r))) flags.push('<span class="pill warn">only on this machine</span>');
+    return `<tr${r.enabled ? "" : ' style="opacity:.55"'}>
+      <td class="mono">${esc(r.source)}</td>
+      <td class="mono">${esc(r.uri)}</td>
+      <td class="mono">${esc(r.suite) || "-"}</td>
+      <td class="mono msg">${esc((r.components || []).join(" "))}</td>
+      <td>${flags.join(" ")}</td>
+      <td class="mono msg">${esc(r.origin_file)}</td>
+    </tr>`;
+  }).join("");
+
+  const missing = (diff.missing_here || []).length
+    ? `<div class="note" style="margin:12px 14px">
+         <b>Missing here.</b> Configured on all ${diff.peers} other machine(s) of this OS, but not this one:
+         <ul style="margin:6px 0 0 18px">${diff.missing_here.map((m) => `<li class="mono">${esc(m)}</li>`).join("")}</ul>
+       </div>`
+    : "";
+
+  const summary = diff.peers
+    ? `compared against ${diff.peers} machine(s) on the same OS`
+    : "no other machines of this OS to compare against";
+
+  return `<div class="card">
+    <h2>Package sources &mdash; ${repos.length}</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>Backend</th><th>URI</th><th>Suite</th><th>Components</th><th></th><th>Declared in</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    ${missing}
+    <div class="bar"><span class="msg">${summary}</span></div>
+  </div>`;
+}
+
 async function loadAgent(id) {
   const body = $("agent-body");
   if (!id) { body.innerHTML = `<div class="empty">No machine selected.</div>`; return; }
@@ -577,6 +618,8 @@ async function loadAgent(id) {
         </div>`;
       }).join("") : `<div class="empty">Nothing has changed this machine yet.</div>`}
     </div>
+
+    ${repoCard(inv.repositories || [], d.repo_diff || {})}
 
     <div class="card">
       <h2>Installed packages &mdash; ${(inv.packages || []).length}</h2>

@@ -103,6 +103,11 @@ pub struct AgentState {
     /// Highest manifest revision this agent has fully applied.
     #[serde(default)]
     pub applied_revision: u64,
+    /// Portal URL learned from the manifest, superseding the one this agent was
+    /// installed with. Kept separate from the bootstrap URL so a bad value can
+    /// always be backed out of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portal_url_override: Option<String>,
 }
 
 impl AgentState {
@@ -124,6 +129,7 @@ impl AgentState {
             agent_id: Uuid::new_v4(),
             agent_token: None,
             applied_revision: 0,
+            portal_url_override: None,
         };
         state.save(state_dir)?;
         tracing::info!(agent_id = %state.agent_id, "minted new agent identity");

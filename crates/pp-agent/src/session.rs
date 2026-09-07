@@ -37,6 +37,12 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// is healthy, and reset the reconnect backoff no matter how it ended.
 const HEALTHY_SESSION: Duration = Duration::from_secs(30);
 
+/// Consecutive failures against a manifest-supplied portal URL before falling
+/// back to the one this agent was installed with. Without this, publishing a
+/// manifest naming an address that does not resolve everywhere would silently
+/// orphan part of the fleet with no way back.
+const OVERRIDE_FAILURES_BEFORE_FALLBACK: u32 = 3;
+
 /// Why a session ended.
 enum Disposition {
     /// Normal drop — reconnect.
@@ -98,9 +104,35 @@ pub async fn run(cfg: Config) -> Result<()> {
     }
 
     let mut backoff = Duration::from_secs(1);
+    let mut failures: u32 = 0;
     loop {
+        // Prefer the manifest's address, but return to the bootstrap one once
+        // it has repeatedly failed: that is the only way home from a bad push.
+        let url = {
+            let s = state.lock().await;
+            match &s.portal_url_override {
+                Some(u) if failures < OVERRIDE_FAILURES_BEFORE_FALLBACK => u.clone(),
+                Some(u) => {
+                    tracing::warn!(
+                        tried = %u,
+                        bootstrap = %cfg.portal_url,
+                        "manifest portal URL keeps failing; falling back"
+                    );
+                    cfg.portal_url.clone()
+                }
+                None => cfg.portal_url.clone(),
+            }
+        };
+
         let started = std::time::Instant::now();
-        let outcome = session(cfg.clone(), state.clone(), platform.clone(), hardware.clone()).await;
+        let outcome = session(
+            cfg.clone(),
+            state.clone(),
+            platform.clone(),
+            hardware.clone(),
+            url,
+        )
+        .await;
         // A session that stayed up this long proves the portal is reachable and
         // that our credentials work. How it *ended* says nothing about that — a
         // portal restart severs the socket with "connection reset", which is an
@@ -117,11 +149,15 @@ pub async fn run(cfg: Config) -> Result<()> {
             Ok(Disposition::Reconnect) => {
                 tracing::warn!("portal connection closed; reconnecting");
                 backoff = Duration::from_secs(1);
+                failures = 0;
             }
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "session failed");
                 if was_healthy {
                     backoff = Duration::from_secs(1);
+                    failures = 0;
+                } else {
+                    failures = failures.saturating_add(1);
                 }
             }
         }
@@ -147,11 +183,12 @@ async fn session(
     state: Arc<Mutex<AgentState>>,
     platform: Arc<Platform>,
     hardware: Arc<pp_proto::Hardware>,
+    portal_url: String,
 ) -> Result<Disposition> {
-    let (ws, _) = tokio_tungstenite::connect_async(cfg.portal_url.as_str())
+    let (ws, _) = tokio_tungstenite::connect_async(portal_url.as_str())
         .await
-        .with_context(|| format!("connecting to {}", cfg.portal_url))?;
-    tracing::info!(portal = %cfg.portal_url, "connected");
+        .with_context(|| format!("connecting to {portal_url}"))?;
+    tracing::info!(portal = %portal_url, "connected");
 
     let (mut sink, mut stream) = ws.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
@@ -314,6 +351,25 @@ async fn handle_server_msg(
 /// converge on it in the background.
 async fn apply_manifest_update(manifest: Manifest, ctx: &Ctx) {
     let revision = manifest.revision;
+
+    // The portal can name its canonical address, typically to move a fleet from
+    // a short hostname onto an FQDN without touching every machine by hand.
+    if let Some(want) = manifest.portal_url.as_deref().map(str::trim) {
+        if !want.is_empty() {
+            let normalised = crate::normalize_portal(want)
+                .map(|(ws, _)| ws)
+                .unwrap_or_else(|_| want.to_string());
+            let mut s = ctx.state.lock().await;
+            if s.portal_url_override.as_deref() != Some(normalised.as_str()) {
+                tracing::info!(url = %normalised, "adopting portal URL from manifest");
+                s.portal_url_override = Some(normalised);
+                if let Err(e) = s.save(&ctx.cfg.state_dir) {
+                    tracing::error!(error = %e, "failed to persist portal URL");
+                }
+            }
+        }
+    }
+
     *ctx.manifest.write().await = manifest;
 
     let applied = ctx.state.lock().await.applied_revision;
@@ -449,6 +505,7 @@ async fn refresh_packages(ctx: &Ctx) {
         tracing::error!(error = %format!("{e:#}"), "update scan failed");
         Vec::new()
     });
+    let repositories = crate::repos::collect();
     let drift = compute_drift(ctx, &p).await;
     let reboot_required = ctx.platform.reboot_required().await;
 
@@ -466,6 +523,7 @@ async fn refresh_packages(ctx: &Ctx) {
         drift,
         devices,
         discovered,
+        repositories,
     };
     *last = Some(inv.clone());
     drop(last);
@@ -517,6 +575,7 @@ async fn refresh_devices(ctx: &Ctx, only: &[String]) -> usize {
         drift: Vec::new(),
         devices: Vec::new(),
         discovered: Vec::new(),
+        repositories: Vec::new(),
     });
 
     // A narrowed probe updates only the devices it touched.
