@@ -9,9 +9,16 @@ use pp_proto::{AppSource, AvailableUpdate, Cleanup, Ensure, Package, ScanIssue};
 
 use crate::exec::{self, Progress};
 
-#[cfg(target_os = "linux")]
+// Both backends are compiled on every host, not just their own.
+//
+// They shell out to package managers and touch only cross-platform std APIs,
+// so this costs nothing but catches the whole class of error where a change to
+// the Linux backend cannot even be type-checked from a Windows dev machine -
+// which is exactly how a literal tab inside a char literal reached a release.
+// Dispatch below is still cfg'd; only the compilation is unconditional.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod linux;
-#[cfg(windows)]
+#[cfg_attr(not(windows), allow(dead_code))]
 mod windows;
 
 /// A package manager this machine can actually drive, decided once at startup.
