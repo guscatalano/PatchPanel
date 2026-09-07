@@ -262,6 +262,20 @@ fn validate(path: &str) -> Result<std::path::PathBuf> {
     }
 }
 
+/// Where a file's backup lives.
+///
+/// Appends rather than using `with_extension`, which replaces: that turned
+/// `foo.list` into `foo.patchpanel-bak`, losing which file it came from and
+/// colliding with the backup of `foo.sources`. The backup is the recovery
+/// path, so it has to name its original unambiguously.
+fn backup_path(target: &std::path::Path) -> std::path::PathBuf {
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    target.with_file_name(format!("{name}.patchpanel-bak"))
+}
+
 /// Does apt complain about any of these URIs?
 ///
 /// Only the URIs from the file just written are considered: a machine with a
@@ -311,7 +325,7 @@ pub async fn write(path: &str, content: &str, p: &Progress) -> Result<String> {
     }
     // Keep a copy on disk too, so a human can recover it without the portal.
     if let Some(prev) = &previous {
-        let backup = target.with_extension("patchpanel-bak");
+        let backup = backup_path(&target);
         let _ = std::fs::write(&backup, prev);
     }
 
@@ -359,7 +373,7 @@ pub async fn remove(path: &str, p: &Progress) -> Result<String> {
     }
 
     let previous = std::fs::read_to_string(&target).unwrap_or_default();
-    let backup = target.with_extension("patchpanel-bak");
+    let backup = backup_path(&target);
     let _ = std::fs::write(&backup, &previous);
 
     std::fs::remove_file(&target).with_context(|| format!("removing {}", target.display()))?;
