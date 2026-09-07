@@ -163,20 +163,41 @@ pub fn install() -> Result<()> {
 
     // Self-update works by replacing the binary and exiting; without restart
     // actions the machine would simply drop off the fleet.
+    configure_recovery()?;
+
+    println!("installed service `{SERVICE_NAME}`");
+    println!("start it with:  sc.exe start {SERVICE_NAME}");
+    Ok(())
+}
+
+/// Make Windows restart the agent after a self-update.
+///
+/// Two settings are needed, and only having the first is a trap: `sc failure`
+/// defines the actions, but the SCM applies them **only when a service
+/// crashes**. An agent that exits deliberately to load a new binary counts as
+/// an orderly stop, so the actions never fire and the machine silently drops
+/// off the fleet. `sc failureflag 1` is what extends recovery to a service that
+/// stops itself with an error code, which is exactly what we do.
+///
+/// Idempotent, so re-running the installer repairs an existing install.
+pub fn configure_recovery() -> Result<()> {
     std::process::Command::new("sc.exe")
         .args([
             "failure",
             SERVICE_NAME,
             "reset=",
-            "60",
+            "86400",
             "actions=",
             "restart/5000/restart/5000/restart/10000",
         ])
         .status()
         .context("configuring restart actions")?;
 
-    println!("installed service `{SERVICE_NAME}`");
-    println!("start it with:  sc.exe start {SERVICE_NAME}");
+    std::process::Command::new("sc.exe")
+        .args(["failureflag", SERVICE_NAME, "1"])
+        .status()
+        .context("enabling recovery for non-crash exits")?;
+
     Ok(())
 }
 

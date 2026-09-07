@@ -381,6 +381,11 @@ async fn setup(cfg: config::Config, config_path: &std::path::Path) -> Result<()>
             // Already registered is fine; anything else is not.
             println!("==> service already registered");
         }
+        // Always reapply recovery settings, not just on first install: an
+        // agent installed before the failure flag was set would otherwise
+        // never restart itself after a self-update.
+        service::configure_recovery()?;
+        println!("==> recovery actions configured");
         let _ = exec::run("sc.exe", &["stop", service::SERVICE_NAME], &p).await;
         exec::run("sc.exe", &["start", service::SERVICE_NAME], &p)
             .await?
