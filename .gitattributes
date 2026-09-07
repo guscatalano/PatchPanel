@@ -1,0 +1,6 @@
+# Shell scripts and unit files are consumed on Linux. A CRLF checkout on a
+# Windows dev box otherwise ships `\r` into them, and the failure is obscure:
+# bash reports `set: pipefail: invalid option name` for a line that looks fine.
+*.sh            text eol=lf
+*.service       text eol=lf
+*.env.example   text eol=lf
