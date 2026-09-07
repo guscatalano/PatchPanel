@@ -583,8 +583,18 @@ async fn refresh_packages(ctx: &Ctx) {
     let release = crate::release::collect(&repositories);
     let cleanup = Some(ctx.platform.cleanup_preview(&p).await);
     scan_issues.extend(ctx.platform.scan_issues());
-    let held_back = ctx.platform.held_back(&p).await;
+    // These overlap by definition: anything a full upgrade refuses was also
+    // refused by a plain upgrade. Reporting both raw sets makes six packages
+    // look like twelve, so keep them disjoint - `held_back` means "a full
+    // upgrade would fix this", `deferred` means "nothing will".
     let deferred = ctx.platform.deferred(&p).await;
+    let held_back: Vec<String> = ctx
+        .platform
+        .held_back(&p)
+        .await
+        .into_iter()
+        .filter(|pkg| !deferred.contains(pkg))
+        .collect();
     let source_files = crate::sources::read_all();
     if !scan_issues.is_empty() {
         tracing::warn!(

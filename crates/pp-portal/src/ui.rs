@@ -710,8 +710,7 @@ async function saveSource(id, path, textareaId) {
 }
 
 async function deleteSource(id, path) {
-  if (!confirm("Delete " + path + "?
-A backup is kept beside it.")) return;
+  if (!confirm("Delete " + path + "? A backup is kept beside it.")) return;
   await cmd(id, "remove_source", { path });
 }
 

@@ -191,48 +191,97 @@ pub async fn install_prerequisites(p: &Progress) -> Result<String> {
     let mut log = Vec::new();
 
     p.line("installing the NuGet provider and trusting PSGallery");
-    let bootstrap = "\
-        [Net.ServicePointManager]::SecurityProtocol = \
-          [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; \
-        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope AllUsers \
-          -ErrorAction SilentlyContinue | Out-Null; \
-        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue; \
-        'ok'";
+    let bootstrap = concat!(
+        "[Net.ServicePointManager]::SecurityProtocol = ",
+        "[Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; ",
+        "Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force ",
+        "-ErrorAction SilentlyContinue | Out-Null; ",
+        "Set-PSRepository -Name PSGallery -InstallationPolicy Trusted ",
+        "-ErrorAction SilentlyContinue; 'ok'"
+    );
     let o = ps(bootstrap, p).await?;
-    log.push(format!("bootstrap: {}", exec::tail(&o.text, 400)));
+    log.push(format!("bootstrap: {}", exec::tail(o.text.trim(), 200)));
 
     p.line("installing PSWindowsUpdate");
     let o = ps(
-        "Install-Module PSWindowsUpdate -Force -Scope AllUsers -AllowClobber; \
-         (Get-Module -ListAvailable PSWindowsUpdate | Select-Object -First 1).Version.ToString()",
+        "Install-Module PSWindowsUpdate -Force -Scope AllUsers -AllowClobber -ErrorAction Stop; 'installed'",
         p,
     )
     .await?;
-    if o.ok() {
-        log.push(format!("PSWindowsUpdate: {}", o.text.trim()));
-    } else {
-        log.push(format!("PSWindowsUpdate FAILED: {}", exec::tail(&o.text, 500)));
+    if !o.ok() {
+        log.push(format!("PSWindowsUpdate failed: {}", exec::tail(&o.text, 400)));
     }
 
-    p.line("repairing winget for all users");
-    // Repair-WinGetPackageManager is Microsoft's supported way to get a
-    // working winget outside a user session; installing the MSIX by hand is
-    // fragile and version-specific.
-    let o = ps(
-        "Install-Module Microsoft.WinGet.Client -Force -Scope AllUsers -AllowClobber; \
-         Import-Module Microsoft.WinGet.Client; \
-         Repair-WinGetPackageManager -AllUsers -Force; 'winget repaired'",
-        p,
-    )
-    .await?;
-    if o.ok() {
-        log.push(format!("winget: {}", exec::tail(&o.text, 300)));
-    } else {
-        log.push(format!("winget FAILED: {}", exec::tail(&o.text, 500)));
+    // winget is the awkward one. Repair-WinGetPackageManager is the supported
+    // route but it only runs under PowerShell 7 - under Windows PowerShell it
+    // fails with WindowsPowerShellNotSupported. Try it only where pwsh exists,
+    // and otherwise provision the App Installer bundle directly, which works
+    // from 5.1 and from a SYSTEM service.
+    if winget_path().is_none() {
+        if exec::have("pwsh.exe") {
+            p.line("repairing winget with PowerShell 7");
+            let o = exec::run(
+                "pwsh.exe",
+                &[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Install-Module Microsoft.WinGet.Client -Force -Scope AllUsers -AllowClobber;                      Import-Module Microsoft.WinGet.Client;                      Repair-WinGetPackageManager -AllUsers -Force; 'done'",
+                ],
+                p,
+            )
+            .await?;
+            log.push(format!("winget via pwsh: exit {}", o.code));
+        } else {
+            p.line("provisioning the App Installer bundle (no PowerShell 7 present)");
+            // Forward slashes are valid in PowerShell paths and avoid a pile of
+            // escaping for no benefit.
+            let provision = concat!(
+                "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; ",
+                "[Net.ServicePointManager]::SecurityProtocol = ",
+                "[Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; ",
+                "$d = Join-Path $env:TEMP 'pp-winget'; ",
+                "New-Item -ItemType Directory -Force $d | Out-Null; ",
+                "$b = \"$d/winget.msixbundle\"; $v = \"$d/vclibs.appx\"; ",
+                "Invoke-WebRequest -UseBasicParsing 'https://aka.ms/getwinget' -OutFile $b; ",
+                "Invoke-WebRequest -UseBasicParsing ",
+                "'https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx' -OutFile $v; ",
+                "Add-AppxProvisionedPackage -Online -PackagePath $b ",
+                "-DependencyPackagePath $v -SkipLicense | Out-Null; 'provisioned'"
+            );
+            let o = ps(provision, p).await?;
+            if !o.ok() {
+                log.push(format!(
+                    "winget provisioning failed: {}",
+                    exec::tail(&o.text, 500)
+                ));
+            }
+        }
     }
 
-    log.push("restart the agent service for the new backends to be detected".into());
-    Ok(log.join("\n"))
+    // Report what is actually true now, not what the commands claimed. The
+    // previous version printed "winget repaired" even when the cmdlet had
+    // refused to run, which is worse than not trying.
+    let winget_ok = winget_path().is_some();
+    let wu_ok = has_pswindowsupdate();
+    log.push(format!(
+        "result: PSWindowsUpdate {}, winget {}",
+        if wu_ok { "available" } else { "STILL MISSING" },
+        if winget_ok { "available" } else { "STILL MISSING" }
+    ));
+
+    if wu_ok && winget_ok {
+        log.push("restart the agent service so the new backends are detected".into());
+        Ok(log.join("\n"))
+    } else {
+        // A partial result is a failure: the machine still cannot be fully
+        // scanned, and saying otherwise recreates the false-zero problem.
+        anyhow::bail!(
+            "{}\n\nThis machine still cannot be fully scanned. Installing PowerShell 7 \
+             (winget's supported tooling) and re-running usually resolves the winget half.",
+            log.join("\n")
+        )
+    }
 }
 
 pub async fn available_updates(
