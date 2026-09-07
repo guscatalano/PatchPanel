@@ -59,6 +59,31 @@ impl std::fmt::Display for OsKind {
     }
 }
 
+/// Static facts about the machine. Deliberately not usage: what CPU it has,
+/// not how busy it is. Collected once at startup, because none of it changes
+/// while the agent runs and polling it would be pure noise.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Hardware {
+    #[serde(default)]
+    pub cpu_model: String,
+    /// Physical cores.
+    #[serde(default)]
+    pub cpu_cores: u32,
+    /// Logical processors, i.e. what `nproc` reports.
+    #[serde(default)]
+    pub cpu_threads: u32,
+    #[serde(default)]
+    pub memory_mb: u64,
+    /// Non-loopback IPv4 addresses.
+    #[serde(default)]
+    pub ip_addresses: Vec<String>,
+    #[serde(default)]
+    pub kernel: String,
+    /// System manufacturer and model, where the machine will tell us.
+    #[serde(default)]
+    pub vendor: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemInfo {
     pub hostname: String,
@@ -72,6 +97,10 @@ pub struct SystemInfo {
     /// Collector site this agent belongs to; selects the devices it probes.
     #[serde(default)]
     pub site: String,
+    /// Static hardware description. Defaulted so an older agent that does not
+    /// send it still enrolls.
+    #[serde(default)]
+    pub hardware: Hardware,
 }
 
 // ---------------------------------------------------------------------------

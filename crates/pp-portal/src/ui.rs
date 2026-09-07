@@ -291,7 +291,10 @@ const INDEX: &str = r##"<!doctype html>
 <script>
 const $ = (id) => document.getElementById(id);
 let TOKEN = localStorage.getItem("pp_token") || "";
-let TAB = "fleet";
+// Read from the URL so a refresh, a bookmark, or a shared link all land on the
+// tab you were actually looking at.
+const TABS = ["fleet", "devices", "add", "manifest", "activity"];
+let TAB = TABS.includes(location.hash.slice(1)) ? location.hash.slice(1) : "fleet";
 let AGENTS = [];
 let REV = 0;
 let AUTH_REQUIRED = true;
@@ -329,13 +332,24 @@ document.addEventListener("input", (e) => {
   if (e.target && (e.target.id === "add-site" || e.target.id === "add-portal")) loadAdd();
 });
 
+function showTab(tab) {
+  TAB = TABS.includes(tab) ? tab : "fleet";
+  document.querySelectorAll("nav button").forEach((x) =>
+    x.classList.toggle("active", x.dataset.tab === TAB));
+  document.querySelectorAll("section").forEach((s) =>
+    s.classList.toggle("active", s.id === TAB));
+  if (location.hash.slice(1) !== TAB) location.hash = TAB;
+  refresh();
+}
+
 document.querySelectorAll("nav button").forEach((b) => {
-  b.onclick = () => {
-    TAB = b.dataset.tab;
-    document.querySelectorAll("nav button").forEach((x) => x.classList.toggle("active", x === b));
-    document.querySelectorAll("section").forEach((s) => s.classList.toggle("active", s.id === TAB));
-    refresh();
-  };
+  b.onclick = () => showTab(b.dataset.tab);
+});
+
+// Back/forward and manual hash edits should move tabs too.
+window.addEventListener("hashchange", () => {
+  const t = location.hash.slice(1);
+  if (TABS.includes(t) && t !== TAB) showTab(t);
 });
 
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -596,7 +610,7 @@ async function boot() {
   }
   if (!AUTH_REQUIRED || TOKEN) {
     $("app").hidden = false;
-    refresh();
+    showTab(TAB);
   } else {
     gate();
     $("gate-msg").className = "msg";

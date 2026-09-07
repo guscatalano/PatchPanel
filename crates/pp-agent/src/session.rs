@@ -312,11 +312,23 @@ async fn apply_manifest_update(manifest: Manifest, ctx: &Ctx) {
             match reconcile_apps(&ctx, &p).await {
                 Ok(summary) => {
                     tracing::info!(revision, %summary, "converged on manifest");
-                    let mut s = ctx.state.lock().await;
-                    s.applied_revision = revision;
-                    if let Err(e) = s.save(&ctx.cfg.state_dir) {
-                        tracing::error!(error = %e, "failed to persist applied revision");
+                    let reboot_required = ctx.platform.reboot_required().await;
+                    {
+                        let mut s = ctx.state.lock().await;
+                        s.applied_revision = revision;
+                        if let Err(e) = s.save(&ctx.cfg.state_dir) {
+                            tracing::error!(error = %e, "failed to persist applied revision");
+                        }
                     }
+                    // Tell the portal now rather than on the next heartbeat.
+                    // Otherwise every freshly enrolled agent shows as "stale
+                    // manifest" for up to a full heartbeat interval, which
+                    // looks like a fault and is not one.
+                    ctx.send(ClientMsg::Heartbeat {
+                        at: Utc::now(),
+                        reboot_required,
+                        applied_revision: revision,
+                    });
                 }
                 // Leave applied_revision alone so the next manifest push, or
                 // the next reconnect, tries again.

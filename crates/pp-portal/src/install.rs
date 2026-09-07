@@ -40,7 +40,12 @@ fn portal_host(headers: &HeaderMap, state: &SharedState) -> String {
 /// because this endpoint is unauthenticated and reachable by anyone who can
 /// see the port.
 const SERVABLE: &[(&str, &str)] = &[
+    // Architecture-suffixed names are what install.sh asks for; the bare name
+    // stays as an x86_64 alias so older instructions keep working.
     ("pp-agent", "application/octet-stream"),
+    ("pp-agent-x86_64", "application/octet-stream"),
+    ("pp-agent-aarch64", "application/octet-stream"),
+    ("pp-agent-armv7l", "application/octet-stream"),
     ("pp-agent.exe", "application/octet-stream"),
     ("patchpanel-agent.service", "text/plain; charset=utf-8"),
 ];
@@ -104,10 +109,25 @@ done
 
 command -v systemctl >/dev/null 2>&1 || {{ echo "error: this installer needs systemd" >&2; exit 1; }}
 
-echo "==> downloading agent"
+# A binary for the wrong CPU fails with "Exec format error", which says nothing
+# useful, so pick the right one up front and say so plainly if there is none.
+ARCH="$(uname -m)"
+case "$ARCH" in
+  x86_64|amd64)   BIN=pp-agent-x86_64 ;;
+  aarch64|arm64)  BIN=pp-agent-aarch64 ;;
+  armv7l|armv7)   BIN=pp-agent-armv7l ;;
+  *) echo "error: no agent build for architecture '$ARCH'" >&2; exit 1 ;;
+esac
+
+echo "==> downloading agent ($ARCH)"
 # Download beside the target and rename, so an interrupted fetch never leaves a
 # half-written binary where systemd expects a working one.
-curl -fsSL "http://$PORTAL/download/pp-agent" -o /usr/local/bin/.pp-agent.new
+if ! curl -fsSL "http://$PORTAL/download/$BIN" -o /usr/local/bin/.pp-agent.new; then
+  rm -f /usr/local/bin/.pp-agent.new
+  echo "error: this portal has no '$BIN' published." >&2
+  echo "       build it and drop it in the portal's agent directory." >&2
+  exit 1
+fi
 chmod 0755 /usr/local/bin/.pp-agent.new
 mv /usr/local/bin/.pp-agent.new /usr/local/bin/pp-agent
 
