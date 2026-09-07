@@ -614,7 +614,10 @@ function scanCard(issues, held, deferred, id, connected) {
       ${issues.some((i) => i.backend === "winget" || i.backend === "windowsupdate")
         ? `<button class="act" ${connected ? "" : "disabled"} style="margin-top:10px"
              title="Installs the NuGet provider, PSWindowsUpdate, and repairs winget for all users. Downloads from the PowerShell Gallery."
-             onclick="installPrereqs('${id}')">Install the missing tooling</button>`
+             onclick="installPrereqs('${id}')">Install the missing tooling</button>
+           <button class="act" ${connected ? "" : "disabled"} style="margin-top:10px"
+             title="Backends are detected once at startup, so a restart is needed after installing tooling."
+             onclick="restartAgent('${id}')">Restart agent</button>`
         : ""}
     </div>` : ""}
     ${deferred.length ? `<div class="step">
@@ -885,6 +888,11 @@ async function loadAgent(id) {
           ["Package backends", (d.backends || []).map((b) => `<span class="mono">${esc(b)}</span>`).join(", ")],
           ["Agent id", `<span class="mono msg">${esc(d.id)}</span>`],
         ])}
+        <div class="bar">
+          <button class="act" ${d.connected && !busy ? "" : "disabled"}
+            title="Restarts the agent process. Re-detects package backends; does not touch the machine otherwise."
+            onclick="restartAgent('${d.id}')">Restart agent</button>
+        </div>
       </div>
     </div>
 
@@ -1145,6 +1153,11 @@ async function loadActivity() {
 
 // Patching restarts services and can demand a reboot, so it is the one
 // per-machine action that asks first.
+async function restartAgent(id) {
+  if (!confirm("Restart the agent on this machine? It re-detects package backends and reconnects in a few seconds. Nothing else on the machine is touched.")) return;
+  await cmd(id, "restart_agent");
+}
+
 async function installPrereqs(id) {
   const warn = "Install the missing update tooling on this machine? This downloads PSWindowsUpdate and the WinGet client from the PowerShell Gallery and repairs winget for all users. Restart the agent service afterwards so the new backends are detected.";
   if (!confirm(warn)) return;

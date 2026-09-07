@@ -345,6 +345,13 @@ pub enum Command {
     /// Delete an apt source file, keeping a backup beside it.
     RemoveSource { path: String },
 
+    /// Exit so the supervisor starts the agent again.
+    ///
+    /// Backends are detected once at startup, so installing package tooling
+    /// only takes effect after a restart. Making that a button beats telling
+    /// someone to go and do it by hand on the machine.
+    RestartAgent,
+
     /// Install whatever this machine is missing in order to be scannable at
     /// all - on Windows, the PSWindowsUpdate module and a system-wide winget.
     InstallPrerequisites,

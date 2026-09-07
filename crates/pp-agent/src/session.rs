@@ -761,7 +761,12 @@ async fn run_command(env: CommandEnvelope, ctx: Ctx) {
     let p = Progress::attached(id, ctx.progress_tx.clone());
     tracing::info!(%id, command = ?env.command, "running command");
 
-    let self_updated = matches!(env.command, Command::SelfUpdate { .. });
+    // Both of these end with this process exiting so the supervisor can start
+    // it again - one to load a new binary, one to re-detect backends.
+    let wants_restart = matches!(
+        env.command,
+        Command::SelfUpdate { .. } | Command::RestartAgent
+    );
     let result = execute(env.command, &ctx, &p).await;
 
     let (ok, summary, detail) = match result {
@@ -781,11 +786,11 @@ async fn run_command(env: CommandEnvelope, ctx: Ctx) {
         finished_at: Utc::now(),
     }));
 
-    if ok && self_updated {
+    if ok && wants_restart {
         // Give the writer a moment to flush the result before we tear the
         // connection down; the portal should record the update before we go.
         tokio::time::sleep(Duration::from_millis(500)).await;
-        tracing::info!("self-update installed; signalling restart");
+        tracing::info!("signalling restart");
         if ctx.restart_tx.send(()).is_err() {
             // The session is already ending, which achieves the same thing.
             tracing::warn!("restart channel closed; the next reconnect will run the new binary");
@@ -857,6 +862,10 @@ async fn execute(cmd: Command, ctx: &Ctx, p: &Progress) -> Result<String> {
             let msg = crate::sources::remove(&path, p).await?;
             refresh_packages(ctx).await;
             Ok(msg)
+        }
+
+        Command::RestartAgent => {
+            Ok("restarting; the supervisor will start the agent again".to_string())
         }
 
         Command::InstallPrerequisites => {
