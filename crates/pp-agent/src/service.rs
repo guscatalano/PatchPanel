@@ -73,7 +73,13 @@ fn service_body() -> Result<()> {
     ))?;
 
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
-    let agent = runtime.spawn(async {
+
+    // The agent loop returns only after a self-update has put a new binary in
+    // place. Watch for that as well as for the SCM's stop request: without it
+    // the service sits here "running" with nothing inside it, and a Windows
+    // agent silently stops reporting the moment it upgrades itself.
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let agent = runtime.spawn(async move {
         let path = crate::config::default_config_path();
         match crate::config::Config::load(&path) {
             Ok(cfg) => {
@@ -83,15 +89,43 @@ fn service_body() -> Result<()> {
             }
             Err(e) => tracing::error!(error = %format!("{e:#}"), "failed to load config"),
         }
+        let _ = done_tx.send(());
     });
 
-    // Block this thread until the SCM asks us to stop.
-    let _ = shutdown_rx.recv();
-    tracing::info!("stop requested by service control manager");
+    let mut replaced = false;
+    loop {
+        if shutdown_rx.try_recv().is_ok() {
+            tracing::info!("stop requested by service control manager");
+            break;
+        }
+        if done_rx.try_recv().is_ok() {
+            tracing::info!("agent exited to pick up a new binary");
+            replaced = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
     agent.abort();
     runtime.shutdown_timeout(Duration::from_secs(5));
 
-    status_handle.set_service_status(report(ServiceState::Stopped, ServiceControlAccept::empty()))?;
+    // Exiting cleanly would tell the SCM we meant to stop, and the restart
+    // actions configured at install time would never fire. Report a service
+    // specific code so it restarts us onto the binary we just installed.
+    let exit_code = if replaced {
+        ServiceExitCode::ServiceSpecific(1)
+    } else {
+        ServiceExitCode::Win32(0)
+    };
+    status_handle.set_service_status(ServiceStatus {
+        service_type: SERVICE_TYPE,
+        current_state: ServiceState::Stopped,
+        controls_accepted: ServiceControlAccept::empty(),
+        exit_code,
+        checkpoint: 0,
+        wait_hint: Duration::from_secs(0),
+        process_id: None,
+    })?;
     Ok(())
 }
 
