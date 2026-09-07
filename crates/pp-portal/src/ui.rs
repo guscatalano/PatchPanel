@@ -382,6 +382,36 @@ window.addEventListener("hashchange", () => {
   if (r.tab !== ROUTE.tab || r.id !== ROUTE.id) showTab(r.tab, r.id);
 });
 
+// Re-rendering on a timer is what makes the dashboard live, and also what
+// closes an <details> you were reading. Two defences: skip the write entirely
+// when nothing changed, and carry the open ones across when it did.
+function setHTML(el, html) {
+  if (!el || el.__lastHTML === html) return false;
+  const open = new Set(
+    [...el.querySelectorAll("details[open][data-k]")].map((d) => d.dataset.k)
+  );
+  const active = document.activeElement;
+  const keepId = active && el.contains(active) ? active.id : null;
+  const caret = keepId && "selectionStart" in active ? active.selectionStart : null;
+
+  el.__lastHTML = html;
+  el.innerHTML = html;
+
+  el.querySelectorAll("details[data-k]").forEach((d) => {
+    if (open.has(d.dataset.k)) d.open = true;
+  });
+  if (keepId) {
+    const again = document.getElementById(keepId);
+    if (again) {
+      again.focus();
+      if (caret !== null && "setSelectionRange" in again) {
+        try { again.setSelectionRange(caret, caret); } catch (e) { /* not a text field */ }
+      }
+    }
+  }
+  return true;
+}
+
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 function ago(iso) {
@@ -416,7 +446,7 @@ async function loadFleet() {
     tile(s.devices_drifted, "firmware drift", "warn");
 
   $("agents-empty").hidden = d.agents.length > 0;
-  $("agents").innerHTML = d.agents.map((a) => {
+  const agentRows = d.agents.map((a) => {
     const live = a.connected ? "on" : (a.online ? "on" : "off");
     const upd = a.security_count > 0
       ? `<span class="pill bad">${a.security_count} sec</span> ${a.update_count - a.security_count}`
@@ -456,6 +486,7 @@ async function loadFleet() {
       </td>
     </tr>`;
   }).join("");
+  setHTML($("agents"), agentRows);
 }
 
 function since(iso) {
@@ -541,7 +572,7 @@ async function loadAgent(id) {
   const CHANGED = ["apply_patches", "apply_manifest", "self_update", "reboot"];
   const history = (d.commands || []).filter((c) => CHANGED.includes(c.kind));
 
-  body.innerHTML = `
+  const html = `
     <div class="back" onclick="showTab('fleet')">&larr; Fleet</div>
     <div class="hdr">
       <h2>${esc(d.hostname)}</h2>${state}
@@ -614,7 +645,7 @@ async function loadAgent(id) {
           <div>${st} <b>${esc(c.kind)}</b>
             <span class="msg">&middot; ${new Date(c.created_at).toLocaleString()} &middot; ${ago(c.created_at)}</span></div>
           ${c.summary ? `<div class="mono" style="margin-top:4px">${esc(c.summary)}</div>` : ""}
-          ${out ? `<details><summary>output</summary><pre>${esc(out)}</pre></details>` : ""}
+          ${out ? `<details data-k="${esc(c.id)}"><summary>output</summary><pre>${esc(out)}</pre></details>` : ""}
         </div>`;
       }).join("") : `<div class="empty">Nothing has changed this machine yet.</div>`}
     </div>
@@ -633,6 +664,10 @@ async function loadAgent(id) {
            <td class="mono">${esc(p.version)}</td><td class="mono msg">${esc(p.source)}</td></tr>`).join("")}</tbody></table>
       </div>
     </div>`;
+
+  // Only touches the DOM when something actually changed, so an open output
+   // block, the package filter's text, and its caret all survive the timer.
+  if (!setHTML(body, html)) return;
 
   const filter = $("pkg-filter");
   if (filter) {
@@ -773,7 +808,7 @@ async function loadActivity() {
   const rows = await api("/api/commands?limit=40");
   $("commands-empty").hidden = rows.length > 0;
   const host = (id) => (AGENTS.find((a) => a.id === id) || {}).hostname || id.slice(0, 8);
-  $("commands").innerHTML = rows.map((c) => {
+  const html = rows.map((c) => {
     const state = c.ok === null || c.ok === undefined
       ? '<span class="pill">running</span>'
       : (c.ok ? '<span class="pill ok">ok</span>' : '<span class="pill bad">failed</span>');
@@ -782,9 +817,10 @@ async function loadActivity() {
       <div>${state} <b>${esc(c.kind)}</b> on ${esc(host(c.agent_id))}
         <span class="msg">· ${ago(c.created_at)}</span></div>
       ${c.summary ? `<div class="mono" style="margin-top:4px">${esc(c.summary)}</div>` : ""}
-      ${body ? `<details><summary>output</summary><pre>${esc(body)}</pre></details>` : ""}
+      ${body ? `<details data-k="${esc(c.id)}"><summary>output</summary><pre>${esc(body)}</pre></details>` : ""}
     </div>`;
   }).join("");
+  setHTML($("commands"), html);
 }
 
 // Patching restarts services and can demand a reboot, so it is the one
