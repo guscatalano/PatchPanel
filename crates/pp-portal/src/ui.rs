@@ -449,9 +449,14 @@ async function loadFleet() {
   $("agents-empty").hidden = d.agents.length > 0;
   const agentRows = d.agents.map((a) => {
     const live = a.connected ? "on" : (a.online ? "on" : "off");
-    const upd = a.security_count > 0
-      ? `<span class="pill bad">${a.security_count} sec</span> ${a.update_count - a.security_count}`
-      : (a.update_count || "-");
+    // Show the total, then flag the security subset in full words. The old
+    // form rendered "1 sec 0" - which reads as a duration, and buried the
+    // total behind an unexplained subtraction.
+    const upd = a.update_count
+      ? `${a.update_count}${a.security_count
+          ? ` <span class="pill bad" title="${a.security_count} of these are security updates - patch these first">${a.security_count} security</span>`
+          : ""}`
+      : `<span class="msg">none</span>`;
     const dev = a.device_count
       ? `${a.device_count}${a.device_problem_count ? ` <span class="pill bad">${a.device_problem_count}</span>` : ""}`
       : "-";
