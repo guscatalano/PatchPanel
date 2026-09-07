@@ -545,8 +545,7 @@ function scanCard(issues, held, id, connected) {
       <p>A plain <code>apt upgrade</code> refuses anything needing new packages installed &mdash;
          typically a kernel metapackage. These stay pending forever until a full upgrade runs,
          which may also remove packages, so it is a deliberate action.</p>
-      <pre>${esc(held.join("
-"))}</pre>
+      <ul style="margin:8px 0 0 18px">${held.map((h) => `<li class="mono">${esc(h)}</li>`).join("")}</ul>
       <button class="act" ${connected ? "" : "disabled"}
         title="Runs apt full-upgrade. This can install new packages and remove existing ones."
         onclick="fullUpgrade('${id}')">Run full upgrade</button>
@@ -932,9 +931,8 @@ async function loadActivity() {
 // Patching restarts services and can demand a reboot, so it is the one
 // per-machine action that asks first.
 async function fullUpgrade(id) {
-  if (!confirm("Run a FULL upgrade?
-
-This can install new packages and remove existing ones. It is how held-back upgrades such as a kernel get applied.")) return;
+  const warn = "Run a FULL upgrade? This can install new packages and remove existing ones. It is how held-back upgrades such as a kernel get applied.";
+  if (!confirm(warn)) return;
   await cmd(id, "apply_patches", { full: true });
 }
 
