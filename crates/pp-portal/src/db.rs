@@ -54,6 +54,9 @@ pub struct AgentRow {
     pub drift_count: usize,
     pub device_count: usize,
     pub device_problem_count: usize,
+    /// Release-readiness blockers, so the fleet list can warn before someone
+    /// presses a button that would break the machine.
+    pub release_blockers: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -335,6 +338,11 @@ impl Db {
                 drift_count: drift,
                 device_count: devices,
                 device_problem_count: device_problems,
+                release_blockers: inv
+                    .as_ref()
+                    .and_then(|i| i.release.as_ref())
+                    .map(|r| r.blockers())
+                    .unwrap_or(0),
             })
         })?;
 

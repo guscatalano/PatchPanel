@@ -573,6 +573,7 @@ async fn refresh_packages(ctx: &Ctx) {
         Vec::new()
     });
     let repositories = crate::repos::collect();
+    let release = crate::release::collect(&repositories);
     let drift = compute_drift(ctx, &p).await;
     let reboot_required = ctx.platform.reboot_required().await;
 
@@ -591,6 +592,7 @@ async fn refresh_packages(ctx: &Ctx) {
         devices,
         discovered,
         repositories,
+        release,
     };
     *last = Some(inv.clone());
     drop(last);
@@ -643,6 +645,7 @@ async fn refresh_devices(ctx: &Ctx, only: &[String]) -> usize {
         devices: Vec::new(),
         discovered: Vec::new(),
         repositories: Vec::new(),
+        release: None,
     });
 
     // A narrowed probe updates only the devices it touched.

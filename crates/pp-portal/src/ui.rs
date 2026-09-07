@@ -452,6 +452,9 @@ async function loadFleet() {
     // Show the total, then flag the security subset in full words. The old
     // form rendered "1 sec 0" - which reads as a duration, and buried the
     // total behind an unexplained subtraction.
+    const unsafe_ = a.release_blockers > 0
+      ? ` <span class="pill bad" title="This machine's package sources are misconfigured; installing updates could break it. Open the machine for details.">unsafe</span>`
+      : "";
     const upd = a.update_count
       ? `${a.update_count}${a.security_count
           ? ` <span class="pill bad" title="${a.security_count} of these are security updates - patch these first">${a.security_count} security</span>`
@@ -479,7 +482,7 @@ async function loadFleet() {
       <td title="${esc(a.os_version)} ${esc(a.arch)}">${esc(a.os_version.length > 22 ? a.os_version.slice(0, 21) + "…" : a.os_version)}
           <div class="msg mono">${esc(a.arch)}</div></td>
       <td>${esc(a.site) || "-"}</td>
-      <td>${upd}</td>
+      <td>${upd}${unsafe_}</td>
       <td>${a.drift_count ? `<span class="pill warn">${a.drift_count}</span>` : "-"}</td>
       <td>${dev}</td>
       <td class="mono">${a.applied_revision < REV ? `<span class="pill warn">r${a.applied_revision}</span>` : "r" + a.applied_revision}</td>
@@ -514,6 +517,40 @@ function kv(rows) {
     .filter(([, v]) => v !== null && v !== undefined && v !== "")
     .map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`)
     .join("") + `</dl>`;
+}
+
+function releaseCard(rel) {
+  if (!rel) return "";
+  const blockers = (rel.findings || []).filter((f) => f.severity === "blocker");
+  const warnings = (rel.findings || []).filter((f) => f.severity === "warning");
+
+  const verdict = blockers.length
+    ? `<span class="pill bad">not safe to upgrade</span>`
+    : (rel.next ? `<span class="pill ok">ready for ${esc(rel.next)}</span>`
+                : `<span class="pill">no known next release</span>`);
+
+  const finding = (f) => `<div class="step">
+      <h3>${f.severity === "blocker" ? '<span class="pill bad">blocker</span>' : '<span class="pill warn">warning</span>'}
+        ${esc(f.summary)}</h3>
+      ${f.detail ? `<pre>${esc(f.detail)}</pre>` : ""}
+    </div>`;
+
+  return `<div class="card">
+    <h2>Release</h2>
+    <div class="step">
+      <div class="hdr" style="margin:0">
+        <b>${esc(rel.distro)} ${esc(rel.version_id)}</b>
+        <span class="mono msg">${esc(rel.codename)}</span>
+        ${verdict}
+      </div>
+      ${blockers.length
+        ? `<p style="margin-top:10px">Installing updates on this machine is unsafe until the
+             blocker${blockers.length > 1 ? "s" : ""} below ${blockers.length > 1 ? "are" : "is"} resolved.</p>`
+        : (rel.next ? `<p style="margin-top:10px">Next release is <b>${esc(rel.next)}</b>.</p>` : "")}
+    </div>
+    ${blockers.map(finding).join("")}
+    ${warnings.map(finding).join("")}
+  </div>`;
 }
 
 function repoCard(repos, diff) {
@@ -660,6 +697,8 @@ async function loadAgent(id) {
         </div>`;
       }).join("") : `<div class="empty">Nothing has changed this machine yet.</div>`}
     </div>
+
+    ${releaseCard(inv.release)}
 
     ${repoCard(inv.repositories || [], d.repo_diff || {})}
 

@@ -7,6 +7,7 @@ mod exec;
 mod hardware;
 mod platform;
 mod probe;
+mod release;
 mod repos;
 mod selfupdate;
 mod session;
@@ -439,6 +440,17 @@ cpu:      {}", hw.cpu_model);
     for r in &repos {
         let off = if r.enabled { "" } else { "  [disabled]" };
         println!("  {:<8} {:<50} {}{}", r.source, r.uri, r.suite, off);
+    }
+
+    if let Some(rel) = release::collect(&repos) {
+        println!("
+release:  {} {} ({})", rel.distro, rel.version_id, rel.codename);
+        if let Some(n) = &rel.next {
+            println!("next:     {n}");
+        }
+        for f in &rel.findings {
+            println!("  [{:?}] {}", f.severity, f.summary);
+        }
     }
 
     let updates = pf.available_updates(&p).await?;

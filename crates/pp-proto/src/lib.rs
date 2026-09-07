@@ -134,6 +134,46 @@ pub struct Repository {
     pub origin_file: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    /// Upgrading, or in some cases even patching, would likely break this box.
+    Blocker,
+    /// Worth resolving first, but not disqualifying on its own.
+    Warning,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseFinding {
+    pub severity: Severity,
+    pub summary: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// Which distribution release a machine is on, and whether it is in a fit
+/// state to move to the next one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseInfo {
+    pub distro: String,
+    pub codename: String,
+    pub version_id: String,
+    /// The next major release, where the sequence is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+    #[serde(default)]
+    pub findings: Vec<ReleaseFinding>,
+}
+
+impl ReleaseInfo {
+    pub fn blockers(&self) -> usize {
+        self.findings
+            .iter()
+            .filter(|f| f.severity == Severity::Blocker)
+            .count()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Package {
     pub name: String,
@@ -172,6 +212,9 @@ pub struct Inventory {
     /// Package repositories this machine is configured to use.
     #[serde(default)]
     pub repositories: Vec<Repository>,
+    /// Distribution release state and upgrade readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<ReleaseInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
