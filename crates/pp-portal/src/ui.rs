@@ -109,6 +109,26 @@ const INDEX: &str = r##"<!doctype html>
   details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
   pre { margin: 8px 0 0; padding: 10px; background: var(--bg); border-radius: 6px; font-family: var(--mono); font-size: 11.5px; white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto; }
 
+  .step { padding: 14px; border-bottom: 1px solid var(--line); }
+  .step:last-child { border-bottom: none; }
+  .step h3 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+  .step p { margin: 0 0 10px; color: var(--muted); font-size: 12.5px; }
+  .cmd { position: relative; }
+  .cmd pre { margin: 0; max-height: none; }
+  .cmd button {
+    position: absolute; top: 6px; right: 6px; font: inherit; font-size: 11px;
+    padding: 3px 9px; background: var(--panel); color: var(--muted);
+    border: 1px solid var(--line); border-radius: 5px; cursor: pointer;
+  }
+  .cmd button:hover { color: var(--accent); border-color: var(--accent); }
+  .field { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+  .field label { font-size: 12.5px; color: var(--muted); }
+  .field input {
+    padding: 5px 9px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--bg); color: var(--ink); font-family: var(--mono); font-size: 12.5px;
+  }
+  .note { padding: 10px 12px; border-radius: 8px; font-size: 12.5px; border: 1px solid var(--line); background: var(--bg); margin-bottom: 12px; }
+
   #gate { max-width: 380px; margin: 80px auto; }
   #gate input { width: 100%; padding: 9px 11px; margin: 10px 0; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); color: var(--ink); font-family: var(--mono); font-size: 13px; }
 </style>
@@ -132,6 +152,7 @@ const INDEX: &str = r##"<!doctype html>
     <nav>
       <button data-tab="fleet" class="active">Fleet</button>
       <button data-tab="devices">Devices</button>
+      <button data-tab="add">Add machine</button>
       <button data-tab="manifest">Manifest</button>
       <button data-tab="activity">Activity</button>
     </nav>
@@ -185,6 +206,51 @@ const INDEX: &str = r##"<!doctype html>
         </table></div>
         <div class="empty" id="unmanaged-empty" hidden>
           Nothing unaccounted for. Add a <code>discovery</code> range to the manifest to sweep for devices.
+        </div>
+      </div>
+    </section>
+
+    <section id="add">
+      <div class="card">
+        <h2>Add a machine</h2>
+        <div class="step">
+          <div class="note">
+            Enrolling only makes a machine <b>report</b> what it has installed.
+            Nothing is installed, upgraded, or rebooted until you publish a
+            manifest that asks for it.
+          </div>
+          <div class="field">
+            <label for="add-portal">Portal address</label>
+            <input id="add-portal" spellcheck="false" size="24">
+            <label for="add-site" style="margin-left:8px">Site</label>
+            <input id="add-site" value="homelab" spellcheck="false" size="14">
+          </div>
+          <div id="add-hint" class="msg"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Linux &mdash; run as root</h2>
+        <div class="step">
+          <div class="cmd"><button onclick="copyCmd('cmd-linux')">Copy</button><pre id="cmd-linux"></pre></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Windows &mdash; run in an elevated PowerShell</h2>
+        <div class="step">
+          <div class="cmd"><button onclick="copyCmd('cmd-win')">Copy</button><pre id="cmd-win"></pre></div>
+          <p style="margin-top:10px">For Windows Update patching as well as winget app updates, the
+             target also needs <code>Install-Module PSWindowsUpdate -Force -Scope AllUsers</code>.</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>What the installer does</h2>
+        <div class="step">
+          <p>Downloads the agent from this portal, enrols it, installs a service that
+             restarts on failure, and starts it. Re-running upgrades in place and keeps
+             the machine's existing identity.</p>
         </div>
       </div>
     </section>
@@ -258,6 +324,10 @@ function saveToken() {
   $("app").hidden = false;
   refresh();
 }
+
+document.addEventListener("input", (e) => {
+  if (e.target && (e.target.id === "add-site" || e.target.id === "add-portal")) loadAdd();
+});
 
 document.querySelectorAll("nav button").forEach((b) => {
   b.onclick = () => {
@@ -359,6 +429,60 @@ async function loadDevices() {
     </tr>`).join("");
 }
 
+// The portal cannot know which address you reached it on (it may be bound to
+// 0.0.0.0), so the commands are built from the URL in your address bar - which
+// is by definition an address that works.
+async function loadAdd() {
+  const site = ($("add-site").value || "default").replace(/[^A-Za-z0-9._-]/g, "");
+  const host = $("add-portal").value.trim() || location.host;
+  let token = "<enrollment-token>";
+  try {
+    token = (await api("/api/enrollment")).token || token;
+  } catch (e) {
+    // Leave the placeholder; the shape of the command is still useful.
+  }
+
+  $("cmd-linux").textContent =
+    `curl -fsSL http://${host}/install.sh | sh -s -- --token ${token} --site ${site}`;
+
+  $("cmd-win").textContent =
+    `irm http://${host}/install.ps1 -OutFile $env:TEMP\pp.ps1; ` +
+    `& $env:TEMP\pp.ps1 -Token ${token} -Site ${site}`;
+
+  // A bare IP works until DHCP moves the portal, and then every enrolled agent
+  // is pointing at nothing. Say so once, here, rather than in a runbook.
+  const hint = $("add-hint");
+  if (/^\d+\.\d+\.\d+\.\d+(:\d+)?$/.test(host)) {
+    hint.textContent =
+      "This is an IP address. If this portal is on DHCP, prefer its hostname " +
+      "so agents keep working when the address changes.";
+    hint.className = "msg bad";
+  } else {
+    hint.textContent = "Agents will connect to this address, so it must resolve from every machine you enrol.";
+    hint.className = "msg";
+  }
+}
+
+// The async clipboard API needs a secure context, and this portal is plain
+// HTTP, so fall back to the old selection trick rather than silently failing.
+function copyCmd(id) {
+  const text = $(id).textContent;
+  const done = (btn) => { const o = btn.textContent; btn.textContent = "Copied"; setTimeout(() => (btn.textContent = o), 1200); };
+  const btn = $(id).parentElement.querySelector("button");
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(() => done(btn));
+    return;
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand("copy"); done(btn); } catch (e) { /* user can select manually */ }
+  document.body.removeChild(ta);
+}
+
 async function loadManifest() {
   const m = await api("/api/manifest");
   $("manifest-doc").value = JSON.stringify(m, null, 2);
@@ -444,6 +568,10 @@ async function refresh() {
     // The fleet call also populates the hostname lookup the activity tab uses.
     await loadFleet();
     if (TAB === "devices") await loadDevices();
+    if (TAB === "add") {
+      if (!$("add-portal").value) $("add-portal").value = location.host;
+      await loadAdd();
+    }
     if (TAB === "manifest" && !$("manifest-doc").value) await loadManifest();
     if (TAB === "activity") await loadActivity();
   } catch (e) {

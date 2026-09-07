@@ -41,6 +41,7 @@ pub fn routes(state: SharedState) -> Router {
         .route("/api/commands/broadcast", post(broadcast))
         .route("/api/manifest", get(get_manifest).put(put_manifest))
         .route("/api/builds", get(list_builds).post(add_build))
+        .route("/api/enrollment", get(enrollment))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_admin,
@@ -477,6 +478,16 @@ async fn command_log(
     Query(q): Query<LogQuery>,
 ) -> ApiResult<Json<Vec<crate::db::CommandRow>>> {
     Ok(Json(state.db.commands(q.agent, q.limit.min(500))?))
+}
+
+/// The shared secret a new agent needs, so the dashboard can render a
+/// ready-to-paste enrolment command instead of making the operator go and
+/// read it off the portal's filesystem.
+async fn enrollment(State(state): State<SharedState>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(json!({
+        "token": state.enrollment_token,
+        "ws_path": "/api/agent/ws",
+    })))
 }
 
 // ---------------------------------------------------------------------------

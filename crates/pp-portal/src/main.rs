@@ -7,6 +7,7 @@
 mod api;
 mod db;
 mod hub;
+mod install;
 mod state;
 mod ui;
 mod ws;
@@ -59,6 +60,11 @@ struct Cli {
     )]
     no_admin_auth: bool,
 
+    /// Directory holding `pp-agent`, `pp-agent.exe` and the systemd unit, which
+    /// the portal serves so new machines can install themselves in one line.
+    #[arg(long, default_value = "/var/lib/patchpanel-portal/agents", env = "PATCHPANEL_AGENT_DIR")]
+    agent_dir: PathBuf,
+
     #[arg(long, default_value = "info")]
     log: String,
 }
@@ -100,6 +106,12 @@ async fn main() -> Result<()> {
         enrollment_token: enrollment_token.clone(),
         admin_token: admin_token.clone(),
         require_admin_auth,
+        agent_dir: cli.agent_dir.clone(),
+        public_host: if cli.bind.ip().is_unspecified() {
+            format!("{}:{}", hostname(), cli.bind.port())
+        } else {
+            cli.bind.to_string()
+        },
     });
     if !require_admin_auth {
         tracing::warn!("admin authentication is DISABLED; anyone who can reach this port controls the fleet");
@@ -114,6 +126,7 @@ async fn main() -> Result<()> {
         .route("/api/agent/ws", get(ws::handler))
         .with_state(state.clone())
         .merge(api::public_routes(state.clone()))
+        .merge(install::routes(state.clone()))
         .merge(api::routes(state.clone()))
         .merge(ui::routes())
         .layer(TraceLayer::new_for_http());
@@ -138,6 +151,15 @@ async fn main() -> Result<()> {
         .await
         .context("serving")?;
     Ok(())
+}
+
+/// Our own hostname, used only as a fallback in generated install scripts.
+fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_string())
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "localhost".into())
 }
 
 /// 256 bits of randomness, which is what `Uuid::new_v4` gives us twice over

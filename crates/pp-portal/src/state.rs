@@ -21,6 +21,11 @@ pub struct AppState {
     /// network you fully trust, because the API can install software on and
     /// reboot every enrolled machine.
     pub require_admin_auth: bool,
+    /// Directory holding the agent artefacts this portal will hand out.
+    pub agent_dir: std::path::PathBuf,
+    /// Fallback address used in generated install scripts when a client sends
+    /// no `Host:` header. Normally the request's own Host wins.
+    pub public_host: String,
 }
 
 pub type SharedState = Arc<AppState>;
