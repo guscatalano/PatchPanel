@@ -127,6 +127,20 @@ pub fn suggest_for(content: &str, distro: &str, codename: &str) -> Option<(Strin
         let original = fields.join(" ");
         let is_security = fields[ui].contains("security");
 
+        // Is this Debian's own archive, or a third party that merely publishes
+        // a Debian build? Components are the reliable signal: Debian's are
+        // main/contrib/non-free, while a vendor repo uses its own name. Rules
+        // that rewrite suites or hosts must only fire on the former - UniFi's
+        // repository genuinely calls its suite `stable`, and "correcting" that
+        // to a Debian codename breaks it.
+        let debian_archive = fields.len() > ui + 2
+            && fields[ui + 2..].iter().all(|c| {
+                matches!(
+                    c.as_str(),
+                    "main" | "contrib" | "non-free" | "non-free-firmware"
+                )
+            });
+
         // 1. A moving suite pins nothing; name the release actually installed.
         {
             let suite = fields[ui + 1].clone();
@@ -138,7 +152,7 @@ pub fn suggest_for(content: &str, distro: &str, codename: &str) -> Option<(Strin
                 .next()
                 .unwrap_or(&suite)
                 .to_string();
-            if MOVING.contains(&base.as_str()) {
+            if debian_archive && MOVING.contains(&base.as_str()) {
                 let want = if is_security {
                     format!("{codename}-security")
                 } else if suite.contains("-updates") {
@@ -199,13 +213,7 @@ pub fn suggest_for(content: &str, distro: &str, codename: &str) -> Option<(Strin
         // Debian build - MongoDB and UniFi both do - and repointing those at
         // archive.debian.org destroys them. A real Debian mirror is
         // identifiable by its components: main, contrib, non-free and friends.
-        let debian_components = fields[ui + 2..].iter().all(|c| {
-            matches!(
-                c.as_str(),
-                "main" | "contrib" | "non-free" | "non-free-firmware"
-            )
-        }) && fields.len() > ui + 2;
-        if eol && debian_components && !fields[ui + 1].contains('/') {
+        if eol && debian_archive && !fields[ui + 1].contains('/') {
             let host_ok = fields[ui].contains("archive.debian.org");
             if !host_ok {
                 let want = if is_security {
@@ -474,6 +482,18 @@ mod tests {
         assert_eq!(
             got,
             "deb http://archive.debian.org/debian bullseye main contrib"
+        );
+    }
+
+
+    #[test]
+    fn does_not_repin_a_vendors_own_stable_suite() {
+        // UniFi publishes under a suite it calls `stable`; rewriting that to a
+        // Debian codename would point at a distribution that does not exist.
+        let line = "deb https://www.ui.com/downloads/unifi/debian stable ubiquiti";
+        assert!(
+            suggest_for(line, "debian", "bullseye").is_none(),
+            "a vendor suite was rewritten"
         );
     }
 
