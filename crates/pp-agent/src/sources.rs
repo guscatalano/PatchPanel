@@ -193,7 +193,19 @@ pub fn suggest_for(content: &str, distro: &str, codename: &str) -> Option<(Strin
         }
 
         // 5. After end-of-life the packages move to the archive host.
-        if eol && (fields[ui].contains("deb.debian.org") || fields[ui].contains("/debian")) {
+        //
+        // Only Debian's own archive moves. Matching any URI containing
+        // "/debian" swept up third-party repositories that merely publish a
+        // Debian build - MongoDB and UniFi both do - and repointing those at
+        // archive.debian.org destroys them. A real Debian mirror is
+        // identifiable by its components: main, contrib, non-free and friends.
+        let debian_components = fields[ui + 2..].iter().all(|c| {
+            matches!(
+                c.as_str(),
+                "main" | "contrib" | "non-free" | "non-free-firmware"
+            )
+        }) && fields.len() > ui + 2;
+        if eol && debian_components && !fields[ui + 1].contains('/') {
             let host_ok = fields[ui].contains("archive.debian.org");
             if !host_ok {
                 let want = if is_security {
@@ -435,6 +447,34 @@ mod tests {
     fn moves_an_end_of_life_release_to_the_archive() {
         let got = fix("deb http://deb.debian.org/debian bullseye main", "bullseye");
         assert_eq!(got, "deb http://archive.debian.org/debian bullseye main");
+    }
+
+
+    #[test]
+    fn leaves_third_party_repos_off_the_debian_archive() {
+        // Both of these publish a Debian build but are not Debian mirrors.
+        // Repointing them at archive.debian.org would break them outright.
+        for line in [
+            "deb [ arch=amd64 signed-by=/etc/apt/keyrings/mongodb.gpg ]              https://repo.mongodb.org/apt/debian bullseye/mongodb-org/8.0 main",
+            "deb https://www.ui.com/downloads/unifi/debian bullseye ubiquiti",
+        ] {
+            let got = suggest_for(line, "debian", "bullseye")
+                .map(|(t, _)| t)
+                .unwrap_or_else(|| line.to_string());
+            assert!(
+                !got.contains("archive.debian.org"),
+                "third-party repo was rewritten: {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn still_moves_a_real_debian_mirror() {
+        let got = fix("deb http://mirrors.example.org/debian/ bullseye main contrib", "bullseye");
+        assert_eq!(
+            got,
+            "deb http://archive.debian.org/debian bullseye main contrib"
+        );
     }
 
     #[test]
