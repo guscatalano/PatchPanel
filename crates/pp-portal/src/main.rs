@@ -179,8 +179,16 @@ fn banner(
     revision: u64,
     known: usize,
 ) {
+    // These lines get copied onto *other* machines, so 127.0.0.1 would be
+    // actively wrong. Use our hostname, and omit the port when it is the
+    // default so the URL reads like one a person would type.
     let host = if bind.ip().is_unspecified() {
-        format!("127.0.0.1:{}", bind.port())
+        match bind.port() {
+            80 => hostname(),
+            p => format!("{}:{p}", hostname()),
+        }
+    } else if bind.port() == 80 {
+        bind.ip().to_string()
     } else {
         bind.to_string()
     };
