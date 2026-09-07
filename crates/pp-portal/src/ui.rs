@@ -445,9 +445,11 @@ async function loadAdd() {
   $("cmd-linux").textContent =
     `curl -fsSL http://${host}/install.sh | sh -s -- --token ${token} --site ${site}`;
 
+  // The path must be quoted: after `&` PowerShell parses in expression mode,
+  // where `$env:TEMP\pp.ps1` is a syntax error rather than a path.
   $("cmd-win").textContent =
-    `irm http://${host}/install.ps1 -OutFile $env:TEMP\pp.ps1; ` +
-    `& $env:TEMP\pp.ps1 -Token ${token} -Site ${site}`;
+    `irm http://${host}/install.ps1 -OutFile "$env:TEMP\pp.ps1"; ` +
+    `& "$env:TEMP\pp.ps1" -Token ${token} -Site ${site}`;
 
   // A bare IP works until DHCP moves the portal, and then every enrolled agent
   // is pointing at nothing. Say so once, here, rather than in a runbook.

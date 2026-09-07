@@ -161,6 +161,18 @@ param(
 $ErrorActionPreference = 'Stop'
 $Portal = '{host}'
 
+# Windows PowerShell 5.1 renders a progress bar for every chunk of
+# Invoke-WebRequest, which turns a 6 MB download into minutes. Silencing it is
+# the difference between this feeling instant and feeling broken.
+$ProgressPreference = 'SilentlyContinue'
+
+# 5.1 negotiates TLS 1.0 by default; harmless over plain HTTP, but it means
+# this still works if the portal is later put behind HTTPS.
+try {{
+  [Net.ServicePointManager]::SecurityProtocol =
+    [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}} catch {{ }}
+
 $principal = New-Object Security.Principal.WindowsPrincipal(
   [Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {{
