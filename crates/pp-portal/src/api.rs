@@ -389,11 +389,73 @@ async fn put_manifest(
     let stored = state.db.put_manifest(manifest)?;
     let pushed = state.hub.broadcast(&ServerMsg::Manifest(stored.clone()));
 
-    tracing::info!(revision = stored.revision, pushed, "manifest published");
+    // Agents are told to self-update when they connect, but an already
+    // connected fleet would then sit on the old version until something
+    // happened to drop its connection. Publishing a version is an instruction,
+    // so act on it now.
+    let upgrading = dispatch_self_updates(&state, &stored)?;
+
+    tracing::info!(
+        revision = stored.revision,
+        pushed,
+        upgrading,
+        "manifest published"
+    );
     Ok(Json(json!({
         "revision": stored.revision,
         "pushed_to": pushed,
+        "upgrading": upgrading,
     })))
+}
+
+/// Send `SelfUpdate` to every connected agent running a version other than the
+/// one the manifest asks for. Returns how many were dispatched.
+fn dispatch_self_updates(state: &SharedState, manifest: &Manifest) -> anyhow::Result<usize> {
+    if manifest.agent_version.is_none() {
+        return Ok(0);
+    }
+
+    let rows = state.db.agents()?;
+    let mut sent = 0;
+    for id in state.hub.connected() {
+        let Some(row) = rows.iter().find(|r| r.id == id) else {
+            continue;
+        };
+        // `build_for` keys on the OS/arch strings the agent reported, so
+        // reconstruct just enough of its SystemInfo to ask the same question.
+        let system = pp_proto::SystemInfo {
+            hostname: row.hostname.clone(),
+            os: match row.os.as_str() {
+                "linux" => pp_proto::OsKind::Linux,
+                "windows" => pp_proto::OsKind::Windows,
+                _ => pp_proto::OsKind::Other,
+            },
+            os_version: row.os_version.clone(),
+            arch: row.arch.clone(),
+            agent_version: row.agent_version.clone(),
+            backends: row.backends.clone(),
+            site: row.site.clone(),
+            hardware: Default::default(),
+            boot_time: None,
+        };
+
+        let Some(cmd) = crate::ws::self_update_command(state, manifest, &system) else {
+            continue;
+        };
+        let cmd_id = Uuid::new_v4();
+        state.db.record_command(cmd_id, id, &cmd)?;
+        if state.hub.send(
+            id,
+            ServerMsg::Command(CommandEnvelope {
+                id: cmd_id,
+                command: cmd,
+            }),
+        ) {
+            sent += 1;
+            tracing::info!(agent = %row.hostname, from = %row.agent_version, "dispatched self-update");
+        }
+    }
+    Ok(sent)
 }
 
 /// Catch the mistakes that would otherwise only show up as a red row on every

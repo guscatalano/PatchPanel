@@ -184,7 +184,7 @@ fn new_token() -> String {
 
 /// Build a `SelfUpdate` when the manifest names a version this agent is not
 /// running and a matching build has been published.
-fn self_update_command(
+pub fn self_update_command(
     state: &AppState,
     manifest: &pp_proto::Manifest,
     system: &SystemInfo,
