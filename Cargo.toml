@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["crates/pp-proto", "crates/pp-agent", "crates/pp-portal"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+pp-proto = { path = "crates/pp-proto" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+clap = { version = "4", features = ["derive", "env"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+# Deliberately NOT panic = "abort": the agent isolates panicking probe and
+# command tasks so one bad device or backend cannot take the host off the fleet.
+# Aborting would turn every such panic into a full outage for that machine.

@@ -1,0 +1,33 @@
+[Unit]
+Description=PatchPanel Agent
+Documentation=https://github.com/your-org/patchpanel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pp-agent --config /etc/patchpanel/agent.json run
+
+# Root is required: the agent drives apt/dnf and writes to /usr/local/bin
+# during self-update.
+User=root
+
+# Self-update works by replacing the binary and exiting; without this the host
+# would silently drop off the fleet after every agent upgrade.
+Restart=always
+RestartSec=5s
+
+# Give a long apt transaction room to finish rather than killing it mid-dpkg,
+# which is how you get a machine stuck needing `dpkg --configure -a`.
+TimeoutStopSec=300
+KillSignal=SIGTERM
+
+StateDirectory=patchpanel
+Environment=PATCHPANEL_STATE_DIR=/var/lib/patchpanel
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=patchpanel-agent
+
+[Install]
+WantedBy=multi-user.target

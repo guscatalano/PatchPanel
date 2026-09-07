@@ -1,0 +1,31 @@
+[package]
+name = "pp-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+csnmp = "0.6.0"
+futures-util.workspace = true
+gethostname = "1.1.0"
+hex = "0.4.3"
+ipnet = "2.12.2"
+os_info = "3.15.0"
+pp-proto.workspace = true
+regex = "1.13.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "stream", "charset", "http2", "system-proxy"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10.9"
+tokio.workspace = true
+tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-native-roots"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[target."cfg(windows)".dependencies]
+windows-service = "0.8.1"

@@ -1,0 +1,106 @@
+{
+  "revision": 0,
+
+  "_comment_apps": "Applications the fleet should be running. `ensure` is present (install once), latest (keep upgraded), or absent (remove). `os` restricts a spec to one platform; omit it for cross-platform packages.",
+  "apps": [
+    {
+      "name": "openssh-server",
+      "ensure": "latest",
+      "os": ["linux"],
+      "source": { "type": "apt", "package": "openssh-server" }
+    },
+    {
+      "name": "node-exporter",
+      "version": "1.8.2",
+      "ensure": "present",
+      "os": ["linux"],
+      "source": { "type": "dnf", "package": "golang-github-prometheus-node-exporter" }
+    },
+    {
+      "name": "7zip",
+      "ensure": "latest",
+      "os": ["windows"],
+      "source": { "type": "winget", "id": "7zip.7zip" }
+    },
+    {
+      "name": "legacy-toolbar",
+      "ensure": "absent",
+      "os": ["windows"],
+      "source": { "type": "winget", "id": "Vendor.LegacyToolbar" }
+    },
+    {
+      "_comment": "Escape hatch for anything without a package manager. The sha256 is mandatory and verified before the installer runs; {} is replaced with the downloaded file's path.",
+      "name": "in-house-collector",
+      "ensure": "present",
+      "os": ["linux"],
+      "source": {
+        "type": "url",
+        "url": "https://builds.example.com/collector-2.4.0.tar.gz",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "install_cmd": "tar -xzf {} -C /opt/collector --strip-components=1"
+      }
+    }
+  ],
+
+  "_comment_devices": "IoT and appliances that cannot host an agent. Each is probed by the collector whose `site` matches. Probes are read-only: PatchPanel reports firmware drift, it never pushes firmware.",
+  "devices": [
+    {
+      "id": "sw-floor1",
+      "label": "Floor 1 access switch",
+      "target": "10.20.0.2",
+      "site": "plant-a",
+      "expect_version": "15.2(7)E6",
+      "tags": ["network"],
+      "probe": {
+        "type": "snmp",
+        "community": "public",
+        "version_regex": "Version ([0-9][^,]*)"
+      }
+    },
+    {
+      "id": "plc-line3",
+      "label": "Line 3 PLC",
+      "target": "10.20.4.31",
+      "site": "plant-a",
+      "expect_version": "2.10.1",
+      "tags": ["ot", "critical"],
+      "probe": {
+        "type": "http",
+        "url": "https://10.20.4.31/api/system",
+        "insecure": true,
+        "version_json_pointer": "/firmware/version"
+      }
+    },
+    {
+      "id": "cam-dock",
+      "label": "Loading dock camera",
+      "target": "10.20.9.14",
+      "site": "plant-a",
+      "probe": { "type": "tcp", "port": 554, "read_banner": true }
+    }
+  ],
+
+  "_comment_discovery": "Optional sweeps that surface devices nobody declared. Capped at 1024 hosts per range.",
+  "discovery": [
+    {
+      "cidr": "10.20.0.0/24",
+      "ports": [80, 443, 22, 23, 502, 8080, 1883],
+      "site": "plant-a"
+    }
+  ],
+
+  "_comment_patch_policy": "auto_apply false means agents report pending updates but change nothing until someone dispatches ApplyPatches. exclude never gets touched, even by an explicit run.",
+  "patch_policy": {
+    "auto_apply": false,
+    "security_only": true,
+    "allow_reboot": false,
+    "exclude": ["linux-image-generic", "postgresql-16"]
+  },
+
+  "_comment_agent_version": "Set this to a version published under /api/builds and the portal rolls the fleet's agents to it. Omit to leave agent versions alone.",
+  "agent_version": null,
+
+  "heartbeat_secs": 30,
+  "inventory_secs": 3600,
+  "device_probe_secs": 300
+}

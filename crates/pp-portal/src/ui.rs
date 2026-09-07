@@ -1,0 +1,462 @@
+//! The dashboard, embedded in the binary.
+//!
+//! Compiling the UI in means the portal is still a single file to deploy, which
+//! matters more here than a build pipeline would: this is a thing people run on
+//! a box in a cupboard, not a service with a CDN in front of it.
+
+use axum::response::Html;
+use axum::routing::get;
+use axum::Router;
+
+pub fn routes() -> Router {
+    Router::new().route("/", get(|| async { Html(INDEX) }))
+}
+
+const INDEX: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PatchPanel</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --line: #dfe3e8;
+    --ink: #16191d;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --ok: #15803d;
+    --warn: #b45309;
+    --bad: #b91c1c;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115; --panel: #171a21; --line: #272b34;
+      --ink: #e6e8ec; --muted: #9aa3af; --accent: #60a5fa;
+      --ok: #4ade80; --warn: #fbbf24; --bad: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+    padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: -0.01em; }
+  header .rev { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+  nav { margin-left: auto; display: flex; gap: 4px; }
+  nav button {
+    background: none; border: 1px solid transparent; color: var(--muted);
+    padding: 5px 11px; border-radius: 6px; cursor: pointer; font: inherit;
+  }
+  nav button.active { color: var(--ink); border-color: var(--line); background: var(--bg); }
+  main { padding: 20px; max-width: 1400px; margin: 0 auto; }
+  section { display: none; }
+  section.active { display: block; }
+
+  .tiles { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin-bottom: 20px; }
+  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .tile .n { font-size: 26px; font-weight: 600; line-height: 1.1; font-variant-numeric: tabular-nums; }
+  .tile .l { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .tile.warn .n { color: var(--warn); }
+  .tile.bad .n { color: var(--bad); }
+
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin-bottom: 20px; }
+  .card > h2 { font-size: 13px; margin: 0; padding: 11px 14px; border-bottom: 1px solid var(--line); color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 14px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: var(--bg); }
+  td.mono, .mono { font-family: var(--mono); font-size: 12px; }
+
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; }
+  .dot.on { background: var(--ok); }
+  .dot.off { background: var(--muted); }
+  .dot.bad { background: var(--bad); }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 20px; font-size: 11px; border: 1px solid var(--line); color: var(--muted); }
+  .pill.bad { color: var(--bad); border-color: var(--bad); }
+  .pill.warn { color: var(--warn); border-color: var(--warn); }
+  .pill.ok { color: var(--ok); border-color: var(--ok); }
+
+  button.act {
+    font: inherit; font-size: 12px; padding: 3px 9px; margin-right: 4px;
+    background: var(--bg); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 6px; cursor: pointer;
+  }
+  button.act:hover { border-color: var(--accent); color: var(--accent); }
+  button.act:disabled { opacity: .4; cursor: default; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+  textarea {
+    width: 100%; min-height: 460px; padding: 12px 14px; border: none; resize: vertical;
+    background: var(--panel); color: var(--ink); font-family: var(--mono); font-size: 12.5px; line-height: 1.55;
+  }
+  textarea:focus { outline: none; }
+  .bar { display: flex; gap: 8px; align-items: center; padding: 10px 14px; border-top: 1px solid var(--line); }
+  .msg { font-size: 12px; color: var(--muted); }
+  .msg.bad { color: var(--bad); }
+  .msg.ok { color: var(--ok); }
+  .empty { padding: 28px 14px; text-align: center; color: var(--muted); font-size: 13px; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  pre { margin: 8px 0 0; padding: 10px; background: var(--bg); border-radius: 6px; font-family: var(--mono); font-size: 11.5px; white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto; }
+
+  #gate { max-width: 380px; margin: 80px auto; }
+  #gate input { width: 100%; padding: 9px 11px; margin: 10px 0; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); color: var(--ink); font-family: var(--mono); font-size: 13px; }
+</style>
+</head>
+<body>
+
+<div id="gate" class="card" hidden>
+  <h2>Admin token</h2>
+  <div style="padding:14px">
+    <p class="msg">The portal prints this on startup.</p>
+    <input id="token-input" type="password" placeholder="admin token" autocomplete="off">
+    <button class="act primary" onclick="saveToken()">Connect</button>
+    <span id="gate-msg" class="msg"></span>
+  </div>
+</div>
+
+<div id="app" hidden>
+  <header>
+    <h1>PatchPanel</h1>
+    <span class="rev" id="rev"></span>
+    <nav>
+      <button data-tab="fleet" class="active">Fleet</button>
+      <button data-tab="devices">Devices</button>
+      <button data-tab="manifest">Manifest</button>
+      <button data-tab="activity">Activity</button>
+    </nav>
+  </header>
+
+  <main>
+    <section id="fleet" class="active">
+      <div class="tiles" id="tiles"></div>
+      <div class="card">
+        <h2>Agents</h2>
+        <div class="scroll"><table>
+          <thead><tr>
+            <th>Host</th><th>OS</th><th>Site</th><th>Agent</th>
+            <th>Updates</th><th>Drift</th><th>Devices</th><th>Manifest</th><th>Last seen</th><th></th>
+          </tr></thead>
+          <tbody id="agents"></tbody>
+        </table></div>
+        <div class="empty" id="agents-empty" hidden>No agents have enrolled yet.</div>
+      </div>
+      <div class="card">
+        <h2>Fleet actions</h2>
+        <div class="bar">
+          <button class="act" onclick="broadcast('collect_inventory')">Collect inventory</button>
+          <button class="act" onclick="broadcast('apply_manifest')">Apply manifest</button>
+          <button class="act" onclick="broadcast('probe_devices')">Probe devices</button>
+          <button class="act" onclick="broadcast('discover')">Run discovery</button>
+          <span id="broadcast-msg" class="msg"></span>
+        </div>
+      </div>
+    </section>
+
+    <section id="devices">
+      <div class="card">
+        <h2>Devices</h2>
+        <div class="scroll"><table>
+          <thead><tr>
+            <th>Device</th><th>Target</th><th>Site</th><th>Status</th>
+            <th>Firmware</th><th>Expected</th><th>Latency</th><th>Collector</th><th>Checked</th>
+          </tr></thead>
+          <tbody id="device-rows"></tbody>
+        </table></div>
+        <div class="empty" id="devices-empty" hidden>
+          No devices declared. Add them under <code>devices</code> in the manifest.
+        </div>
+      </div>
+      <div class="card">
+        <h2>Seen on the network, not in the manifest</h2>
+        <div class="scroll"><table>
+          <thead><tr><th>Address</th><th>Open ports</th><th>Banner</th><th>Site</th><th>Found by</th></tr></thead>
+          <tbody id="unmanaged-rows"></tbody>
+        </table></div>
+        <div class="empty" id="unmanaged-empty" hidden>
+          Nothing unaccounted for. Add a <code>discovery</code> range to the manifest to sweep for devices.
+        </div>
+      </div>
+    </section>
+
+    <section id="manifest">
+      <div class="card">
+        <h2>Desired state</h2>
+        <textarea id="manifest-doc" spellcheck="false"></textarea>
+        <div class="bar">
+          <button class="act primary" onclick="saveManifest()">Publish</button>
+          <button class="act" onclick="loadManifest()">Reload</button>
+          <span id="manifest-msg" class="msg"></span>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Agent builds</h2>
+        <div class="scroll"><table>
+          <thead><tr><th>Version</th><th>OS</th><th>Arch</th><th>URL</th><th>sha256</th></tr></thead>
+          <tbody id="build-rows"></tbody>
+        </table></div>
+        <div class="empty" id="builds-empty" hidden>
+          No builds published. POST to <code>/api/builds</code>, then set
+          <code>agent_version</code> in the manifest to roll the fleet.
+        </div>
+      </div>
+    </section>
+
+    <section id="activity">
+      <div class="card">
+        <h2>Recent commands</h2>
+        <div id="commands"></div>
+        <div class="empty" id="commands-empty" hidden>Nothing has run yet.</div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let TOKEN = localStorage.getItem("pp_token") || "";
+let TAB = "fleet";
+let AGENTS = [];
+let REV = 0;
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: { "Authorization": "Bearer " + TOKEN, "Content-Type": "application/json", ...(opts.headers || {}) },
+  });
+  if (res.status === 401) { gate("That token was not accepted."); throw new Error("unauthorized"); }
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || res.statusText);
+  return body;
+}
+
+function gate(msg) {
+  $("app").hidden = true;
+  $("gate").hidden = false;
+  $("gate-msg").textContent = msg || "";
+  $("gate-msg").className = "msg bad";
+}
+
+function saveToken() {
+  TOKEN = $("token-input").value.trim();
+  localStorage.setItem("pp_token", TOKEN);
+  $("gate").hidden = true;
+  $("app").hidden = false;
+  refresh();
+}
+
+document.querySelectorAll("nav button").forEach((b) => {
+  b.onclick = () => {
+    TAB = b.dataset.tab;
+    document.querySelectorAll("nav button").forEach((x) => x.classList.toggle("active", x === b));
+    document.querySelectorAll("section").forEach((s) => s.classList.toggle("active", s.id === TAB));
+    refresh();
+  };
+});
+
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+function ago(iso) {
+  if (!iso) return "-";
+  const s = Math.max(0, (Date.now() - new Date(iso)) / 1000);
+  if (s < 60) return Math.round(s) + "s ago";
+  if (s < 3600) return Math.round(s / 60) + "m ago";
+  if (s < 86400) return Math.round(s / 3600) + "h ago";
+  return Math.round(s / 86400) + "d ago";
+}
+
+function tile(n, label, cls) {
+  return `<div class="tile ${n > 0 && cls ? cls : ""}"><div class="n">${n}</div><div class="l">${label}</div></div>`;
+}
+
+async function loadFleet() {
+  const d = await api("/api/fleet");
+  AGENTS = d.agents;
+  REV = d.manifest_revision;
+  $("rev").textContent = "manifest r" + d.manifest_revision;
+  const s = d.summary;
+  $("tiles").innerHTML =
+    tile(s.online, "online") +
+    tile(s.offline, "offline", "warn") +
+    tile(s.pending_security, "security updates", "bad") +
+    tile(s.pending_updates, "updates pending", "warn") +
+    tile(s.needs_reboot, "need reboot", "warn") +
+    tile(s.app_drift, "app drift", "warn") +
+    tile(s.stale_manifest, "stale manifest", "warn") +
+    tile(s.devices, "devices") +
+    tile(s.devices_unreachable, "devices down", "bad") +
+    tile(s.devices_drifted, "firmware drift", "warn");
+
+  $("agents-empty").hidden = d.agents.length > 0;
+  $("agents").innerHTML = d.agents.map((a) => {
+    const live = a.connected ? "on" : (a.online ? "on" : "off");
+    const upd = a.security_count > 0
+      ? `<span class="pill bad">${a.security_count} sec</span> ${a.update_count - a.security_count}`
+      : (a.update_count || "-");
+    const dev = a.device_count
+      ? `${a.device_count}${a.device_problem_count ? ` <span class="pill bad">${a.device_problem_count}</span>` : ""}`
+      : "-";
+    return `<tr>
+      <td><span class="dot ${live}"></span>${esc(a.hostname)}${a.reboot_required ? ' <span class="pill warn">reboot</span>' : ""}</td>
+      <td>${esc(a.os_version)} <span class="mono">${esc(a.arch)}</span></td>
+      <td>${esc(a.site) || "-"}</td>
+      <td class="mono">${esc(a.agent_version)}</td>
+      <td>${upd}</td>
+      <td>${a.drift_count ? `<span class="pill warn">${a.drift_count}</span>` : "-"}</td>
+      <td>${dev}</td>
+      <td class="mono">${a.applied_revision < REV ? `<span class="pill warn">r${a.applied_revision}</span>` : "r" + a.applied_revision}</td>
+      <td>${ago(a.last_seen)}</td>
+      <td style="text-align:right">
+        <button class="act" ${a.connected ? "" : "disabled"} onclick="cmd('${a.id}','collect_inventory')">Scan</button>
+        <button class="act" ${a.connected ? "" : "disabled"} onclick="cmd('${a.id}','apply_patches')">Patch</button>
+        <button class="act" ${a.connected ? "" : "disabled"} onclick="cmd('${a.id}','apply_manifest')">Converge</button>
+      </td>
+    </tr>`;
+  }).join("");
+}
+
+async function loadDevices() {
+  const d = await api("/api/devices");
+  $("devices-empty").hidden = d.devices.length > 0;
+  $("device-rows").innerHTML = d.devices.map((x) => {
+    let status = '<span class="pill ok">ok</span>';
+    if (!x.reachable) status = `<span class="pill bad">unreachable</span>`;
+    else if (x.drift) status = `<span class="pill warn">drift</span>`;
+    return `<tr>
+      <td>${esc(x.label || x.id)}<div class="mono" style="color:var(--muted)">${esc(x.id)}</div></td>
+      <td class="mono">${esc(x.target)}</td>
+      <td>${esc(x.site) || "-"}</td>
+      <td>${status}${x.error ? `<div class="mono" style="color:var(--muted)">${esc(x.error)}</div>` : ""}</td>
+      <td class="mono">${esc(x.firmware || "-")}</td>
+      <td class="mono">${esc(x.expect_version || "-")}</td>
+      <td>${x.latency_ms != null ? x.latency_ms + "ms" : "-"}</td>
+      <td>${esc(x.collector_host)}</td>
+      <td>${ago(x.checked_at)}</td>
+    </tr>`;
+  }).join("");
+
+  $("unmanaged-empty").hidden = d.unmanaged.length > 0;
+  $("unmanaged-rows").innerHTML = d.unmanaged.map((h) => `<tr>
+      <td class="mono">${esc(h.ip)}</td>
+      <td class="mono">${h.open_ports.join(", ")}</td>
+      <td class="mono">${esc(h.hint) || "-"}</td>
+      <td>${esc(h.site) || "-"}</td>
+      <td>${esc(h.collector_host)}</td>
+    </tr>`).join("");
+}
+
+async function loadManifest() {
+  const m = await api("/api/manifest");
+  $("manifest-doc").value = JSON.stringify(m, null, 2);
+  $("manifest-msg").textContent = "revision " + m.revision;
+  $("manifest-msg").className = "msg";
+
+  const builds = await api("/api/builds");
+  $("builds-empty").hidden = builds.length > 0;
+  $("build-rows").innerHTML = builds.map((b) => `<tr>
+      <td class="mono">${esc(b.version)}</td><td>${esc(b.os)}</td><td class="mono">${esc(b.arch)}</td>
+      <td class="mono">${esc(b.url)}</td><td class="mono">${esc(b.sha256.slice(0, 16))}…</td>
+    </tr>`).join("");
+}
+
+async function saveManifest() {
+  const msg = $("manifest-msg");
+  let doc;
+  try {
+    doc = JSON.parse($("manifest-doc").value);
+  } catch (e) {
+    msg.textContent = "Invalid JSON: " + e.message;
+    msg.className = "msg bad";
+    return;
+  }
+  try {
+    const r = await api("/api/manifest", { method: "PUT", body: JSON.stringify(doc) });
+    msg.textContent = `Published revision ${r.revision} to ${r.pushed_to} connected agent(s).`;
+    msg.className = "msg ok";
+    loadManifest();
+  } catch (e) {
+    msg.textContent = e.message;
+    msg.className = "msg bad";
+  }
+}
+
+async function loadActivity() {
+  const rows = await api("/api/commands?limit=40");
+  $("commands-empty").hidden = rows.length > 0;
+  const host = (id) => (AGENTS.find((a) => a.id === id) || {}).hostname || id.slice(0, 8);
+  $("commands").innerHTML = rows.map((c) => {
+    const state = c.ok === null || c.ok === undefined
+      ? '<span class="pill">running</span>'
+      : (c.ok ? '<span class="pill ok">ok</span>' : '<span class="pill bad">failed</span>');
+    const body = (c.detail || c.progress || "").trim();
+    return `<div style="padding:10px 14px;border-bottom:1px solid var(--line)">
+      <div>${state} <b>${esc(c.kind)}</b> on ${esc(host(c.agent_id))}
+        <span class="msg">· ${ago(c.created_at)}</span></div>
+      ${c.summary ? `<div class="mono" style="margin-top:4px">${esc(c.summary)}</div>` : ""}
+      ${body ? `<details><summary>output</summary><pre>${esc(body)}</pre></details>` : ""}
+    </div>`;
+  }).join("");
+}
+
+async function cmd(id, kind, extra = {}) {
+  try {
+    await api(`/api/agents/${id}/commands`, {
+      method: "POST",
+      body: JSON.stringify({ command: { kind, ...extra } }),
+    });
+    setTimeout(refresh, 400);
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function broadcast(kind) {
+  const msg = $("broadcast-msg");
+  try {
+    const r = await api("/api/commands/broadcast", {
+      method: "POST",
+      body: JSON.stringify({ command: { kind } }),
+    });
+    msg.textContent = `Sent to ${r.dispatched_to} agent(s).`;
+    msg.className = "msg ok";
+  } catch (e) {
+    msg.textContent = e.message;
+    msg.className = "msg bad";
+  }
+}
+
+async function refresh() {
+  try {
+    // The fleet call also populates the hostname lookup the activity tab uses.
+    await loadFleet();
+    if (TAB === "devices") await loadDevices();
+    if (TAB === "manifest" && !$("manifest-doc").value) await loadManifest();
+    if (TAB === "activity") await loadActivity();
+  } catch (e) {
+    if (e.message !== "unauthorized") console.error(e);
+  }
+}
+
+if (!TOKEN) {
+  gate();
+  $("gate-msg").className = "msg";
+} else {
+  $("app").hidden = false;
+  refresh();
+}
+// Polling covers both entry paths, and skips itself while the gate is up.
+setInterval(() => { if (!$("app").hidden) refresh(); }, 5000);
+</script>
+</body>
+</html>
+"##;
