@@ -429,6 +429,7 @@ fn system_info(platform: &Platform, site: &str, hardware: &pp_proto::Hardware) -
         backends: platform.backend_names(),
         site: site.to_string(),
         hardware: hardware.clone(),
+        boot_time: crate::hardware::boot_time(),
     }
 }
 

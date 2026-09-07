@@ -101,6 +101,11 @@ pub struct SystemInfo {
     /// send it still enrolls.
     #[serde(default)]
     pub hardware: Hardware,
+    /// When this machine last booted. Constant for the life of a connection —
+    /// a reboot necessarily means a reconnect — so it is reported here rather
+    /// than repeated on every heartbeat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_time: Option<DateTime<Utc>>,
 }
 
 // ---------------------------------------------------------------------------

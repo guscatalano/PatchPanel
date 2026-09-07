@@ -43,6 +43,9 @@ pub struct AgentRow {
     /// Static machine facts, absent for agents that predate the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hardware: Option<pp_proto::Hardware>,
+    /// When the machine last booted, as the agent reported it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_time: Option<DateTime<Utc>>,
     /// Counts derived from the latest inventory, so the fleet list does not
     /// have to ship every package to render.
     pub package_count: usize,
@@ -152,12 +155,15 @@ impl Db {
         // Added after the first release, so existing databases need it grafted
         // on. Checking with a SELECT is simpler than tracking schema versions
         // for a single nullable column.
-        if conn
-            .prepare("SELECT hardware FROM agents LIMIT 1")
-            .is_err()
-        {
-            conn.execute("ALTER TABLE agents ADD COLUMN hardware TEXT", [])?;
-            tracing::info!("added agents.hardware column");
+        for (col, ddl) in [
+            ("hardware", "ALTER TABLE agents ADD COLUMN hardware TEXT"),
+            ("boot_time", "ALTER TABLE agents ADD COLUMN boot_time TEXT"),
+        ] {
+            let probe = format!("SELECT {col} FROM agents LIMIT 1");
+            if conn.prepare(&probe).is_err() {
+                conn.execute(ddl, [])?;
+                tracing::info!(column = col, "added agents column");
+            }
         }
 
         // Seed the manifest so agents always receive a valid document.
@@ -194,8 +200,8 @@ impl Db {
             r#"
             INSERT INTO agents
                 (id, token, hostname, os, os_version, arch, agent_version, site,
-                 backends, first_seen, last_seen, hardware)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11)
+                 backends, first_seen, last_seen, hardware, boot_time)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12)
             ON CONFLICT(id) DO UPDATE SET
                 hostname      = excluded.hostname,
                 os            = excluded.os,
@@ -205,7 +211,8 @@ impl Db {
                 site          = excluded.site,
                 backends      = excluded.backends,
                 last_seen     = excluded.last_seen,
-                hardware      = excluded.hardware
+                hardware      = excluded.hardware,
+                boot_time     = excluded.boot_time
             "#,
             params![
                 id.to_string(),
@@ -219,6 +226,7 @@ impl Db {
                 serde_json::to_string(&sys.backends)?,
                 now,
                 serde_json::to_string(&sys.hardware)?,
+                sys.boot_time.map(|t| t.to_rfc3339()),
             ],
         )?;
         Ok(())
@@ -275,7 +283,7 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT id, hostname, os, os_version, arch, agent_version, site, backends,
                     applied_revision, reboot_required, first_seen, last_seen, inventory,
-                    hardware
+                    hardware, boot_time
              FROM agents ORDER BY hostname, id",
         )?;
         let cutoff = Utc::now() - Duration::seconds(OFFLINE_AFTER_SECS);
@@ -287,6 +295,7 @@ impl Db {
             let last_seen: String = r.get(11)?;
             let inventory: Option<String> = r.get(12)?;
             let hardware: Option<String> = r.get(13)?;
+            let boot_time: Option<String> = r.get(14)?;
 
             let last_seen = parse_time(&last_seen);
             let inv: Option<Inventory> =
@@ -319,6 +328,7 @@ impl Db {
                 last_seen,
                 online: last_seen > cutoff,
                 hardware: hardware.and_then(|t| serde_json::from_str(&t).ok()),
+                boot_time: boot_time.as_deref().map(parse_time),
                 package_count: packages,
                 update_count: updates,
                 security_count: security,

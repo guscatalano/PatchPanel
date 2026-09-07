@@ -179,7 +179,7 @@ async fn agent(
     Ok(Json(AgentDetail {
         connected: state.hub.is_connected(id),
         inventory: state.db.inventory(id)?,
-        commands: state.db.commands(Some(id), 25)?,
+        commands: state.db.commands(Some(id), 100)?,
         row,
     }))
 }

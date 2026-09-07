@@ -129,6 +129,17 @@ const INDEX: &str = r##"<!doctype html>
   }
   .note { padding: 10px 12px; border-radius: 8px; font-size: 12.5px; border: 1px solid var(--line); background: var(--bg); margin-bottom: 12px; }
 
+  .back { display: inline-block; margin-bottom: 14px; color: var(--accent); cursor: pointer; font-size: 13px; }
+  .back:hover { text-decoration: underline; }
+  .hdr { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  .hdr h2 { margin: 0; font-size: 20px; letter-spacing: -0.01em; }
+  .grid2 { display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); align-items: start; }
+  dl.kv { margin: 0; padding: 4px 0; }
+  dl.kv > div { display: flex; gap: 12px; padding: 7px 14px; border-bottom: 1px solid var(--line); }
+  dl.kv > div:last-child { border-bottom: none; }
+  dl.kv dt { flex: 0 0 130px; color: var(--muted); font-size: 12.5px; }
+  dl.kv dd { margin: 0; font-size: 13px; word-break: break-word; }
+
   #gate { max-width: 380px; margin: 80px auto; }
   #gate input { width: 100%; padding: 9px 11px; margin: 10px 0; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); color: var(--ink); font-family: var(--mono); font-size: 13px; }
 </style>
@@ -186,6 +197,10 @@ const INDEX: &str = r##"<!doctype html>
           <span id="broadcast-msg" class="msg"></span>
         </div>
       </div>
+    </section>
+
+    <section id="agent">
+      <div id="agent-body"></div>
     </section>
 
     <section id="devices">
@@ -298,7 +313,14 @@ let TOKEN = localStorage.getItem("pp_token") || "";
 // Read from the URL so a refresh, a bookmark, or a shared link all land on the
 // tab you were actually looking at.
 const TABS = ["fleet", "devices", "add", "manifest", "activity"];
-let TAB = TABS.includes(location.hash.slice(1)) ? location.hash.slice(1) : "fleet";
+// `#agent/<uuid>` opens one machine's page; anything else is a tab.
+function routeOf(hash) {
+  const h = (hash || "").replace(/^#/, "");
+  if (h.startsWith("agent/")) return { tab: "agent", id: h.slice(6) };
+  return { tab: TABS.includes(h) ? h : "fleet", id: null };
+}
+let ROUTE = routeOf(location.hash);
+let TAB = ROUTE.tab;
 let AGENTS = [];
 let REV = 0;
 let AUTH_REQUIRED = true;
@@ -336,24 +358,28 @@ document.addEventListener("input", (e) => {
   if (e.target && (e.target.id === "add-site" || e.target.id === "add-portal")) loadAdd();
 });
 
-function showTab(tab) {
-  TAB = TABS.includes(tab) ? tab : "fleet";
+function showTab(tab, id) {
+  ROUTE = { tab, id: id || null };
+  TAB = tab;
+  const want = id ? `agent/${id}` : tab;
+  // No nav button is highlighted on a detail page; it is not a tab.
   document.querySelectorAll("nav button").forEach((x) =>
-    x.classList.toggle("active", x.dataset.tab === TAB));
+    x.classList.toggle("active", x.dataset.tab === tab));
   document.querySelectorAll("section").forEach((s) =>
-    s.classList.toggle("active", s.id === TAB));
-  if (location.hash.slice(1) !== TAB) location.hash = TAB;
+    s.classList.toggle("active", s.id === tab));
+  if (location.hash.slice(1) !== want) location.hash = want;
   refresh();
 }
+
+function openAgent(id) { showTab("agent", id); }
 
 document.querySelectorAll("nav button").forEach((b) => {
   b.onclick = () => showTab(b.dataset.tab);
 });
 
-// Back/forward and manual hash edits should move tabs too.
 window.addEventListener("hashchange", () => {
-  const t = location.hash.slice(1);
-  if (TABS.includes(t) && t !== TAB) showTab(t);
+  const r = routeOf(location.hash);
+  if (r.tab !== ROUTE.tab || r.id !== ROUTE.id) showTab(r.tab, r.id);
 });
 
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -406,7 +432,7 @@ async function loadFleet() {
       ? `${esc(hw.ip_addresses[0])}${hw.ip_addresses.length > 1 ? `<div class="msg">+${hw.ip_addresses.length - 1} more</div>` : ""}`
       : "-";
     return `<tr title="${esc(hw.vendor || "")}">
-      <td><span class="dot ${live}"></span>${esc(a.hostname)}${a.reboot_required ? ' <span class="pill warn">reboot</span>' : ""}
+      <td><span class="dot ${live}"></span><a href="#agent/${a.id}" style="color:inherit">${esc(a.hostname)}</a>${a.reboot_required ? ' <span class="pill warn">reboot</span>' : ""}
           <div class="msg">agent ${esc(a.agent_version)}</div></td>
       <td class="mono">${ips}</td>
       <td>${esc(a.os_version)} <span class="mono">${esc(a.arch)}</span></td>
@@ -430,6 +456,150 @@ async function loadFleet() {
       </td>
     </tr>`;
   }).join("");
+}
+
+function since(iso) {
+  if (!iso) return "-";
+  const s = Math.max(0, (Date.now() - new Date(iso)) / 1000);
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  if (d) return `${d}d ${h}h`;
+  if (h) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
+function kv(rows) {
+  return `<dl class="kv">` + rows
+    .filter(([, v]) => v !== null && v !== undefined && v !== "")
+    .map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`)
+    .join("") + `</dl>`;
+}
+
+async function loadAgent(id) {
+  const body = $("agent-body");
+  if (!id) { body.innerHTML = `<div class="empty">No machine selected.</div>`; return; }
+
+  let d;
+  try {
+    d = await api(`/api/agents/${id}`);
+  } catch (e) {
+    body.innerHTML = `<div class="back" onclick="showTab('fleet')">&larr; Fleet</div>
+      <div class="card"><div class="empty">${esc(e.message)}</div></div>`;
+    return;
+  }
+
+  const hw = d.hardware || {};
+  const inv = d.inventory || {};
+  const updates = inv.updates || [];
+  const sec = updates.filter((u) => u.security);
+  const state = d.connected
+    ? '<span class="pill ok">connected</span>'
+    : (d.online ? '<span class="pill warn">recently seen</span>' : '<span class="pill bad">offline</span>');
+
+  // Patch history is the command log filtered to the actions that change the
+  // machine; a "rescan" is not an event anyone wants in a history.
+  const CHANGED = ["apply_patches", "apply_manifest", "self_update", "reboot"];
+  const history = (d.commands || []).filter((c) => CHANGED.includes(c.kind));
+
+  body.innerHTML = `
+    <div class="back" onclick="showTab('fleet')">&larr; Fleet</div>
+    <div class="hdr">
+      <h2>${esc(d.hostname)}</h2>${state}
+      ${d.reboot_required ? '<span class="pill warn">reboot required</span>' : ""}
+      <span class="msg">${esc(d.os_version)} &middot; ${esc(d.site) || "no site"}</span>
+    </div>
+
+    <div class="grid2">
+      <div class="card">
+        <h2>Hardware</h2>
+        ${kv([
+          ["CPU", esc(hw.cpu_model) || "-"],
+          ["Cores", hw.cpu_threads ? `${hw.cpu_cores || "?"} physical / ${hw.cpu_threads} logical` : "-"],
+          ["Memory", hw.memory_mb ? `${(hw.memory_mb / 1024).toFixed(1)} GB` : "-"],
+          ["Architecture", `<span class="mono">${esc(d.arch)}</span>`],
+          ["System", esc(hw.vendor)],
+          ["IP", (hw.ip_addresses || []).map((i) => `<span class="mono">${esc(i)}</span>`).join("<br>") || "-"],
+          ["Kernel", `<span class="mono">${esc(hw.kernel)}</span>`],
+        ])}
+      </div>
+
+      <div class="card">
+        <h2>State</h2>
+        ${kv([
+          ["Booted", d.boot_time ? `${since(d.boot_time)} ago <span class="msg">(${new Date(d.boot_time).toLocaleString()})</span>` : "-"],
+          ["Last seen", `${ago(d.last_seen)}`],
+          ["First enrolled", new Date(d.first_seen).toLocaleString()],
+          ["Agent version", `<span class="mono">${esc(d.agent_version)}</span>`],
+          ["Manifest", d.applied_revision < REV
+            ? `<span class="pill warn">r${d.applied_revision}</span> portal is at r${REV}`
+            : `r${d.applied_revision} <span class="msg">up to date</span>`],
+          ["Package backends", (d.backends || []).map((b) => `<span class="mono">${esc(b)}</span>`).join(", ")],
+          ["Agent id", `<span class="mono msg">${esc(d.id)}</span>`],
+        ])}
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Pending updates &mdash; ${updates.length}${sec.length ? `, ${sec.length} security` : ""}</h2>
+      ${updates.length ? `<div class="scroll"><table>
+        <thead><tr><th>Package</th><th>Installed</th><th>Available</th><th>Source</th></tr></thead>
+        <tbody>${updates.map((u) => `<tr>
+          <td>${esc(u.name)}${u.security ? ' <span class="pill bad">security</span>' : ""}</td>
+          <td class="mono">${esc(u.current_version) || "-"}</td>
+          <td class="mono">${esc(u.new_version)}</td>
+          <td class="mono">${esc(u.source)}</td></tr>`).join("")}</tbody>
+      </table></div>` : `<div class="empty">Nothing pending${inv.collected_at ? ` as of ${ago(inv.collected_at)}` : ""}.</div>`}
+      <div class="bar">
+        <button class="act" ${d.connected ? "" : "disabled"} onclick="cmd('${d.id}','collect_inventory')">Rescan</button>
+        <button class="act" ${d.connected ? "" : "disabled"} onclick="patchNow('${d.id}','${esc(d.hostname)}')">Install updates</button>
+        <button class="act" ${d.connected ? "" : "disabled"} onclick="cmd('${d.id}','apply_manifest')">Apply manifest</button>
+        <span class="msg">${inv.collected_at ? `inventory collected ${ago(inv.collected_at)}` : ""}</span>
+      </div>
+    </div>
+
+    ${(inv.drift || []).length ? `<div class="card"><h2>Application drift</h2>
+      <div class="scroll"><table><thead><tr><th>App</th><th>Wanted</th><th>Found</th></tr></thead>
+      <tbody>${inv.drift.map((x) => `<tr><td>${esc(x.app)}</td>
+        <td class="mono">${esc(x.desired)}</td><td class="mono">${esc(x.observed)}</td></tr>`).join("")}</tbody>
+      </table></div></div>` : ""}
+
+    <div class="card">
+      <h2>History &mdash; changes made to this machine</h2>
+      ${history.length ? history.map((c) => {
+        const st = c.ok === null || c.ok === undefined
+          ? '<span class="pill">running</span>'
+          : (c.ok ? '<span class="pill ok">ok</span>' : '<span class="pill bad">failed</span>');
+        const out = (c.detail || c.progress || "").trim();
+        return `<div style="padding:10px 14px;border-bottom:1px solid var(--line)">
+          <div>${st} <b>${esc(c.kind)}</b>
+            <span class="msg">&middot; ${new Date(c.created_at).toLocaleString()} &middot; ${ago(c.created_at)}</span></div>
+          ${c.summary ? `<div class="mono" style="margin-top:4px">${esc(c.summary)}</div>` : ""}
+          ${out ? `<details><summary>output</summary><pre>${esc(out)}</pre></details>` : ""}
+        </div>`;
+      }).join("") : `<div class="empty">Nothing has changed this machine yet.</div>`}
+    </div>
+
+    <div class="card">
+      <h2>Installed packages &mdash; ${(inv.packages || []).length}</h2>
+      <div class="step">
+        <input id="pkg-filter" placeholder="filter&hellip;" spellcheck="false"
+          style="width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink);font-family:var(--mono);font-size:12.5px">
+      </div>
+      <div class="scroll" style="max-height:380px;overflow-y:auto">
+        <table><tbody id="pkg-rows">${(inv.packages || []).map((p) =>
+          `<tr data-n="${esc((p.name || "").toLowerCase())}"><td>${esc(p.name)}</td>
+           <td class="mono">${esc(p.version)}</td><td class="mono msg">${esc(p.source)}</td></tr>`).join("")}</tbody></table>
+      </div>
+    </div>`;
+
+  const filter = $("pkg-filter");
+  if (filter) {
+    filter.oninput = () => {
+      const q = filter.value.toLowerCase();
+      document.querySelectorAll("#pkg-rows tr").forEach((tr) => {
+        tr.hidden = q && !tr.dataset.n.includes(q);
+      });
+    };
+  }
 }
 
 async function loadDevices() {
@@ -621,6 +791,7 @@ async function refresh() {
     }
     if (TAB === "manifest" && !$("manifest-doc").value) await loadManifest();
     if (TAB === "activity") await loadActivity();
+    if (TAB === "agent") await loadAgent(ROUTE.id);
   } catch (e) {
     if (e.message !== "unauthorized") console.error(e);
   }

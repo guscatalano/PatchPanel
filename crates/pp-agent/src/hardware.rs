@@ -7,6 +7,7 @@
 
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 
+use chrono::{DateTime, TimeZone, Utc};
 use pp_proto::Hardware;
 
 pub fn collect() -> Hardware {
@@ -26,6 +27,47 @@ pub fn collect() -> Hardware {
             .unwrap_or(0);
     }
     hw
+}
+
+/// When this machine last booted.
+pub fn boot_time() -> Option<DateTime<Utc>> {
+    #[cfg(target_os = "linux")]
+    {
+        // /proc/stat's btime is the boot instant as a unix timestamp, which is
+        // stable; deriving it from /proc/uptime drifts by however long we took
+        // to get here.
+        let text = std::fs::read_to_string("/proc/stat").ok()?;
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("btime ") {
+                let secs: i64 = v.trim().parse().ok()?;
+                return Utc.timestamp_opt(secs, 0).single();
+            }
+        }
+        None
+    }
+    #[cfg(windows)]
+    {
+        // GetTickCount64 wraps after 49 days on 32-bit; the CIM value is the
+        // one Windows itself reports, so use that.
+        let out = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')",
+            ])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        DateTime::parse_from_rfc3339(&text)
+            .ok()
+            .map(|d| d.with_timezone(&Utc))
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        None
+    }
 }
 
 /// The source address the kernel would pick for outbound traffic.
