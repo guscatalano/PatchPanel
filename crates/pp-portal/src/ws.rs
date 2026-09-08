@@ -293,6 +293,18 @@ async fn read_loop(
                     devices = inv.devices.len(),
                     "inventory received"
                 );
+                // Devices get a history of their own: the inventory only ever
+                // holds the latest reading, and a device's past is where "it
+                // has been unreachable since Tuesday" lives.
+                if let Ok(Some(row)) = state.db.agents().map(|rows| {
+                    rows.into_iter().find(|a| a.id == agent_id)
+                }) {
+                    for report in &inv.devices {
+                        if let Err(e) = state.db.record_probe(&row.hostname, report) {
+                            tracing::warn!(error = %e, device = %report.id, "recording probe failed");
+                        }
+                    }
+                }
                 state.db.store_inventory(agent_id, &inv)?;
             }
 

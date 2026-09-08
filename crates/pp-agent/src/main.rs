@@ -448,7 +448,10 @@ cpu:      {}", hw.cpu_model);
         println!("  {:<8} {:<50} {}{}", r.source, r.uri, r.suite, off);
     }
 
-    if let Some(rel) = release::collect(&repos) {
+    // A one-shot report, so ask the archive directly rather than reaching for
+    // a cache that only exists inside a running session.
+    let stable = release::stable_codename().await;
+    if let Some(rel) = release::collect(&repos, stable.as_deref()) {
         println!("
 release:  {} {} ({})", rel.distro, rel.version_id, rel.codename);
         if let Some(n) = &rel.next {
@@ -514,6 +517,7 @@ async fn probe_once(target: String, kind: String, arg: Option<String>) -> Result
     };
 
     let spec = DeviceSpec {
+        collector: String::new(),
         id: "adhoc".into(),
         label: String::new(),
         target,

@@ -74,6 +74,17 @@ struct Ctx {
     /// Last full snapshot, so a device-only or package-only refresh can still
     /// send the portal a complete picture.
     last: Arc<RwLock<Option<Inventory>>>,
+    /// Updates seen to survive a patch run, carried between scans because the
+    /// evidence only exists at the moment one finishes.
+    blocked: Arc<RwLock<Vec<String>>>,
+    /// What Debian currently calls stable. Fetched once and kept: it changes
+    /// every couple of years, and every scan asking the archive again would be
+    /// a network dependency for no benefit.
+    stable: Arc<RwLock<Option<String>>>,
+    /// Package URLs a patch run could not download. Sampling a repository
+    /// finds a pool that is entirely gone; only a real run finds the four
+    /// files out of a hundred that are missing, so keep what it learned.
+    unfetchable: Arc<RwLock<Vec<String>>>,
     tx: mpsc::UnboundedSender<Message>,
     progress_tx: mpsc::UnboundedSender<(Uuid, String)>,
     /// Signals that a new binary is in place and this process should exit.
@@ -256,6 +267,9 @@ async fn session(
         platform: platform.clone(),
         manifest: Arc::new(RwLock::new(Manifest::default())),
         last: Arc::new(RwLock::new(None)),
+        blocked: Arc::new(RwLock::new(Vec::new())),
+        stable: Arc::new(RwLock::new(None)),
+        unfetchable: Arc::new(RwLock::new(Vec::new())),
         tx: tx.clone(),
         progress_tx,
         restart_tx,
@@ -529,6 +543,13 @@ fn start_schedules(ctx: Ctx, schedules: &mut JoinSet<()>) {
     {
         let ctx = ctx.clone();
         schedules.spawn(async move {
+            // Probe shortly after connecting rather than waiting out a whole
+            // cycle. An agent that has just restarted has no device results to
+            // report, and until it probes, the portal has nothing to show for
+            // this collector - which is a long blank gap after every deploy.
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            refresh_devices(&ctx, &[]).await;
+
             loop {
                 let secs = ctx.manifest.read().await.device_probe_secs.max(30);
                 tokio::time::sleep(Duration::from_secs(secs)).await;
@@ -559,6 +580,16 @@ fn system_info(platform: &Platform, site: &str, hardware: &pp_proto::Hardware) -
 /// Rescan packages and updates, keeping the most recent device results, then
 /// report a complete snapshot.
 async fn refresh_packages(ctx: &Ctx) {
+    refresh_packages_after(ctx, None).await;
+}
+
+/// Re-scan, and if a patch run just finished, work out what it failed to move.
+///
+/// `attempted` is what was pending when the run started. Anything still on
+/// offer at the same version afterwards was not installed, whatever the exit
+/// code said - that is the only reliable way to name a package the tooling
+/// refused, and without a name the operator can only keep pressing the button.
+async fn refresh_packages_after(ctx: &Ctx, attempted: Option<Vec<(String, String)>>) {
     let p = Progress::detached();
     let packages = ctx
         .platform
@@ -579,8 +610,44 @@ async fn refresh_packages(ctx: &Ctx) {
             }],
         )
     });
-    let repositories = crate::repos::collect();
-    let release = crate::release::collect(&repositories);
+    let mut repositories = crate::repos::collect();
+    // Ask whether each one can still serve what it advertises. This is the
+    // difference between "apt failed with a wall of 404s" and knowing which
+    // line in which file to fix.
+    for (label, problem) in ctx.platform.repo_problems(&repositories, &p).await {
+        for r in repositories.iter_mut() {
+            if label == format!("{} {}", r.uri, r.suite) {
+                r.problem = Some(problem.clone());
+            }
+        }
+    }
+    // What the last patch run actually failed to download beats any sample.
+    {
+        let failed = ctx.unfetchable.read().await;
+        for r in repositories.iter_mut() {
+            let base = r.uri.trim_end_matches('/');
+            let mine: Vec<&String> = failed.iter().filter(|u| u.starts_with(base)).collect();
+            if mine.is_empty() {
+                continue;
+            }
+            let examples: Vec<String> = mine
+                .iter()
+                .take(3)
+                .map(|u| u.rsplit('/').next().unwrap_or(u).to_string())
+                .collect();
+            r.problem = Some(format!(
+                "the last patch run could not download {} package(s) from here - the index \
+                 lists them but the server returns 404: {}{}. A release being retired empties \
+                 its pool while the indices linger; the packages are on archive.debian.org, \
+                 or gone. Until this is resolved every patch run on this machine fails after \
+                 downloading everything else.",
+                mine.len(),
+                examples.join(", "),
+                if mine.len() > 3 { ", ..." } else { "" }
+            ));
+        }
+    }
+    let release = crate::release::collect(&repositories, stable_codename(ctx).await.as_deref());
     let cleanup = Some(ctx.platform.cleanup_preview(&p).await);
     scan_issues.extend(ctx.platform.scan_issues());
     // These overlap by definition: anything a full upgrade refuses was also
@@ -595,12 +662,68 @@ async fn refresh_packages(ctx: &Ctx) {
         .into_iter()
         .filter(|pkg| !deferred.contains(pkg))
         .collect();
-    let source_files = crate::sources::read_all();
+    // Packages the archive is withholding, or that need a full upgrade, are
+    // already accounted for and are not evidence of anything being blocked.
+    let excused = |name: &String| deferred.contains(name) || held_back.contains(name);
+    {
+        let mut blocked = ctx.blocked.write().await;
+        if let Some(before) = attempted {
+            *blocked = updates
+                .iter()
+                .filter(|u| !excused(&u.name))
+                .filter(|u| {
+                    before
+                        .iter()
+                        .any(|(n, v)| *n == u.name && *v == u.new_version)
+                })
+                .map(|u| u.name.clone())
+                .collect();
+            if !blocked.is_empty() {
+                tracing::warn!(
+                    packages = ?*blocked,
+                    "these updates survived a patch run untouched"
+                );
+            }
+        } else {
+            // Keep the finding until the package moves or stops being offered.
+            blocked.retain(|n| updates.iter().any(|u| u.name == *n) && !excused(n));
+        }
+    }
+    let blocked = ctx.blocked.read().await.clone();
+    let source_files = crate::sources::read_all().await;
     if !scan_issues.is_empty() {
         tracing::warn!(
             count = scan_issues.len(),
             "some backends could not be scanned; the update count is a floor, not a total"
         );
+    }
+    let mid_upgrade = ctx.platform.mid_upgrade(&p).await;
+    let (firmware, firmware_devices, firmware_issue) = ctx.platform.firmware(&p).await;
+    // fwupd being installed but unable to answer means firmware is not being
+    // checked at all, which belongs with the other coverage gaps.
+    scan_issues.extend(firmware_issue);
+    let boot = ctx.platform.boot_report(&p).await;
+    let virt = ctx.platform.virtualization(&p).await;
+
+    // A physical machine with no fwupd has firmware nobody is looking at, and
+    // nothing else would ever mention it. Virtual machines are exempt: there
+    // is no firmware inside a VM to update, and saying so on every guest would
+    // be noise on most of a fleet.
+    let is_guest = virt
+        .as_ref()
+        .is_some_and(|v| v.role.contains("guest") && !v.role.contains("host"));
+    if cfg!(target_os = "linux")
+        && !is_guest
+        && !ctx.platform.backend_names().iter().any(|b| b == "fwupd")
+    {
+        scan_issues.push(pp_proto::ScanIssue {
+            backend: "fwupd".into(),
+            problem: "firmware is not being checked: fwupd is not installed".into(),
+            remedy: "This machine has real hardware - system firmware, drives, controllers - \
+                     and none of it is being looked at. Installing fwupd makes it visible; \
+                     PatchPanel never flashes anything without being asked."
+                .into(),
+        });
     }
     let drift = compute_drift(ctx, &p).await;
     let reboot_required = ctx.platform.reboot_required().await;
@@ -625,6 +748,12 @@ async fn refresh_packages(ctx: &Ctx) {
         scan_issues,
         held_back,
         deferred,
+        blocked,
+        mid_upgrade,
+        firmware,
+        firmware_devices,
+        boot,
+        virt,
         source_files,
     };
     *last = Some(inv.clone());
@@ -639,14 +768,111 @@ async fn refresh_packages(ctx: &Ctx) {
     ctx.send(ClientMsg::Inventory(inv));
 }
 
+/// Put the manifest's apt source files in place on this machine.
+///
+/// Runs before the app reconciliation for a reason: an app cannot be installed
+/// from a repository that does not resolve, so fixing the sources first is
+/// what makes the rest of the run mean anything.
+///
+/// Each file goes through the same validated write a hand edit does - apt has
+/// to accept the result or the previous file comes back - so a policy that is
+/// wrong for one machine cannot leave it unable to install anything.
+async fn apply_source_policies(ctx: &Ctx, p: &Progress) -> Vec<String> {
+    if !cfg!(target_os = "linux") {
+        return Vec::new();
+    }
+    let (distro, codename) = crate::sources::running_release();
+    if distro.is_empty() {
+        return Vec::new();
+    }
+
+    let policies: Vec<pp_proto::SourcePolicy> = ctx
+        .manifest
+        .read()
+        .await
+        .sources_for(&distro, &codename)
+        .cloned()
+        .collect();
+    if policies.is_empty() {
+        return Vec::new();
+    }
+
+    let mut log = Vec::new();
+    for policy in policies {
+        // Writing a file that already says the right thing would run
+        // `apt-get update` on every machine on every manifest apply.
+        if std::fs::read_to_string(&policy.path).is_ok_and(|c| c.trim() == policy.content.trim()) {
+            continue;
+        }
+        p.line(&format!("applying source policy to {}", policy.path));
+        match crate::sources::write(&policy.path, &policy.content, p).await {
+            Ok(msg) => log.push(format!("{}: {msg}", policy.path)),
+            Err(e) => log.push(format!("{}: NOT applied - {e:#}", policy.path)),
+        }
+    }
+    log
+}
+
+/// The package URLs in an apt log that came back 404 or otherwise refused.
+///
+/// apt writes `E: Failed to fetch http://host/pool/... 404 Not Found`.
+fn unfetchable_in(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|l| l.contains("Failed to fetch"))
+        .filter_map(|l| l.split_whitespace().find(|w| w.starts_with("http")))
+        .map(|u| {
+            // apt percent-encodes the version separators; the repository
+            // prefix is all we match on, so leave the rest alone.
+            u.to_string()
+        })
+        .collect()
+}
+
+/// The current Debian stable codename, fetched at most once per process.
+async fn stable_codename(ctx: &Ctx) -> Option<String> {
+    if let Some(v) = ctx.stable.read().await.clone() {
+        return Some(v);
+    }
+    let found = crate::release::stable_codename().await;
+    if let Some(v) = found.clone() {
+        *ctx.stable.write().await = Some(v);
+    }
+    found
+}
+
+/// The host part of the portal's address, which is how an agent recognises
+/// that it is the machine running the portal.
+async fn portal_hostname(ctx: &Ctx) -> String {
+    // The manifest's portal_url wins when set, since that is the address the
+    // fleet was told to move to; otherwise the one this agent dialled.
+    let from_manifest = ctx.manifest.read().await.portal_url.clone();
+    let url = from_manifest.unwrap_or_else(|| ctx.cfg.portal_url.clone());
+
+    // ws://host:8080/api/agent/ws, http://host/, or a bare host.
+    let after_scheme = url.rsplit("://").next().unwrap_or(&url);
+    after_scheme
+        .split('/')
+        .next()
+        .unwrap_or(after_scheme)
+        .split(':')
+        .next()
+        .unwrap_or(after_scheme)
+        .to_string()
+}
+
 /// Re-probe assigned devices, keeping the most recent package results.
 /// `only` narrows to specific device ids.
 async fn refresh_devices(ctx: &Ctx, only: &[String]) -> usize {
     let (specs, scans) = {
         let m = ctx.manifest.read().await;
         let site = ctx.cfg.site.as_str();
+        let me = gethostname::gethostname().to_string_lossy().into_owned();
+        // A device with no collector named falls to whichever agent is running
+        // on the portal itself. Every agent knows the portal's address and
+        // only one of them is it, so they agree without talking to each other.
+        let portal_host = portal_hostname(ctx).await;
         (
-            m.devices_for(site)
+            m.devices_for(site, &me, &portal_host)
                 .filter(|d| only.is_empty() || only.contains(&d.id))
                 .cloned()
                 .collect::<Vec<_>>(),
@@ -683,6 +909,12 @@ async fn refresh_devices(ctx: &Ctx, only: &[String]) -> usize {
         scan_issues: Vec::new(),
         held_back: Vec::new(),
         deferred: Vec::new(),
+        blocked: Vec::new(),
+        mid_upgrade: None,
+        firmware: Vec::new(),
+        firmware_devices: Vec::new(),
+        boot: None,
+        virt: None,
         source_files: Vec::new(),
     });
 
@@ -811,7 +1043,13 @@ async fn execute(cmd: Command, ctx: &Ctx, p: &Progress) -> Result<String> {
         }
 
         Command::ApplyManifest => {
+            let sources = apply_source_policies(ctx, p).await;
             let summary = reconcile_apps(ctx, p).await?;
+            let summary = if sources.is_empty() {
+                summary
+            } else {
+                format!("{}\n{}", sources.join("\n"), summary)
+            };
             let revision = ctx.manifest.read().await.revision;
             {
                 let mut s = ctx.state.lock().await;
@@ -828,12 +1066,55 @@ async fn execute(cmd: Command, ctx: &Ctx, p: &Progress) -> Result<String> {
             full,
         } => {
             let policy = ctx.manifest.read().await.patch_policy.clone();
-            let log = ctx
+
+            // Only a run that was asked to install everything proves anything
+            // about what is left. A security-only or narrowed run leaves other
+            // updates pending on purpose.
+            let attempted: Option<Vec<(String, String)>> = if only.is_empty() && !security_only {
+                Some(
+                    ctx.last
+                        .read()
+                        .await
+                        .as_ref()
+                        .map(|i| {
+                            i.updates
+                                .iter()
+                                .filter(|u| !policy.exclude.contains(&u.name))
+                                .map(|u| (u.name.clone(), u.new_version.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                )
+            } else {
+                None
+            };
+
+            let result = ctx
                 .platform
                 .apply_patches(security_only, &only, &policy.exclude, full, p)
-                .await?;
-            refresh_packages(ctx).await;
-            Ok(log)
+                .await;
+
+            // apt names every file it could not fetch. Those names are the
+            // only reliable way to tell which repository has stopped serving
+            // what it advertises, so keep them before the error goes back up.
+            let failed = match &result {
+                Ok(log) => unfetchable_in(log),
+                Err(e) => unfetchable_in(&format!("{e:#}")),
+            };
+            {
+                let mut store = ctx.unfetchable.write().await;
+                if !failed.is_empty() {
+                    *store = failed;
+                } else if result.is_ok() {
+                    // A clean run means whatever was missing is not any more.
+                    store.clear();
+                }
+            }
+
+            // Refresh either way: a failed run still changed the machine, and
+            // the scan is where the repository gets flagged.
+            refresh_packages_after(ctx, attempted).await;
+            result
         }
 
         Command::SelfUpdate {
@@ -870,6 +1151,29 @@ async fn execute(cmd: Command, ctx: &Ctx, p: &Progress) -> Result<String> {
 
         Command::InstallPrerequisites => {
             let log = ctx.platform.install_prerequisites(p).await?;
+            refresh_packages(ctx).await;
+            Ok(log)
+        }
+
+        Command::DistroUpgrade { to, check } => {
+            let log = ctx.platform.distro_upgrade(&to, check, p).await?;
+            // An upgrade rewrites the sources and moves every package, so the
+            // inventory the portal holds is stale the moment it finishes.
+            refresh_packages(ctx).await;
+            Ok(log)
+        }
+
+        Command::UpdateFirmware { only } => {
+            let log = ctx.platform.update_firmware(&only, p).await?;
+            refresh_packages(ctx).await;
+            Ok(log)
+        }
+
+        Command::FinishUpgrade { grub_device } => {
+            let log = ctx
+                .platform
+                .finish_upgrade(grub_device.as_deref(), p)
+                .await?;
             refresh_packages(ctx).await;
             Ok(log)
         }

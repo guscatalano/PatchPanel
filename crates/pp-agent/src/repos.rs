@@ -41,7 +41,20 @@ fn apt_sources() -> Vec<Repository> {
         files.push(list.to_path_buf());
     }
     if let Ok(dir) = std::fs::read_dir("/etc/apt/sources.list.d") {
-        files.extend(dir.filter_map(|e| e.ok()).map(|e| e.path()));
+        // apt reads only `.list` and `.sources` here. Everything else in the
+        // directory - our own `.patchpanel-bak` and `.pre-<release>` copies
+        // included - is inert, and reporting it as a configured repository
+        // invents problems that do not exist.
+        files.extend(
+            dir.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    matches!(
+                        p.extension().and_then(|e| e.to_str()),
+                        Some("list") | Some("sources")
+                    )
+                }),
+        );
     }
 
     for path in files {
@@ -91,6 +104,7 @@ fn parse_one_line(text: &str, file: &str) -> Vec<Repository> {
         }
 
         out.push(Repository {
+            problem: None,
             source: if kind == "deb-src" { "apt-src".into() } else { "apt".into() },
             uri: first,
             suite: fields.next().unwrap_or_default().to_string(),
@@ -141,6 +155,7 @@ fn parse_deb822(text: &str, file: &str) -> Vec<Repository> {
         for uri in uris.split_whitespace() {
             for suite in suites.split_whitespace() {
                 out.push(Repository {
+            problem: None,
                     source: if is_src { "apt-src".into() } else { "apt".into() },
                     uri: uri.to_string(),
                     suite: suite.to_string(),
@@ -171,6 +186,7 @@ fn dnf_repos() -> Vec<Repository> {
         let flush = |out: &mut Vec<Repository>, id: &str, url: &str, enabled: bool, file: &str| {
             if !id.is_empty() {
                 out.push(Repository {
+            problem: None,
                     source: "dnf".into(),
                     uri: if url.is_empty() { id.to_string() } else { url.to_string() },
                     suite: id.to_string(),
@@ -238,6 +254,7 @@ fn windows() -> Vec<Repository> {
             continue;
         };
         repos.push(Repository {
+            problem: None,
             source: "winget".into(),
             uri: url.to_string(),
             suite: name.to_string(),

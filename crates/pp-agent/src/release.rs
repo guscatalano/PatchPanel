@@ -24,7 +24,60 @@ const DEBIAN_ORDER: &[(&str, &str)] = &[
 /// underneath it and an ordinary `apt upgrade` becomes a release jump.
 const MOVING_SUITES: &[&str] = &["stable", "testing", "unstable", "oldstable", "sid"];
 
-pub fn collect(repos: &[Repository]) -> Option<ReleaseInfo> {
+/// The codename Debian currently calls `stable`, straight from the archive.
+///
+/// Without this the release order below is just a list of names, and the one
+/// after the newest release is whatever is in testing. Offering that as "the
+/// next release" moves a server onto an unreleased distribution - which is
+/// exactly what happened to one of these machines. Ask the archive instead of
+/// hard-coding an answer that goes stale every two years.
+pub async fn stable_codename() -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .ok()?;
+    let text = client
+        .get("https://deb.debian.org/debian/dists/stable/Release")
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("Codename:"))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Is `codename` the same release as `other`, or an older one?
+///
+/// Used to refuse an upgrade to something newer than stable. An unknown
+/// codename answers `false`: a name we do not recognise is not one we should
+/// be moving a machine onto.
+pub fn at_or_before(codename: &str, other: &str) -> bool {
+    match (position(codename), position(other)) {
+        (Some(a), Some(b)) => a <= b,
+        _ => false,
+    }
+}
+
+/// Where a codename sits in the release order, if we know it at all.
+fn position(codename: &str) -> Option<usize> {
+    DEBIAN_ORDER.iter().position(|(n, _)| *n == codename)
+}
+
+/// Has this release actually been released?
+///
+/// Unknown stable means unknown answer, and the callers treat that as "do not
+/// offer an upgrade" rather than guessing.
+fn is_released(codename: &str, stable: Option<&str>) -> Option<bool> {
+    let want = position(codename)?;
+    let now = position(stable?)?;
+    Some(want <= now)
+}
+
+pub fn collect(repos: &[Repository], stable: Option<&str>) -> Option<ReleaseInfo> {
     if !cfg!(target_os = "linux") {
         return None;
     }
@@ -44,16 +97,75 @@ pub fn collect(repos: &[Repository]) -> Option<ReleaseInfo> {
     };
     let version_id = field("VERSION_ID");
 
-    let next = next_release(&distro, &codename);
-    let findings = audit(&distro, &codename, next.as_deref(), repos);
+    let mut findings = Vec::new();
+
+    // A machine on a codename newer than stable is running testing, whatever
+    // it was upgraded from. Say so: it is a different support model, and
+    // /etc/os-release stops carrying a version number.
+    if distro == "debian" && is_released(&codename, stable) == Some(false) {
+        findings.push(ReleaseFinding {
+            severity: Severity::Warning,
+            summary: format!("running Debian testing ({codename})"),
+            detail: format!(
+                "{} is the current stable release; {codename} is still testing. Testing has \
+                 no security team of its own and no version number, which is why this machine \
+                 reports no release version.",
+                stable.unwrap_or("the current release")
+            ),
+        });
+    }
+
+    // Only offer a hop to something that exists as a release.
+    let next = match next_release(&distro, &codename) {
+        Some(n) => match is_released(&n, stable) {
+            Some(true) => Some(n),
+            Some(false) => {
+                findings.push(ReleaseFinding {
+                    severity: Severity::Warning,
+                    summary: format!("{codename} is the newest released Debian"),
+                    detail: format!(
+                        "The next codename in the sequence is {n}, but it is still testing. \
+                         There is nothing to upgrade to yet."
+                    ),
+                });
+                None
+            }
+            // The archive could not be reached, so we cannot tell a release
+            // from testing. Offering the upgrade anyway is how a machine ends
+            // up on an unreleased distribution.
+            None => None,
+        },
+        None => None,
+    };
+
+    findings.extend(audit(&distro, &codename, next.as_deref(), stable, repos));
+
+    let next_version = next
+        .as_deref()
+        .and_then(|n| DEBIAN_ORDER.iter().find(|(c, _)| *c == n))
+        .map(|(_, v)| v.to_string());
 
     Some(ReleaseInfo {
         distro,
         codename,
         version_id,
         next,
+        next_version,
+        stable: stable.map(str::to_string),
         findings,
     })
+}
+
+/// Is this release far enough behind that Debian has stopped securing it?
+///
+/// stable and oldstable get security updates; anything older does not. Derived
+/// from what the archive says stable is, so it stays true without being
+/// edited every two years.
+fn retired_release(codename: &str, stable: Option<&str>) -> bool {
+    match (position(codename), stable.and_then(position)) {
+        (Some(mine), Some(now)) => now.saturating_sub(mine) >= 2,
+        _ => false,
+    }
 }
 
 fn next_release(distro: &str, codename: &str) -> Option<String> {
@@ -62,8 +174,7 @@ fn next_release(distro: &str, codename: &str) -> Option<String> {
         // do-release-upgrade, which has its own rules; do not guess.
         return None;
     }
-    let i = DEBIAN_ORDER.iter().position(|(n, _)| *n == codename)?;
-    DEBIAN_ORDER.get(i + 1).map(|(n, _)| n.to_string())
+    DEBIAN_ORDER.get(position(codename)? + 1).map(|(n, _)| n.to_string())
 }
 
 /// Everything that would make an upgrade — or even an ordinary `apt upgrade` —
@@ -72,6 +183,7 @@ fn audit(
     distro: &str,
     codename: &str,
     next: Option<&str>,
+    stable: Option<&str>,
     repos: &[Repository],
 ) -> Vec<ReleaseFinding> {
     let mut out = Vec::new();
@@ -134,17 +246,30 @@ fn audit(
         });
     }
 
-    // 3. Security updates switched off is worth saying loudly on its own.
+    // 3. Security updates switched off is worth saying loudly on its own -
+    //    unless the release is old enough that Debian has stopped publishing
+    //    them, in which case there is no line to add and calling it a blocker
+    //    only stands in the way of the upgrade that actually fixes it.
     let has_security = apt
         .iter()
         .any(|r| r.uri.contains("security") || r.suite.contains("security"));
     if !has_security && distro == "debian" {
+        let retired = retired_release(codename, stable);
         out.push(ReleaseFinding {
-            severity: Severity::Blocker,
+            severity: if retired { Severity::Warning } else { Severity::Blocker },
             summary: "no enabled security source".into(),
-            detail: "This machine receives no security updates. Add the security suite for \
-                     its release before doing anything else."
-                .into(),
+            detail: if retired {
+                format!(
+                    "This machine receives no security updates, and there is no source to \
+                     add: Debian stopped publishing security updates for {codename} and the \
+                     files have gone from security.debian.org. Upgrading{} is the fix.",
+                    next.map(|n| format!(" to {n}")).unwrap_or_default()
+                )
+            } else {
+                "This machine receives no security updates. Add the security suite for \
+                 its release before doing anything else."
+                    .to_string()
+            },
         });
     }
 

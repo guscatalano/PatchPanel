@@ -16,9 +16,14 @@ const APT_DIR: &str = "/etc/apt";
 
 /// Read every apt source file, so the portal can show and edit the real text
 /// rather than a parsed approximation of it.
-fn make(path: String, content: String) -> SourceFile {
+async fn make(path: String, content: String) -> SourceFile {
     let (suggested, notes) = match suggest(&content) {
-        Some((text, notes)) if text.trim() != content.trim() => (Some(text), notes),
+        Some((text, mut notes)) if !same_text(&text, &content) => {
+            match verify(&content, &text, &mut notes).await {
+                Some(checked) => (Some(checked), notes),
+                None => (None, Vec::new()),
+            }
+        }
         _ => (None, Vec::new()),
     };
     SourceFile {
@@ -29,12 +34,12 @@ fn make(path: String, content: String) -> SourceFile {
     }
 }
 
-pub fn read_all() -> Vec<SourceFile> {
+pub async fn read_all() -> Vec<SourceFile> {
     let mut out = Vec::new();
 
     let main = format!("{APT_DIR}/sources.list");
     if let Ok(content) = std::fs::read_to_string(&main) {
-        out.push(make(main, content));
+        out.push(make(main, content).await);
     }
 
     if let Ok(dir) = std::fs::read_dir(format!("{APT_DIR}/sources.list.d")) {
@@ -46,7 +51,7 @@ pub fn read_all() -> Vec<SourceFile> {
                 continue;
             }
             if let Ok(content) = std::fs::read_to_string(&path) {
-                out.push(make(path.to_string_lossy().into_owned(), content));
+                out.push(make(path.to_string_lossy().into_owned(), content).await);
             }
         }
     }
@@ -56,11 +61,16 @@ pub fn read_all() -> Vec<SourceFile> {
 /// Debian releases whose archives have moved off the main mirrors.
 const DEBIAN_EOL: &[&str] = &["jessie", "stretch", "buster", "bullseye"];
 
+/// Whether a Debian release has moved off the main mirrors.
+pub fn is_eol(codename: &str) -> bool {
+    DEBIAN_EOL.contains(&codename)
+}
+
 /// Suites that mean "whatever is current" rather than a fixed release.
 const MOVING: &[&str] = &["stable", "testing", "unstable", "oldstable", "sid"];
 
 /// Read the distribution id and codename this machine is actually running.
-fn running_release() -> (String, String) {
+pub fn running_release() -> (String, String) {
     let Ok(os) = std::fs::read_to_string("/etc/os-release") else {
         return (String::new(), String::new());
     };
@@ -249,6 +259,231 @@ pub fn suggest_for(content: &str, distro: &str, codename: &str) -> Option<(Strin
     Some((out.join("\n") + "\n", notes))
 }
 
+/// What an archive said when we asked for a suite.
+#[derive(Clone, Copy, PartialEq)]
+enum Serves {
+    /// The suite is there and its Release file is still within its own
+    /// validity window.
+    Yes,
+    /// The files are served, but the Release file's `Valid-Until` has passed.
+    /// apt refuses these by default; it is the normal state of a release the
+    /// security team has stopped signing.
+    Expired,
+    No,
+}
+
+/// Ask an archive whether it serves a suite, and whether apt will accept it.
+async fn serves(client: &reqwest::Client, uri: &str, suite: &str) -> Serves {
+    let url = format!("{}/dists/{suite}/Release", uri.trim_end_matches('/'));
+    let Ok(res) = client.get(&url).send().await else {
+        return Serves::No;
+    };
+    if !res.status().is_success() {
+        return Serves::No;
+    }
+    let Ok(body) = res.text().await else {
+        return Serves::Yes;
+    };
+    let expired = body
+        .lines()
+        .find_map(|l| l.strip_prefix("Valid-Until:"))
+        .and_then(parse_valid_until)
+        .is_some_and(|t| t < chrono::Utc::now());
+    if expired { Serves::Expired } else { Serves::Yes }
+}
+
+/// Add an option to a source line, into the existing `[...]` group if there
+/// is one.
+///
+/// apt allows exactly one bracket group per line, so a second one is a syntax
+/// error - and the lines that need this most are third-party repos, which are
+/// the ones that already carry `signed-by=`.
+fn add_option(fields: &mut Vec<String>, uri_at: usize, option: &str) {
+    // Options sit between the type and the URI. `[a=1 b=2]` may arrive as one
+    // token or several, depending on how the file was written.
+    if uri_at > 1 && fields[uri_at - 1].ends_with(']') {
+        let last = fields[uri_at - 1].clone();
+        if last == "]" {
+            fields.insert(uri_at - 1, option.to_string());
+        } else {
+            fields[uri_at - 1] = format!("{} {option}]", last.trim_end_matches(']'));
+        }
+        return;
+    }
+    fields.insert(uri_at, format!("[{option}]"));
+}
+
+/// Debian writes `Mon, 07 Sep 2026 21:13:04 UTC`. RFC 2822 wants a numeric
+/// offset and chrono rejects the alphabetic zone, so translate it first -
+/// failing to parse here reads as "not expired", which is the dangerous way
+/// round.
+fn parse_valid_until(v: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    let v = v.trim();
+    let numeric = v
+        .strip_suffix("UTC")
+        .or_else(|| v.strip_suffix("GMT"))
+        .map(|head| format!("{head}+0000"))
+        .unwrap_or_else(|| v.to_string());
+    chrono::DateTime::parse_from_rfc2822(&numeric).ok()
+}
+
+/// Where else the same suite might live.
+///
+/// Debian moves a release's files twice in its life: security leaves
+/// security.debian.org, and the main archive moves to archive.debian.org. The
+/// suite is renamed on the way (`bullseye/updates` became `bullseye-security`
+/// at Debian 12), and the two changes do not happen together - bullseye's
+/// main archive had moved while its security suite had not. Guessing which
+/// combination is live produces a source file apt rejects, so try them.
+fn alternates(uri: &str, suite: &str) -> Vec<(String, String)> {
+    let mut hosts = vec![uri.to_string()];
+    for (from, to) in [
+        ("archive.debian.org/debian-security", "security.debian.org/debian-security"),
+        ("security.debian.org/debian-security", "archive.debian.org/debian-security"),
+        ("deb.debian.org/debian-security", "security.debian.org/debian-security"),
+        ("archive.debian.org/debian", "deb.debian.org/debian"),
+        ("deb.debian.org/debian", "archive.debian.org/debian"),
+        ("ftp.debian.org/debian", "archive.debian.org/debian"),
+    ] {
+        if uri.contains(from) {
+            hosts.push(uri.replace(from, to));
+        }
+    }
+
+    let mut suites = vec![suite.to_string()];
+    if let Some(base) = suite.strip_suffix("-security") {
+        suites.push(format!("{base}/updates"));
+    }
+    if let Some(base) = suite.strip_suffix("/updates") {
+        suites.push(format!("{base}-security"));
+    }
+
+    let mut out = Vec::new();
+    for h in &hosts {
+        for s in &suites {
+            let pair = (h.clone(), s.clone());
+            if !out.contains(&pair) {
+                out.push(pair);
+            }
+        }
+    }
+    out
+}
+
+/// Check a proposed source file against the archives before offering it.
+///
+/// The rules that build a suggestion encode where Debian's files usually are.
+/// "Usually" produced a suggestion that apt threw out - archive.debian.org has
+/// no bullseye-security - and an operator who applies a fix should not be the
+/// one who discovers it was wrong. Every rewritten line is fetched: if the
+/// suite is not there, the alternates are tried, and a line nothing serves is
+/// put back the way it was rather than offered as a fix.
+pub async fn verify(original: &str, suggested: &str, notes: &mut Vec<String>) -> Option<String> {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    else {
+        return Some(suggested.to_string());
+    };
+
+    let before: Vec<&str> = original.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut usable = false;
+
+    for (i, line) in suggested.lines().enumerate() {
+        let t = line.trim();
+        let unchanged = before.get(i).map(|b| b.trim() == t).unwrap_or(false);
+        if unchanged || t.starts_with('#') || !(t.starts_with("deb ") || t.starts_with("deb-src ")) {
+            out.push(line.to_string());
+            continue;
+        }
+
+        let mut fields: Vec<String> = t.split_whitespace().map(str::to_string).collect();
+        let Some(ui) = fields.iter().position(|f| f.contains("://")) else {
+            out.push(line.to_string());
+            continue;
+        };
+        if fields.len() <= ui + 1 {
+            out.push(line.to_string());
+            continue;
+        }
+
+        let mut resolved = None;
+        for (uri, suite) in alternates(&fields[ui], &fields[ui + 1]) {
+            match serves(&client, &uri, &suite).await {
+                Serves::Yes => {
+                    resolved = Some((uri, suite, false));
+                    break;
+                }
+                // Keep looking for a live one, but remember this works if
+                // apt is told to accept a stale Release.
+                Serves::Expired if resolved.is_none() => {
+                    resolved = Some((uri, suite, true));
+                }
+                _ => {}
+            }
+        }
+
+        match resolved {
+            Some((uri, suite, expired)) => {
+                if uri != fields[ui] || suite != fields[ui + 1] {
+                    notes.push(format!(
+                        "`{} {}` is not served; used `{uri} {suite}`, which is",
+                        fields[ui], fields[ui + 1]
+                    ));
+                }
+                // Write the address before touching the options: inserting a
+                // token first shifts everything after it, which turned the
+                // suite into a duplicate of itself.
+                fields[ui] = uri;
+                fields[ui + 1] = suite.clone();
+
+                if expired && !t.contains("check-valid-until") {
+                    // apt refuses a Release past its Valid-Until unless told
+                    // otherwise. For a release nobody signs any more, that is
+                    // the only way to keep installing from it at all.
+                    add_option(&mut fields, ui, "check-valid-until=no");
+                    notes.push(format!(
+                        "`{suite}` is no longer refreshed, so its Release file has expired; \
+                         added `check-valid-until=no` so apt will still read it"
+                    ));
+                }
+                out.push(fields.join(" "));
+                usable = true;
+            }
+            None => {
+                // Nothing anywhere serves this. Offering it would produce the
+                // exact rejection this function exists to prevent.
+                notes.push(format!(
+                    "nothing serves `{} {}` any more, so that line is left as it was",
+                    fields[ui],
+                    fields[ui + 1]
+                ));
+                out.push(before.get(i).map(|b| b.to_string()).unwrap_or_else(|| line.to_string()));
+            }
+        }
+    }
+
+    let text = out.join("\n") + "\n";
+    (usable && !same_text(&text, original)).then_some(text)
+}
+
+/// Do these two files say the same thing to apt?
+///
+/// The rules rebuild each line by joining its fields with single spaces, so a
+/// file that was aligned by hand comes back "changed" on every line while
+/// meaning exactly what it did before. Offering that as a fix wastes the
+/// operator's attention and an `apt-get update` on the machine.
+fn same_text(a: &str, b: &str) -> bool {
+    let norm = |t: &str| -> Vec<String> {
+        t.lines()
+            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|l| !l.is_empty())
+            .collect()
+    };
+    norm(a) == norm(b)
+}
+
 /// Reject anything outside the apt source files.
 ///
 /// The portal supplies this path, so it is untrusted input that names a file
@@ -296,18 +531,32 @@ fn backup_path(target: &std::path::Path) -> std::path::PathBuf {
     target.with_file_name(format!("{name}.patchpanel-bak"))
 }
 
-/// Does apt complain about any of these URIs?
+/// Does apt complain about the file we just wrote, or anything in it?
 ///
-/// Only the URIs from the file just written are considered: a machine with a
-/// pre-existing problem elsewhere should not have an unrelated edit rolled
-/// back on account of it.
-fn breaks_on(text: &str, uris: &[String]) -> Option<String> {
+/// Matching only the URIs was not enough. A line that is not a source line at
+/// all - `apt http://...`, copied out of a table that displays the backend
+/// name - makes apt report the *file and line number* and no URI, so the write
+/// sailed through validation and left the machine unable to read its sources.
+/// Errors naming the path count too.
+///
+/// Still scoped to this file: a machine with a pre-existing problem elsewhere
+/// should not have an unrelated edit rolled back on account of it.
+fn breaks_on(text: &str, uris: &[String], path: &str) -> Option<String> {
+    // `/etc/apt/sources.list.d/x.list` and the bare name, since apt quotes it
+    // both ways depending on the message.
+    let file = path.rsplit('/').next().unwrap_or(path);
     for line in text.lines() {
         let t = line.trim().trim_start_matches("stderr:").trim();
         let is_err = t.starts_with("E:")
             || t.contains("does not have a Release file")
             || t.contains("Failed to fetch");
-        if is_err && uris.iter().any(|u| t.contains(u.as_str())) {
+        if !is_err {
+            continue;
+        }
+        if uris.iter().any(|u| t.contains(u.as_str()))
+            || t.contains(path)
+            || t.contains(file)
+        {
             return Some(t.to_string());
         }
     }
@@ -356,7 +605,7 @@ pub async fn write(path: &str, content: &str, p: &Progress) -> Result<String> {
     p.line("validating with apt-get update");
     let out = exec::run("apt-get", &["-qq", "update"], p).await?;
 
-    if let Some(err) = breaks_on(&out.text, &uris_in(content)) {
+    if let Some(err) = breaks_on(&out.text, &uris_in(content), path) {
         // Undo rather than leave the machine with an apt that refuses to run.
         match previous {
             Some(prev) => {
@@ -409,6 +658,123 @@ pub async fn remove(path: &str, p: &Progress) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A file someone aligned by hand comes back from the rules with single
+    /// spaces everywhere. That is not a fix, and offering it as one costs an
+    /// `apt-get update` on the machine and the operator's attention.
+    #[test]
+    fn spacing_alone_is_not_a_change() {
+        assert!(same_text(
+            "deb  http://deb.debian.org/debian   bookworm  main",
+            "deb http://deb.debian.org/debian bookworm main"
+        ));
+        assert!(same_text("deb http://x/y z main
+
+", "deb http://x/y z main
+"));
+        assert!(!same_text(
+            "deb http://x/y bookworm main",
+            "deb http://x/y trixie main"
+        ));
+        // A line appearing or vanishing is a real change.
+        assert!(!same_text("deb http://x/y z main", "deb http://x/y z main
+deb http://a/b c d"));
+    }
+
+    /// A failure that got past validation once: a line pasted out
+    /// of the repositories table, which shows the backend name rather than
+    /// the source type. apt names the file and the line, never a URI, so a
+    /// check that only looked for URIs let it through and left the machine
+    /// unable to read any of its sources.
+    #[test]
+    fn rolls_back_a_line_apt_cannot_parse() {
+        let apt_said = "stderr: E: Type 'apt' is not known on line 8 in source list                         /etc/apt/sources.list
+stderr: E: The list of sources could not be read.";
+        let uris = vec!["http://security.debian.org".to_string()];
+        assert!(breaks_on(apt_said, &uris, "/etc/apt/sources.list").is_some());
+        // And still catches the case it always did.
+        let unreachable = "stderr: E: Failed to fetch http://nope.example/dists/x/Release";
+        assert!(breaks_on(unreachable, &["http://nope.example".to_string()], "/etc/apt/sources.list").is_some());
+    }
+
+    /// Someone else's broken repository is not a reason to undo this edit.
+    #[test]
+    fn leaves_an_unrelated_failure_alone() {
+        let other = "stderr: E: Failed to fetch http://elsewhere.example/dists/x/Release";
+        assert!(breaks_on(
+            other,
+            &["http://deb.debian.org/debian".to_string()],
+            "/etc/apt/sources.list.d/mine.list"
+        )
+        .is_none());
+    }
+
+    /// Debian's Release files spell the zone `UTC`, which RFC 2822 does not
+    /// allow. Parsing it wrongly is invisible and expensive: every expired
+    /// archive reads as current, so the fix offered to an operator is one apt
+    /// then rejects.
+    #[test]
+    fn reads_debians_spelling_of_a_date() {
+        assert!(parse_valid_until("Mon, 07 Sep 2026 21:13:04 UTC").is_some());
+        assert!(parse_valid_until("Mon, 07 Sep 2026 21:13:04 GMT").is_some());
+        assert!(parse_valid_until("Mon, 07 Sep 2026 21:13:04 +0000").is_some());
+        assert!(parse_valid_until("nonsense").is_none());
+
+        let past = parse_valid_until("Sat, 31 Aug 2024 11:02:15 UTC").unwrap();
+        assert!(past < chrono::Utc::now(), "a 2024 date is in the past");
+    }
+
+    #[test]
+    fn adds_an_option_without_breaking_the_line() {
+        // No options yet: a group of its own.
+        let mut f: Vec<String> = "deb http://x/y suite main"
+            .split_whitespace().map(str::to_string).collect();
+        add_option(&mut f, 1, "check-valid-until=no");
+        assert_eq!(f.join(" "), "deb [check-valid-until=no] http://x/y suite main");
+
+        // An existing group, written as one token: apt takes only one `[...]`,
+        // so it has to go inside.
+        let mut f: Vec<String> = "deb [signed-by=/k.gpg] http://x/y suite main"
+            .split_whitespace().map(str::to_string).collect();
+        add_option(&mut f, 2, "check-valid-until=no");
+        assert_eq!(
+            f.join(" "),
+            "deb [signed-by=/k.gpg check-valid-until=no] http://x/y suite main"
+        );
+
+        // The spaced-out spelling Glenn R's installer writes.
+        let mut f: Vec<String> = "deb [ arch=amd64 signed-by=/k.gpg ] http://x/y suite main"
+            .split_whitespace().map(str::to_string).collect();
+        add_option(&mut f, 5, "check-valid-until=no");
+        assert_eq!(
+            f.join(" "),
+            "deb [ arch=amd64 signed-by=/k.gpg check-valid-until=no ] http://x/y suite main"
+        );
+    }
+
+    /// bullseye's main archive had moved while its security suite had not, so
+    /// the end-of-life rule's first guess 404s. Every place it could be has to
+    /// be on the list.
+    #[test]
+    fn offers_every_place_a_moved_suite_could_be() {
+        let alts = alternates("http://archive.debian.org/debian-security", "bullseye-security");
+        assert!(
+            alts.iter().any(|(u, s)| u.contains("security.debian.org") && s == "bullseye-security"),
+            "{alts:?}"
+        );
+        // The pre-Debian-12 spelling, which is where buster's ended up.
+        assert!(alts.iter().any(|(_, s)| s == "bullseye/updates"), "{alts:?}");
+        // The original is tried first: a source that works is not moved.
+        assert_eq!(
+            alts[0],
+            (
+                "http://archive.debian.org/debian-security".to_string(),
+                "bullseye-security".to_string()
+            )
+        );
+    }
+
     use super::suggest_for;
 
     fn fix(line: &str, codename: &str) -> String {
@@ -419,7 +785,7 @@ mod tests {
 
     #[test]
     fn renames_the_pre_debian_12_security_suite() {
-        // Exactly what broke `bit`: apt refuses the whole run over this.
+        // A real breakage: apt refuses the whole run over this.
         let got = fix(
             "deb http://security.debian.org/debian-security bookworm/updates main",
             "bookworm",
@@ -432,7 +798,7 @@ mod tests {
 
     #[test]
     fn repoints_a_repo_built_for_another_distribution() {
-        // `bit` again: Docker published under /linux/ubuntu on a Debian box.
+        // Docker published under /linux/ubuntu on a Debian box.
         let got = fix("deb https://download.docker.com/linux/ubuntu buster stable", "bookworm");
         assert!(got.contains("/linux/debian"), "{got}");
         assert!(got.contains("bookworm"), "{got}");
@@ -440,7 +806,7 @@ mod tests {
 
     #[test]
     fn pins_a_moving_suite_to_the_installed_release() {
-        // `hub`: `stable` had silently become Debian 13 under a Debian 11 box.
+        // `stable` had silently become Debian 13 under a Debian 11 box.
         assert_eq!(
             fix("deb http://mirrors.example.org/debian/ stable main", "bullseye"),
             "deb http://archive.debian.org/debian bullseye main"

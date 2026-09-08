@@ -31,6 +31,9 @@ mod windows;
 pub enum Backend {
     Apt,
     Dnf,
+    /// Firmware, through fwupd and LVFS. Reported, never installed by a patch
+    /// run: a package can be rolled back and firmware cannot.
+    Fwupd,
     Winget,
     /// Windows Update, driven through the PSWindowsUpdate PowerShell module.
     WindowsUpdate,
@@ -43,6 +46,7 @@ impl Backend {
         match self {
             Backend::Apt => "apt",
             Backend::Dnf => "dnf",
+            Backend::Fwupd => "fwupd",
             Backend::Winget => "winget",
             Backend::WindowsUpdate => "windowsupdate",
             Backend::Registry => "registry",
@@ -106,9 +110,21 @@ impl Platform {
 
     /// Distro or Windows edition string for the dashboard.
     pub fn os_version() -> String {
+        // On Linux, /etc/os-release is the machine's own answer and os_info is
+        // a guess at it. The guess is "Debian n/a" for a testing install,
+        // which reads as a broken field rather than as what it is - and a
+        // machine silently sitting on testing is worth naming plainly.
+        #[cfg(target_os = "linux")]
+        if let Ok(text) = std::fs::read_to_string("/etc/os-release") {
+            if let Some(v) = describe_os_release(&text) {
+                return v;
+            }
+        }
+
         let info = os_info::get();
         let ver = info.version().to_string();
-        if ver == "Unknown" {
+        // os_info spells an unknown version both ways depending on backend.
+        if ver == "Unknown" || ver == "n/a" {
             info.os_type().to_string()
         } else {
             format!("{} {}", info.os_type(), ver)
@@ -146,6 +162,9 @@ impl Platform {
 
     /// Install what this machine needs in order to be scannable.
     pub async fn install_prerequisites(&self, p: &Progress) -> Result<String> {
+        #[cfg(target_os = "linux")]
+        return linux::install_prerequisites(self, p).await;
+        #[allow(unreachable_code)]
         let _ = p;
         #[cfg(windows)]
         return windows::install_prerequisites(p).await;
@@ -210,6 +229,99 @@ impl Platform {
         return linux::cleanup_preview(self, p).await;
         #[cfg(not(target_os = "linux"))]
         return Cleanup::default();
+    }
+
+    /// Firmware updates, everything fwupd can see, and why it could not look.
+    pub async fn firmware(
+        &self,
+        p: &Progress,
+    ) -> (
+        Vec<pp_proto::FirmwareUpdate>,
+        Vec<pp_proto::FirmwareDevice>,
+        Option<ScanIssue>,
+    ) {
+        let _ = p;
+        #[cfg(target_os = "linux")]
+        return linux::firmware(self, p).await;
+        #[cfg(not(target_os = "linux"))]
+        return (Vec::new(), Vec::new(), None);
+    }
+
+    /// Flash firmware. Only ever reached by an explicit request.
+    pub async fn update_firmware(&self, only: &[String], p: &Progress) -> Result<String> {
+        let _ = (only, p);
+        #[cfg(target_os = "linux")]
+        return linux::update_firmware(self, only, p).await;
+        #[cfg(not(target_os = "linux"))]
+        anyhow::bail!(
+            "PatchPanel does not drive firmware on this platform. On Windows, firmware \
+             arrives through Windows Update."
+        );
+    }
+
+    /// Whether this machine hosts virtual machines, or is one.
+    pub async fn virtualization(&self, p: &Progress) -> Option<pp_proto::Virtualization> {
+        let _ = p;
+        #[cfg(target_os = "linux")]
+        return linux::virtualization(p).await;
+        #[cfg(windows)]
+        return windows::virtualization(p).await;
+        #[cfg(not(any(target_os = "linux", windows)))]
+        return None;
+    }
+
+    /// Why this machine last restarted, when its logs can say.
+    pub async fn boot_report(&self, p: &Progress) -> Option<pp_proto::BootReport> {
+        let _ = p;
+        #[cfg(target_os = "linux")]
+        return linux::boot_report(p).await;
+        #[cfg(windows)]
+        return windows::boot_report(p).await;
+        #[cfg(not(any(target_os = "linux", windows)))]
+        return None;
+    }
+
+    /// Is dpkg stuck part-way through an upgrade?
+    pub async fn mid_upgrade(&self, p: &Progress) -> Option<pp_proto::MidUpgrade> {
+        let _ = p;
+        #[cfg(target_os = "linux")]
+        return linux::mid_upgrade(self, p).await;
+        #[cfg(not(target_os = "linux"))]
+        return None;
+    }
+
+    /// Configure what is half-installed and carry on.
+    pub async fn finish_upgrade(&self, grub_device: Option<&str>, p: &Progress) -> Result<String> {
+        let _ = (grub_device, p);
+        #[cfg(target_os = "linux")]
+        return linux::finish_upgrade(self, grub_device, p).await;
+        #[cfg(not(target_os = "linux"))]
+        anyhow::bail!("there is no interrupted upgrade to finish on this platform");
+    }
+
+    /// Which configured repositories cannot actually deliver packages.
+    ///
+    /// Returns `(repo label, problem)` pairs.
+    pub async fn repo_problems(
+        &self,
+        repos: &[pp_proto::Repository],
+        p: &Progress,
+    ) -> Vec<(String, String)> {
+        let _ = (repos, p);
+        #[cfg(target_os = "linux")]
+        return linux::repo_problems(self, repos, p).await;
+        #[cfg(not(target_os = "linux"))]
+        return Vec::new();
+    }
+
+    /// Move to the next distribution release, or just report whether it is
+    /// safe to.
+    pub async fn distro_upgrade(&self, to: &str, check: bool, p: &Progress) -> Result<String> {
+        let _ = (to, check, p);
+        #[cfg(target_os = "linux")]
+        return linux::distro_upgrade(self, to, check, p).await;
+        #[cfg(not(target_os = "linux"))]
+        anyhow::bail!("release upgrades are only supported on Debian for now");
     }
 
     /// Remove orphaned packages and empty the package cache.
@@ -325,4 +437,80 @@ async fn ensure_from_url(
     out.require(&[])?;
 
     Ok(AppOutcome::changed(format!("installed `{name}` from {url}"), None))
+}
+
+/// Turn /etc/os-release into something worth showing in a table.
+///
+/// A released Debian gives `Debian 12 (bookworm)`. A testing install has no
+/// VERSION_ID at all, which is the case worth being explicit about: it is a
+/// different support model, and "Debian n/a" tells nobody that.
+fn describe_os_release(text: &str) -> Option<String> {
+    let field = |key: &str| -> Option<String> {
+        text.lines()
+            .filter_map(|l| l.split_once('='))
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.trim().trim_matches(['"', '\'']).to_string())
+            .filter(|v| !v.is_empty())
+    };
+
+    // NAME is "Debian GNU/Linux"; the shorter half is enough for a column.
+    let name = field("NAME")
+        .map(|n| n.split_whitespace().next().unwrap_or(&n).to_string())
+        .or_else(|| field("ID"))?;
+    let codename = field("VERSION_CODENAME");
+
+    Some(match (field("VERSION_ID"), codename) {
+        (Some(v), Some(c)) => format!("{name} {v} ({c})"),
+        (Some(v), None) => format!("{name} {v}"),
+        // No version number: a rolling suite. sid is unstable by definition;
+        // anything else with a codename and no version is testing.
+        (None, Some(c)) if c == "sid" => format!("{name} unstable (sid)"),
+        (None, Some(c)) => format!("{name} testing ({c})"),
+        (None, None) => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_a_released_debian_by_its_number() {
+        let released = "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\n\
+                        NAME=\"Debian GNU/Linux\"\n\
+                        VERSION_ID=\"12\"\n\
+                        VERSION_CODENAME=bookworm\n\
+                        ID=debian\n";
+        assert_eq!(describe_os_release(released).unwrap(), "Debian 12 (bookworm)");
+    }
+
+    /// A machine upgraded one release too far. os_info renders this as
+    /// "Debian n/a", which looks like a bug in the dashboard rather than a
+    /// fact about the machine.
+    #[test]
+    fn says_testing_when_there_is_no_version() {
+        let testing = "PRETTY_NAME=\"Debian GNU/Linux forky/sid\"\n\
+                       NAME=\"Debian GNU/Linux\"\n\
+                       VERSION_CODENAME=forky\n\
+                       ID=debian\n";
+        assert_eq!(describe_os_release(testing).unwrap(), "Debian testing (forky)");
+    }
+
+    #[test]
+    fn sid_is_unstable_not_testing() {
+        let sid = "NAME=\"Debian GNU/Linux\"\nVERSION_CODENAME=sid\nID=debian\n";
+        assert_eq!(describe_os_release(sid).unwrap(), "Debian unstable (sid)");
+    }
+
+    #[test]
+    fn ubuntu_keeps_its_number() {
+        let ubuntu = "NAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\nID=ubuntu\n";
+        assert_eq!(describe_os_release(ubuntu).unwrap(), "Ubuntu 24.04 (noble)");
+    }
+
+    #[test]
+    fn nothing_useful_falls_back_to_os_info() {
+        assert!(describe_os_release("").is_none());
+        assert!(describe_os_release("SOMETHING=else\n").is_none());
+    }
 }

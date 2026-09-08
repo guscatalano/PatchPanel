@@ -14,7 +14,7 @@ pub mod manifest;
 pub use devices::{
     DeviceReport, DeviceSpec, DiscoveredHost, DiscoveryScan, Probe, OID_SYS_DESCR,
 };
-pub use manifest::{AppSource, AppSpec, Ensure, Manifest, PatchPolicy};
+pub use manifest::{AppSource, AppSpec, Ensure, Manifest, PatchPolicy, SourcePolicy};
 
 /// Bumped whenever a frame shape changes incompatibly. The portal refuses
 /// agents that speak a different major protocol rather than guessing.
@@ -133,6 +133,11 @@ pub struct SourceFile {
 /// old suite or carrying a third-party repo will never converge on the others.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Repository {
+    /// Something wrong with this repository that only shows up when you try
+    /// to install from it - most of the metadata can be perfectly valid while
+    /// the packages themselves have gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
     /// Backend that owns it: "apt", "dnf", "winget".
     pub source: String,
     /// Where the packages come from.
@@ -174,9 +179,18 @@ pub struct ReleaseInfo {
     pub distro: String,
     pub codename: String,
     pub version_id: String,
-    /// The next major release, where the sequence is known.
+    /// The next major release, where the sequence is known and that release
+    /// has actually been made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
+    /// Its version number, so the portal can say "Debian 13 (trixie)" rather
+    /// than a codename an operator has to look up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_version: Option<String>,
+    /// What the distribution currently calls stable, as reported by the
+    /// archive itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable: Option<String>,
     #[serde(default)]
     pub findings: Vec<ReleaseFinding>,
 }
@@ -188,6 +202,136 @@ impl ReleaseInfo {
             .filter(|f| f.severity == Severity::Blocker)
             .count()
     }
+}
+
+/// Firmware waiting to be flashed onto a device in this machine.
+///
+/// Deliberately separate from `AvailableUpdate`: a package can be reinstalled
+/// and a bad one rolled back, while a firmware write can leave hardware that
+/// does not come back. Nothing here is ever installed by a patch run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FirmwareUpdate {
+    /// fwupd's opaque id, which is what an install is addressed to.
+    pub device_id: String,
+    pub device: String,
+    #[serde(default)]
+    pub current: String,
+    pub available: String,
+    /// The vendor's description of what changed.
+    #[serde(default)]
+    pub summary: String,
+    /// Applied at the next boot rather than immediately, which most system
+    /// firmware is.
+    #[serde(default)]
+    pub needs_reboot: bool,
+    /// fwupd's own warning about this update, when it carries one.
+    #[serde(default)]
+    pub caution: String,
+}
+
+/// A virtual machine or container running on this host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Guest {
+    /// The hypervisor's own identifier - a Proxmox VMID, a Hyper-V name.
+    pub id: String,
+    pub name: String,
+    /// "qemu", "lxc", "hyper-v".
+    pub kind: String,
+    #[serde(default)]
+    pub state: String,
+    /// Filled in by the portal: is there an agent reporting for this guest?
+    /// The agent cannot know, and it is the whole point of listing them.
+    #[serde(default)]
+    pub managed: bool,
+}
+
+/// This machine's place in the virtualization stack.
+///
+/// A hypervisor is the one machine whose patch state affects every other
+/// machine on it, and its guests are the most likely place for something to be
+/// running unmanaged - nobody installs an agent on the VM they spun up to try
+/// something.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Virtualization {
+    /// "host", "guest", or both when a VM runs VMs of its own.
+    pub role: String,
+    /// "proxmox", "hyper-v", "kvm guest", "lxc container", ...
+    pub platform: String,
+    #[serde(default)]
+    pub guests: Vec<Guest>,
+    /// Why the guest list could not be read, when it could not.
+    #[serde(default)]
+    pub note: String,
+}
+
+/// A piece of hardware fwupd can see, whether or not it has an update.
+///
+/// Reported even when everything is current: "no firmware updates" and "this
+/// machine's firmware was never looked at" are very different statements, and
+/// an empty section cannot tell them apart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FirmwareDevice {
+    pub name: String,
+    #[serde(default)]
+    pub vendor: String,
+    #[serde(default)]
+    pub version: String,
+    /// Whether fwupd could update it at all. Plenty of devices are visible but
+    /// not updatable, and counting those as "up to date" would overstate the
+    /// coverage.
+    #[serde(default)]
+    pub updatable: bool,
+}
+
+/// Why a machine last restarted.
+///
+/// A machine that reboots on its own tells you something is wrong, and the
+/// evidence is only in its logs until they rotate. Recording it at the next
+/// scan means the answer survives long enough for somebody to look.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BootReport {
+    /// True when the previous shutdown was not a clean one.
+    pub unexpected: bool,
+    /// A short verdict: "kernel panic", "out of memory", "power loss or host
+    /// reset", "clean shutdown".
+    pub summary: String,
+    /// What the machine's own logs said, so the verdict can be checked.
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// A disk the machine could install a bootloader onto.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Disk {
+    pub path: String,
+    #[serde(default)]
+    pub size: String,
+    #[serde(default)]
+    pub model: String,
+    /// Stable names under /dev/disk/by-id. These are what grub records, and a
+    /// stale one is the usual reason a release upgrade stops halfway.
+    #[serde(default)]
+    pub by_id: Vec<String>,
+}
+
+/// A machine left part-way through an upgrade, with packages unpacked but not
+/// configured.
+///
+/// dpkg stops at the first postinst that fails and refuses to do anything else
+/// until someone resolves it, so this state is sticky and completely invisible
+/// from the outside: `apt list --upgradable` looks normal while nothing can be
+/// installed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MidUpgrade {
+    /// Packages dpkg reports as half-installed or half-configured.
+    pub packages: Vec<String>,
+    /// Set when the stuck package is a bootloader, which needs a disk chosen
+    /// before it can be configured.
+    #[serde(default)]
+    pub grub_stuck: bool,
+    /// Candidate disks, for that choice.
+    #[serde(default)]
+    pub disks: Vec<Disk>,
 }
 
 /// A reason this machine's update count cannot be trusted.
@@ -286,6 +430,31 @@ pub struct Inventory {
     /// will never install, which looks exactly like a broken patch run.
     #[serde(default)]
     pub deferred: Vec<String>,
+    /// Updates a patch run was asked to install and left exactly where they
+    /// were: same installed version, same version on offer.
+    ///
+    /// Unlike everything above this is observed rather than reported. Neither
+    /// apt nor winget will say "I refused that one" in a form worth trusting -
+    /// winget gives a count with no names - so the only honest answer comes
+    /// from looking at what actually moved.
+    #[serde(default)]
+    pub blocked: Vec<String>,
+    /// Set when dpkg is stuck part-way through an upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mid_upgrade: Option<MidUpgrade>,
+    /// Firmware updates offered for this machine's hardware.
+    #[serde(default)]
+    pub firmware: Vec<FirmwareUpdate>,
+    /// Everything fwupd can see, so an empty update list can be read as "all
+    /// current" rather than "nothing was checked".
+    #[serde(default)]
+    pub firmware_devices: Vec<FirmwareDevice>,
+    /// Why this machine last restarted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot: Option<BootReport>,
+    /// Whether this machine hosts virtual machines, or is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virt: Option<Virtualization>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -344,6 +513,38 @@ pub enum Command {
 
     /// Delete an apt source file, keeping a backup beside it.
     RemoveSource { path: String },
+
+    /// Move this machine to the next distribution release.
+    ///
+    /// The most destructive thing PatchPanel can do, so it is deliberately
+    /// awkward to ask for. `check` performs every preflight and changes
+    /// nothing, and `to` must match the release the agent itself worked out -
+    /// a page left open for a week cannot order a jump that no longer makes
+    /// sense.
+    DistroUpgrade {
+        to: String,
+        #[serde(default)]
+        check: bool,
+    },
+
+    /// Flash firmware. Never part of a patch run: this is the one action
+    /// here that can leave hardware that does not come back, so it is always
+    /// asked for on its own.
+    UpdateFirmware {
+        /// fwupd device ids, or empty for everything on offer.
+        #[serde(default)]
+        only: Vec<String>,
+    },
+
+    /// Finish an upgrade dpkg stopped part-way through.
+    ///
+    /// `grub_device` answers the question a stuck bootloader package is
+    /// waiting on: which disk to install to. It is a choice with consequences,
+    /// so it comes from the operator rather than being guessed.
+    FinishUpgrade {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grub_device: Option<String>,
+    },
 
     /// Exit so the supervisor starts the agent again.
     ///

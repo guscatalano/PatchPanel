@@ -35,8 +35,11 @@ pub fn routes(state: SharedState) -> Router {
     Router::new()
         .route("/api/fleet", get(fleet))
         .route("/api/devices", get(devices))
+        .route("/api/devices/{id}/history", get(device_history))
+        .route("/api/devices/{id}/id", post(rename_device))
         .route("/api/agents/{id}", get(agent).delete(delete_agent))
         .route("/api/agents/{id}/commands", post(dispatch))
+        .route("/api/agents/{id}/ignores", post(add_ignore).delete(remove_ignore))
         .route("/api/commands", get(command_log))
         .route("/api/commands/broadcast", post(broadcast))
         .route("/api/manifest", get(get_manifest).put(put_manifest))
@@ -107,6 +110,16 @@ struct FleetSummary {
     devices: usize,
     devices_unreachable: usize,
     devices_drifted: usize,
+    /// Devices with updates waiting, and devices whose release is retired.
+    /// Both belong in the summary so the navigation can carry a count without
+    /// the Devices tab having to have been opened.
+    #[serde(default)]
+    devices_pending: usize,
+    #[serde(default)]
+    devices_eol: usize,
+    /// Machines with something installable waiting.
+    #[serde(default)]
+    agents_pending: usize,
 }
 
 #[derive(Serialize)]
@@ -119,7 +132,27 @@ struct AgentView {
 
 async fn fleet(State(state): State<SharedState>) -> ApiResult<Json<FleetResponse>> {
     let manifest = state.db.manifest()?;
-    let rows = state.db.agents()?;
+    let mut rows = state.db.agents()?;
+
+    // Count each host's guests that no agent reports for. Only the fleet as a
+    // whole can answer that, so it is filled in here rather than per row.
+    let known: Vec<String> = rows.iter().map(|a| a.hostname.to_lowercase()).collect();
+    let short = |s: &str| s.split('.').next().unwrap_or(s).to_string();
+    for row in rows.iter_mut() {
+        let Some(inv) = state.db.inventory(row.id)? else {
+            continue;
+        };
+        let Some(virt) = inv.virt else { continue };
+        row.unmanaged_guests = virt
+            .guests
+            .iter()
+            .filter(|g| {
+                let name = g.name.to_lowercase();
+                !known.iter().any(|k| *k == name || short(k) == short(&name))
+            })
+            .count();
+    }
+    let rows = rows;
     let mut summary = FleetSummary {
         agents: rows.len(),
         ..Default::default()
@@ -143,6 +176,9 @@ async fn fleet(State(state): State<SharedState>) -> ApiResult<Json<FleetResponse
             if row.applied_revision < manifest.revision {
                 summary.stale_manifest += 1;
             }
+            if row.actionable_count > 0 {
+                summary.agents_pending += 1;
+            }
             let connected = state.hub.is_connected(row.id);
             AgentView { row, connected }
         })
@@ -152,6 +188,16 @@ async fn fleet(State(state): State<SharedState>) -> ApiResult<Json<FleetResponse
     let all = collect_devices(&state)?;
     summary.devices_drifted = all.iter().filter(|d| d.report.drift).count();
     summary.devices_unreachable = all.iter().filter(|d| !d.report.reachable).count();
+
+    // Device counts come from the same deduplicated view the Devices tab
+    // uses, so a badge and the page it points at cannot disagree.
+    if let Ok(devices) = collect_devices(&state) {
+        summary.devices_pending = devices
+            .iter()
+            .filter(|d| d.report.updates_known && d.report.updates > 0)
+            .count();
+        summary.devices_eol = devices.iter().filter(|d| d.report.eol).count();
+    }
 
     Ok(Json(FleetResponse {
         summary,
@@ -168,6 +214,8 @@ struct AgentDetail {
     inventory: Option<pp_proto::Inventory>,
     commands: Vec<crate::db::CommandRow>,
     repo_diff: RepoDiff,
+    /// Updates set aside on this machine, and at which version.
+    ignored: Vec<crate::db::IgnoredUpdate>,
 }
 
 /// How this machine's package sources compare with its peers.
@@ -178,12 +226,23 @@ struct AgentDetail {
 /// behaves differently.
 #[derive(Default, Serialize)]
 struct RepoDiff {
-    /// How many same-OS agents this was compared against.
+    /// How many comparable agents this was compared against.
     peers: usize,
+    /// What made them comparable: the distribution and release, or the bare
+    /// OS for a machine that has not reported one. Shown so the comparison is
+    /// never mistaken for a wider one than it is.
+    #[serde(default)]
+    group: String,
     /// Configured here, on no peer.
     only_here: Vec<String>,
     /// Configured on every peer, but not here.
     missing_here: Vec<String>,
+    /// Security suites seen on comparable machines, whether or not every one
+    /// of them has it. A machine with no security source needs to be told
+    /// which line to add, and its neighbours running the same release are the
+    /// authoritative answer.
+    #[serde(default)]
+    peer_security: Vec<String>,
 }
 
 /// Identity of a repository for comparison: where it points and at what suite.
@@ -193,10 +252,30 @@ fn repo_key(r: &pp_proto::Repository) -> String {
     format!("{} {} {}", r.source, r.uri.trim_end_matches('/'), r.suite)
 }
 
+/// What makes two machines comparable for sources.
+///
+/// The release, not the operating system. Every Debian 12 box should have the
+/// same archives; a Debian 13 box next to it correctly has different ones, and
+/// comparing the two produces a page full of differences that are all correct.
+/// Falls back to the OS for a machine that has not reported a release, which
+/// is coarse but never claims more than it knows.
+fn compare_group(inv: Option<&pp_proto::Inventory>, os: &str) -> String {
+    match inv.and_then(|i| i.release.as_ref()) {
+        Some(r) if !r.codename.is_empty() => format!("{} {}", r.distro, r.codename),
+        _ => os.to_string(),
+    }
+}
+
+/// Does this repository carry security updates?
+fn is_security(r: &pp_proto::Repository) -> bool {
+    r.uri.contains("security") || r.suite.contains("security") || r.suite.ends_with("/updates")
+}
+
 fn repo_diff(
     state: &SharedState,
     me: pp_proto::AgentId,
     my_os: &str,
+    my_inv: Option<&pp_proto::Inventory>,
     mine: &[pp_proto::Repository],
 ) -> anyhow::Result<RepoDiff> {
     use std::collections::HashSet;
@@ -206,18 +285,26 @@ fn repo_diff(
         .filter(|r| r.enabled)
         .map(repo_key)
         .collect();
+    let group = compare_group(my_inv, my_os);
 
     let mut peer_sets: Vec<HashSet<String>> = Vec::new();
+    let mut peer_security: Vec<String> = Vec::new();
     for row in state.db.agents()? {
-        if row.id == me || row.os != my_os {
+        if row.id == me {
             continue;
         }
         let Some(inv) = state.db.inventory(row.id)? else {
             continue;
         };
-        if inv.repositories.is_empty() {
+        if inv.repositories.is_empty() || compare_group(Some(&inv), &row.os) != group {
             continue;
         }
+        peer_security.extend(
+            inv.repositories
+                .iter()
+                .filter(|r| r.enabled && is_security(r))
+                .map(|r| format!("{} {} {}", r.uri, r.suite, r.components.join(" "))),
+        );
         peer_sets.push(
             inv.repositories
                 .iter()
@@ -226,9 +313,18 @@ fn repo_diff(
                 .collect(),
         );
     }
+    peer_security.sort();
+    peer_security.dedup();
 
     if peer_sets.is_empty() {
-        return Ok(RepoDiff::default());
+        // Still say what it looked for. "No peers" and "no peers running
+        // Debian 11" are different statements, and the second is the one that
+        // explains why a lone machine has nothing to compare against.
+        return Ok(RepoDiff {
+            group,
+            peer_security,
+            ..RepoDiff::default()
+        });
     }
 
     let mut only_here: Vec<String> = my_keys
@@ -247,8 +343,10 @@ fn repo_diff(
 
     Ok(RepoDiff {
         peers: peer_sets.len(),
+        group,
         only_here,
         missing_here,
+        peer_security,
     })
 }
 
@@ -263,19 +361,223 @@ async fn agent(
         .find(|a| a.id == id)
         .ok_or_else(|| ApiError::not_found("no such agent"))?;
 
-    let inventory = state.db.inventory(id)?;
+    let mut inventory = state.db.inventory(id)?;
+    let commands = state.db.commands(Some(id), 100)?;
+
+    // Which repositories actually failed to deliver, taken from the last patch
+    // run rather than from a probe. The agent cannot keep this reliably - a
+    // reconnect gives it a fresh session - and the portal already has every
+    // word apt said, including for runs that happened before this existed.
+    if let Some(inv) = inventory.as_mut() {
+        attach_fetch_failures(inv, &commands);
+        attach_blocked(inv, &commands);
+    }
+
     let diff = match &inventory {
-        Some(inv) => repo_diff(&state, id, &row.os, &inv.repositories)?,
+        Some(inv) => repo_diff(&state, id, &row.os, Some(inv), &inv.repositories)?,
         None => RepoDiff::default(),
     };
 
+    // Which of this host's guests PatchPanel already knows about. The agent
+    // cannot answer that - it is the portal's whole view - and an unmanaged
+    // guest is the most common blind spot on a hypervisor: nobody enrols the
+    // VM they spun up to try something.
+    if let Some(virt) = inventory.as_mut().and_then(|i| i.virt.as_mut()) {
+        if !virt.guests.is_empty() {
+            let known: Vec<String> = state
+                .db
+                .agents()?
+                .into_iter()
+                .map(|a| a.hostname.to_lowercase())
+                .collect();
+            for g in virt.guests.iter_mut() {
+                let name = g.name.to_lowercase();
+                // A Proxmox guest is named by the operator and an agent
+                // reports its own hostname, so they usually match outright;
+                // allow the short name of an FQDN on either side.
+                let short = |s: &str| s.split('.').next().unwrap_or(s).to_string();
+                g.managed = known
+                    .iter()
+                    .any(|k| *k == name || short(k) == short(&name));
+            }
+        }
+    }
+
+    // "Add the security suite for its release" is true and useless on its own.
+    // The machines running the same release already have the line.
+    if let Some(rel) = inventory.as_mut().and_then(|i| i.release.as_mut()) {
+        if !diff.peer_security.is_empty() {
+            for f in rel
+                .findings
+                .iter_mut()
+                .filter(|f| f.summary.contains("security source"))
+            {
+                f.detail = format!(
+                    "{}\n\n{} other machine(s) running {} use:\n{}",
+                    f.detail.trim_end(),
+                    diff.peers.max(1),
+                    diff.group,
+                    diff.peer_security
+                        .iter()
+                        .map(|s| format!("  deb {s}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+            }
+        }
+    }
+
     Ok(Json(AgentDetail {
         connected: state.hub.is_connected(id),
-        commands: state.db.commands(Some(id), 100)?,
+        ignored: state.db.ignores(id)?,
+        commands,
         inventory,
         repo_diff: diff,
         row,
     }))
+}
+
+/// Mark updates a patch run demonstrably failed to install.
+///
+/// The agent works this out at the moment a run finishes - it is the only
+/// point where "what was pending before" and "what is pending now" both exist
+/// - but it cannot hold on to it. A self-update restarts the agent, and the
+/// finding went with it. The portal has the run's own words and keeps them, so
+/// read it back from there.
+///
+/// Only names still being offered are marked: anything since installed has
+/// stopped being blocked, whatever a week-old run said.
+fn attach_blocked(inv: &mut pp_proto::Inventory, commands: &[crate::db::CommandRow]) {
+    if !inv.blocked.is_empty() {
+        return;
+    }
+    let Some(run) = commands.iter().find(|c| c.kind == "apply_patches") else {
+        return;
+    };
+
+    let text = format!("{}\n{}", run.detail, run.progress);
+    let Some(start) = text.find("still offered after the run") else {
+        return;
+    };
+
+    let mut names = Vec::new();
+    for line in text[start..].lines().skip(1) {
+        // The block is indented names, and ends at the blank line before the
+        // advice that follows it.
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if !line.starts_with("  ") {
+            break;
+        }
+        let name = trimmed.split(" (").next().unwrap_or(trimmed).trim();
+        if !name.is_empty() {
+            names.push(name.to_string());
+        }
+    }
+
+    inv.blocked = names
+        .into_iter()
+        .filter(|n| inv.updates.iter().any(|u| u.name == *n))
+        .collect();
+}
+
+/// Mark repositories that the most recent patch run could not download from.
+///
+/// apt prints `E: Failed to fetch <url>  404  Not Found` for each one. Those
+/// URLs carry the repository they came from, which is the difference between a
+/// wall of errors and knowing which line in which file has stopped working.
+fn attach_fetch_failures(inv: &mut pp_proto::Inventory, commands: &[crate::db::CommandRow]) {
+    let Some(run) = commands
+        .iter()
+        .find(|c| c.kind == "apply_patches" && c.ok == Some(false))
+    else {
+        return;
+    };
+    // A run older than the inventory has been overtaken by events.
+    if run.created_at < inv.collected_at - chrono::Duration::hours(24) {
+        return;
+    }
+
+    let text = format!(
+        "{}\n{}\n{}",
+        run.summary, run.detail, run.progress
+    );
+    let failed: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("Failed to fetch"))
+        .filter_map(|l| l.split_whitespace().find(|w| w.starts_with("http")))
+        .collect();
+    if failed.is_empty() {
+        return;
+    }
+
+    for repo in inv.repositories.iter_mut() {
+        let base = repo.uri.trim_end_matches('/');
+        if base.is_empty() {
+            continue;
+        }
+        let mine: Vec<&&str> = failed.iter().filter(|u| u.starts_with(base)).collect();
+        if mine.is_empty() {
+            continue;
+        }
+        let mut names: Vec<String> = mine
+            .iter()
+            .map(|u| {
+                let file = u.rsplit('/').next().unwrap_or(u);
+                // apt percent-encodes `+` and `~` in version strings.
+                file.replace("%2b", "+").replace("%7e", "~")
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        let shown: Vec<String> = names.iter().take(4).cloned().collect();
+
+        repo.problem = Some(format!(
+            "the last patch run could not download {} package(s) from here: the index lists \
+             them but the server answers 404 ({}{}). Every patch run on this machine will \
+             keep failing until this source is fixed or disabled - apt downloads everything \
+             else first, then gives up. A release being retired empties its pool while the \
+             indices remain; the files move to archive.debian.org, or are gone.",
+            names.len(),
+            shown.join(", "),
+            if names.len() > shown.len() { ", ..." } else { "" }
+        ));
+    }
+}
+
+#[derive(Deserialize)]
+struct IgnoreRequest {
+    name: String,
+    #[serde(default)]
+    source: String,
+    /// The exact version being set aside. Ignoring a package outright would
+    /// hide the next security fix for it too.
+    version: String,
+}
+
+async fn add_ignore(
+    State(state): State<SharedState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<IgnoreRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if req.name.trim().is_empty() || req.version.trim().is_empty() {
+        return Err(ApiError::bad_request("a name and a version are required"));
+    }
+    state
+        .db
+        .add_ignore(id, req.name.trim(), req.source.trim(), req.version.trim())?;
+    Ok(Json(json!({ "ignored": req.name, "version": req.version })))
+}
+
+async fn remove_ignore(
+    State(state): State<SharedState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<IgnoreRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let removed = state.db.remove_ignore(id, req.name.trim(), req.version.trim())?;
+    Ok(Json(json!({ "removed": removed })))
 }
 
 async fn delete_agent(
@@ -309,18 +611,34 @@ struct DeviceView {
     label: String,
     tags: Vec<String>,
     expect_version: Option<String>,
+    /// How many collectors are reporting this device. More than one means no
+    /// `collector` is named on it and every agent in the site is probing it.
+    collectors: usize,
+    /// False for a device that is declared but has never been probed. It still
+    /// belongs in the list: a device nobody has looked at yet is exactly the
+    /// one worth seeing, and leaving it out made adding one feel like it had
+    /// silently failed.
+    probed: bool,
 }
 
 fn collect_devices(state: &SharedState) -> anyhow::Result<Vec<DeviceView>> {
     let manifest = state.db.manifest()?;
     let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<String> = Default::default();
 
     for row in state.db.agents()? {
         let Some(inv) = state.db.inventory(row.id)? else {
             continue;
         };
         for report in inv.devices {
-            let spec = manifest.devices.iter().find(|d| d.id == report.id);
+            // A report whose device is no longer declared is history, not a
+            // device. Reports are kept across restarts, so this is what makes
+            // Remove actually remove.
+            let Some(spec) = manifest.devices.iter().find(|d| d.id == report.id) else {
+                continue;
+            };
+            let spec = Some(spec);
+            seen.insert(report.id.clone());
             out.push(DeviceView {
                 collector: row.id,
                 collector_host: row.hostname.clone(),
@@ -328,13 +646,75 @@ fn collect_devices(state: &SharedState) -> anyhow::Result<Vec<DeviceView>> {
                 label: spec.map(|s| s.label.clone()).unwrap_or_default(),
                 tags: spec.map(|s| s.tags.clone()).unwrap_or_default(),
                 expect_version: spec.and_then(|s| s.expect_version.clone()),
+                collectors: 0,
+                probed: true,
                 report,
             });
         }
     }
 
-    out.sort_by(|a, b| a.report.id.cmp(&b.report.id));
-    Ok(out)
+    // A declared device nobody has probed yet still gets a row. Waiting for
+    // the first probe to make it appear looks exactly like the add having
+    // failed, which is the moment someone most needs to see that it worked.
+    for spec in &manifest.devices {
+        if seen.contains(&spec.id) {
+            continue;
+        }
+        out.push(DeviceView {
+            collector: pp_proto::AgentId::nil(),
+            collector_host: if spec.collector.is_empty() {
+                "the portal".to_string()
+            } else {
+                spec.collector.clone()
+            },
+            site: spec.site.clone(),
+            label: spec.label.clone(),
+            tags: spec.tags.clone(),
+            expect_version: spec.expect_version.clone(),
+            collectors: 1,
+            probed: false,
+            report: pp_proto::DeviceReport {
+                id: spec.id.clone(),
+                target: spec.target.clone(),
+                reachable: false,
+                firmware: None,
+                detail: String::new(),
+                latency_ms: None,
+                error: None,
+                drift: false,
+                updates: 0,
+                updates_known: false,
+                reboot_required: false,
+                eol: false,
+                eol_note: String::new(),
+                checked_at: chrono::DateTime::UNIX_EPOCH,
+            },
+        });
+    }
+
+    // One row per device, not one per collector that happened to probe it.
+    //
+    // A device with no collector named is probed by every agent in its site,
+    // which turned one firewall into thirteen identical rows. The newest
+    // report wins; `collectors` says how many machines are reporting, because
+    // more than one is worth noticing rather than hiding.
+    out.sort_by(|a, b| {
+        a.report
+            .id
+            .cmp(&b.report.id)
+            .then(b.report.checked_at.cmp(&a.report.checked_at))
+    });
+    let mut deduped: Vec<DeviceView> = Vec::new();
+    for mut view in out {
+        match deduped.last_mut() {
+            Some(prev) if prev.report.id == view.report.id => prev.collectors += 1,
+            _ => {
+                view.collectors = 1;
+                deduped.push(view);
+            }
+        }
+    }
+    Ok(deduped)
 }
 
 #[derive(Serialize)]
@@ -373,6 +753,57 @@ async fn devices(State(state): State<SharedState>) -> ApiResult<Json<DevicesResp
     }
 
     Ok(Json(DevicesResponse { devices, unmanaged }))
+}
+
+#[derive(Deserialize)]
+struct RenameRequest {
+    to: String,
+}
+
+/// Change a device's id, taking its history with it.
+async fn rename_device(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Json(req): Json<RenameRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let to = req.to.trim().to_string();
+    if to.is_empty() {
+        return Err(ApiError::bad_request("the new id cannot be empty"));
+    }
+    if to == id {
+        return Ok(Json(json!({ "renamed": false })));
+    }
+
+    let mut manifest = state.db.manifest()?;
+    if manifest.devices.iter().any(|d| d.id == to) {
+        return Err(ApiError::conflict(format!(
+            "there is already a device called {to}"
+        )));
+    }
+    let Some(dev) = manifest.devices.iter_mut().find(|d| d.id == id) else {
+        return Err(ApiError::not_found("no such device"));
+    };
+    dev.id = to.clone();
+
+    let moved = state.db.rename_device(&id, &to)?;
+    let stored = state.db.put_manifest(manifest)?;
+    state.hub.broadcast(&ServerMsg::Manifest(stored.clone()));
+
+    Ok(Json(json!({
+        "renamed": true,
+        "from": id,
+        "to": to,
+        "history_moved": moved,
+        "revision": stored.revision,
+    })))
+}
+
+/// What a device has looked like over time.
+async fn device_history(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<crate::db::DeviceProbeRow>>> {
+    Ok(Json(state.db.device_history(&id, 50)?))
 }
 
 // ---------------------------------------------------------------------------
@@ -547,6 +978,29 @@ async fn dispatch(
         return Err(ApiError::conflict(
             "agent is not connected; commands are not queued",
         ));
+    }
+
+    // One changing command at a time. Two apt runs collide on the dpkg lock,
+    // and a reboot in the middle of a release upgrade is worse than that: the
+    // machine comes back half-migrated. Scans and an agent restart stay
+    // available, the restart deliberately - it is the way out when something
+    // is wedged.
+    const ALWAYS: [&str; 4] = [
+        "collect_inventory",
+        "probe_devices",
+        "discover",
+        "restart_agent",
+    ];
+    let kind = crate::db::command_kind(&req.command);
+    if !ALWAYS.contains(&kind) {
+        if let Some(run) = state.db.running_for(id)? {
+            return Err(ApiError::conflict(format!(
+                "{} is already running on this machine (activity {}). Wait for it to finish, \
+                 or restart the agent if it is stuck.",
+                run.kind,
+                &run.id.to_string()[..8]
+            )));
+        }
     }
 
     let cmd_id = Uuid::new_v4();

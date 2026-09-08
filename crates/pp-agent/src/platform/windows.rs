@@ -6,7 +6,9 @@
 //! without it still reports full inventory, it just cannot apply OS patches.
 
 use anyhow::{Context, Result};
-use pp_proto::{AppSource, AvailableUpdate, Ensure, Package, ScanIssue};
+use pp_proto::{
+    AppSource, AvailableUpdate, BootReport, Ensure, Guest, Package, ScanIssue, Virtualization,
+};
 use serde::Deserialize;
 
 use super::{AppOutcome, Backend, Platform};
@@ -284,27 +286,158 @@ pub async fn install_prerequisites(p: &Progress) -> Result<String> {
     }
 }
 
+/// Does this machine host virtual machines, or is it one?
+///
+/// The same question as on Linux, asked the Windows way: Hyper-V exposes its
+/// guests through a PowerShell module that only exists when the role is
+/// installed, and the firmware tells any machine whether it is itself running
+/// under a hypervisor.
+pub async fn virtualization(p: &Progress) -> Option<Virtualization> {
+    let script = concat!(
+        "$out = [ordered]@{ guest = $false; model = ''; guests = @() }; ",
+        "$cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue; ",
+        "if ($cs) { $out.guest = [bool]$cs.HypervisorPresent; $out.model = \"$($cs.Manufacturer) $($cs.Model)\" } ",
+        "if (Get-Command Get-VM -ErrorAction SilentlyContinue) { ",
+        "  $out.guests = @(Get-VM -ErrorAction SilentlyContinue | ",
+        "    Select-Object @{n='id';e={$_.Id.ToString()}}, @{n='name';e={$_.Name}}, ",
+        "                  @{n='state';e={$_.State.ToString()}}) } ",
+        "$out | ConvertTo-Json -Depth 4 -Compress"
+    );
+    let o = ps(script, p).await.ok()?;
+    if !o.ok() {
+        return None;
+    }
+
+    #[derive(serde::Deserialize)]
+    struct WinGuest {
+        id: String,
+        name: String,
+        state: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Report {
+        guest: bool,
+        #[serde(default)]
+        model: String,
+        #[serde(default)]
+        guests: Vec<WinGuest>,
+    }
+
+    // ps_json always hands back a list, even for a single object.
+    let r: Report = ps_json(&o.text).ok()?.into_iter().next()?;
+    let host = !r.guests.is_empty();
+
+    // HypervisorPresent is true on a Hyper-V host as well as inside a VM, so
+    // it only means "guest" when this machine is not the one doing the
+    // hosting. Saying a hypervisor is a guest of itself helps nobody.
+    let role = match (host, r.guest) {
+        (true, _) => "host",
+        (false, true) => "guest",
+        _ => return None,
+    };
+
+    Some(Virtualization {
+        role: role.to_string(),
+        platform: if host {
+            "hyper-v".to_string()
+        } else if r.model.trim().is_empty() {
+            "a hypervisor".to_string()
+        } else {
+            r.model.trim().to_string()
+        },
+        guests: r
+            .guests
+            .into_iter()
+            .map(|g| Guest {
+                id: g.id,
+                name: g.name,
+                kind: "hyper-v".into(),
+                state: g.state,
+                managed: false,
+            })
+            .collect(),
+        note: String::new(),
+    })
+}
+
+/// Why this machine last restarted, from the System event log.
+///
+/// Windows is unusually good about this: it records an explicit "the previous
+/// shutdown was unexpected" event, and a bugcheck event carrying the stop code
+/// when a crash was the cause. The events outlive the reboot, which is exactly
+/// what makes them worth reading.
+pub async fn boot_report(p: &Progress) -> Option<BootReport> {
+    // 1074 planned shutdown, 6008 previous shutdown was unexpected,
+    // 41 kernel power (lost power or bugchecked), 1001 bugcheck details.
+    let script = concat!(
+        "$ids = 1074,6008,41,1001; ",
+        "Get-WinEvent -FilterHashtable @{LogName='System'; Id=$ids} -MaxEvents 12 ",
+        "-ErrorAction SilentlyContinue | ",
+        "Select-Object Id, TimeCreated, ",
+        "@{n='Message';e={($_.Message -split \"`r`n\")[0]}} | ConvertTo-Json -Compress"
+    );
+    let o = ps(script, p).await.ok()?;
+    if !o.ok() {
+        return None;
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Ev {
+        #[serde(rename = "Id")]
+        id: u32,
+        #[serde(rename = "TimeCreated")]
+        time: Option<String>,
+        #[serde(rename = "Message")]
+        message: Option<String>,
+    }
+
+    let events: Vec<Ev> = ps_json(&o.text).unwrap_or_default();
+    if events.is_empty() {
+        return None;
+    }
+
+    // Newest first, which is how Get-WinEvent returns them.
+    let newest = events.first()?;
+    let line = |e: &Ev| {
+        format!(
+            "{}  event {}  {}",
+            e.time.clone().unwrap_or_default(),
+            e.id,
+            e.message.clone().unwrap_or_default()
+        )
+    };
+    let detail = events.iter().take(6).map(line).collect::<Vec<_>>().join("\n");
+
+    let bugcheck = events.iter().find(|e| e.id == 1001);
+    let unexpected = matches!(newest.id, 6008 | 41 | 1001);
+
+    Some(BootReport {
+        unexpected,
+        summary: match newest.id {
+            1001 => "bugcheck (blue screen)".into(),
+            6008 => "previous shutdown was unexpected".into(),
+            41 => "lost power or stopped responding".into(),
+            _ => "clean shutdown".into(),
+        },
+        detail: if let Some(b) = bugcheck {
+            format!("{}\n\n{}", line(b), detail)
+        } else {
+            detail
+        },
+    })
+}
+
 pub async fn available_updates(
     pf: &Platform,
     p: &Progress,
 ) -> Result<(Vec<AvailableUpdate>, Vec<ScanIssue>)> {
     let mut out = Vec::new();
-    let issues = Vec::new();
+    let mut issues = Vec::new();
 
     if pf.has(Backend::Winget) {
-        let o = exec::run(
-            &winget_path().unwrap_or_else(|| "winget.exe".into()),
-            &[
-                "upgrade",
-                "--include-unknown",
-                "--disable-interactivity",
-                "--accept-source-agreements",
-            ],
-            p,
-        )
-        .await?;
-        // winget exits non-zero when nothing is upgradable; that is not a fault.
-        out.extend(parse_winget_table(&o.text));
+        let (found, text) = winget_scan(p).await;
+        out.extend(found);
+        issues.extend(winget_blocked(&text));
     }
 
     if pf.has(Backend::WindowsUpdate) {
@@ -332,6 +465,75 @@ pub async fn available_updates(
     }
 
     Ok((out, issues))
+}
+
+/// Ask winget what it would upgrade, returning the parsed rows along with the
+/// raw output: the footers underneath the table say things the table does not.
+async fn winget_scan(p: &Progress) -> (Vec<AvailableUpdate>, String) {
+    let Ok(o) = exec::run(
+        &winget_path().unwrap_or_else(|| "winget.exe".into()),
+        &[
+            "upgrade",
+            "--include-unknown",
+            "--disable-interactivity",
+            "--accept-source-agreements",
+        ],
+        p,
+    )
+    .await
+    else {
+        return (Vec::new(), String::new());
+    };
+    // winget exits non-zero when nothing is upgradable; that is not a fault.
+    (parse_winget_table(&o.text), o.text)
+}
+
+async fn winget_pending(p: &Progress) -> Vec<AvailableUpdate> {
+    winget_scan(p).await.0
+}
+
+/// winget will not replace a package whose new version ships as a different
+/// kind of installer - an MSI superseded by an MSIX, most often - because
+/// doing so means uninstalling first, which it refuses to decide on its own.
+///
+/// It says so only in a footer, and the package stays in the upgrade table
+/// forever. Left alone it is a pending update that no amount of pressing
+/// Install updates will ever clear, so name the condition and say what
+/// actually resolves it.
+fn winget_blocked(text: &str) -> Vec<ScanIssue> {
+    let Some(line) = text
+        .lines()
+        .map(str::trim)
+        .find(|l| l.contains("different install technology"))
+    else {
+        return Vec::new();
+    };
+
+    let n = line
+        .split_whitespace()
+        .next()
+        .and_then(|w| w.parse::<u32>().ok())
+        .unwrap_or(1);
+
+    vec![ScanIssue {
+        backend: "winget".into(),
+        problem: format!(
+            "{n} application(s) cannot be upgraded in place: the newer version ships as a \
+             different kind of installer (an MSI replaced by an MSIX, usually)"
+        ),
+        remedy: format!(
+            "These stay in the pending list no matter how many times updates are installed, \
+             because winget will not uninstall an application to upgrade it.\n\n\
+             winget said:\n  {line}\n\n\
+             To clear it, on this machine run:\n  \
+             winget upgrade --include-unknown\n\
+             then, for the application that will not move:\n  \
+             winget uninstall --id <Id>\n  \
+             winget install --id <Id>\n\n\
+             Uninstalling removes that application's settings in some cases, which is why \
+             PatchPanel will not do it for you."
+        ),
+    }]
 }
 
 /// winget prints a fixed-width table with no machine-readable alternative for
@@ -429,6 +631,47 @@ pub async fn apply_patches(
             )
             .await?;
             log.push(format!("winget upgrade --all (exit {})", o.code));
+
+            // winget names the packages it is about to upgrade, and separately
+            // reports a count of the ones it refused without saying which.
+            // Asking again afterwards settles it: whatever is still offered at
+            // the same version did not move, whatever the exit code claimed.
+            let attempted = parse_winget_table(&o.text);
+            let remaining = winget_pending(p).await;
+            let stuck: Vec<&AvailableUpdate> = attempted
+                .iter()
+                .filter(|a| {
+                    remaining
+                        .iter()
+                        .any(|r| r.name == a.name && r.new_version == a.new_version)
+                })
+                .collect();
+
+            // The footer explaining why is otherwise the last line of a wall
+            // of output, where nobody looking for a reason will find it.
+            for issue in winget_blocked(&o.text) {
+                log.push(format!("\n{}\n{}", issue.problem, issue.remedy));
+            }
+            if !stuck.is_empty() {
+                let names = stuck
+                    .iter()
+                    .map(|u| {
+                        let from = if u.current_version.is_empty() {
+                            "unknown"
+                        } else {
+                            &u.current_version
+                        };
+                        format!("  {} ({from} -> {})", u.name, u.new_version)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                log.push(format!(
+                    "\nstill offered after the run, so nothing was installed:\n{names}\n\n\
+                     Pressing Install updates again will do exactly the same thing. Each of \
+                     these has to be uninstalled and reinstalled by hand, or pinned with \
+                     `winget pin add --id <Id>` if you would rather it stopped being offered."
+                ));
+            }
             log.push(exec::tail(&o.text, 3000));
         } else {
             for id in only.iter().filter(|i| !exclude.contains(i)) {
@@ -633,4 +876,46 @@ async fn winget_installed_version(id: &str, p: &Progress) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shape winget prints in practice: a normal upgrade table, and a
+    /// footer that is the only mention of the package it will not touch.
+    const BLOCKED: &str = "Name              Id                   Version   Available Source
+-------------------------------------------------------------------------
+Some App          Vendor.SomeApp       1.0.0     1.1.0     winget
+2 upgrades available.
+1 package(s) have upgrades blocked because newer versions use a different install technology than the current installation. Uninstall each package, then install the newer version.
+";
+
+    #[test]
+    fn names_the_install_technology_block() {
+        let issues = winget_blocked(BLOCKED);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].backend, "winget");
+        assert!(issues[0].problem.starts_with("1 application(s)"), "{}", issues[0].problem);
+        // The operator needs winget's own words, not only our paraphrase.
+        assert!(issues[0].remedy.contains("different install technology"));
+        assert!(issues[0].remedy.contains("winget uninstall --id"));
+    }
+
+    #[test]
+    fn a_clean_machine_raises_nothing() {
+        assert!(winget_blocked("No installed package found matching input criteria.").is_empty());
+        assert!(winget_blocked("").is_empty());
+    }
+
+    #[test]
+    fn the_footer_is_not_parsed_as_a_package() {
+        // Both trailing lines look enough like table rows to be caught by a
+        // column slice, and a phantom package would be a pending update that
+        // can never be installed.
+        let rows = parse_winget_table(BLOCKED);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].name, "Vendor.SomeApp");
+        assert_eq!(rows[0].new_version, "1.1.0");
+    }
 }
