@@ -5,11 +5,16 @@
 //! keeps every connected agent converged on it.
 
 mod api;
+mod attention;
+mod logscan;
+mod syslog;
 mod db;
 mod hub;
 mod install;
 mod state;
+mod pools;
 mod ui;
+mod versions;
 mod ws;
 
 use std::net::SocketAddr;
@@ -65,6 +70,23 @@ struct Cli {
     #[arg(long, default_value = "/var/lib/patchpanel-portal/agents", env = "PATCHPANEL_AGENT_DIR")]
     agent_dir: PathBuf,
 
+    /// Accept syslog from devices on this address, and keep a rolling day of it.
+    ///
+    /// Off unless given: this opens an unauthenticated socket that anything on
+    /// the network can write to, which is a choice rather than a default. 514 is
+    /// the port devices use without being told otherwise, and the shipped unit
+    /// grants CAP_NET_BIND_SERVICE so a non-root portal can take it.
+    #[arg(long, env = "PATCHPANEL_SYSLOG_BIND")]
+    syslog_bind: Option<SocketAddr>,
+
+    /// Where those lines are written, one plain file per sender.
+    #[arg(
+        long,
+        default_value = "/var/lib/patchpanel-portal/logs",
+        env = "PATCHPANEL_LOG_DIR"
+    )]
+    log_dir: PathBuf,
+
     #[arg(long, default_value = "info")]
     log: String,
 }
@@ -107,6 +129,8 @@ async fn main() -> Result<()> {
         admin_token: admin_token.clone(),
         require_admin_auth,
         agent_dir: cli.agent_dir.clone(),
+        log_dir: cli.log_dir.clone(),
+        syslog_on: cli.syslog_bind.is_some(),
         public_host: if cli.bind.ip().is_unspecified() {
             format!("{}:{}", hostname(), cli.bind.port())
         } else {
@@ -130,6 +154,17 @@ async fn main() -> Result<()> {
         .merge(api::routes(state.clone()))
         .merge(ui::routes())
         .layer(TraceLayer::new_for_http());
+
+    // Vendor versions for anything the package managers cannot speak for.
+    versions::spawn(state.clone());
+    // And the pools that patch on a schedule.
+    pools::spawn(state.clone());
+
+    if let Some(bind) = cli.syslog_bind {
+        syslog::spawn(state.clone(), bind, cli.log_dir.clone());
+    } else {
+        tracing::debug!("syslog receiver is off; pass --syslog-bind to accept device logs");
+    }
 
     let listener = tokio::net::TcpListener::bind(cli.bind)
         .await

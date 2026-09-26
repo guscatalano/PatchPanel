@@ -26,6 +26,12 @@ pub struct AppState {
     /// Fallback address used in generated install scripts when a client sends
     /// no `Host:` header. Normally the request's own Host wins.
     pub public_host: String,
+    /// Where received syslog is written, one file per sender. Empty when the
+    /// receiver is off.
+    pub log_dir: std::path::PathBuf,
+    /// Whether anything is listening for syslog at all, so the page can say
+    /// "off" rather than "nothing has arrived".
+    pub syslog_on: bool,
 }
 
 pub type SharedState = Arc<AppState>;

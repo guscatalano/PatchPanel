@@ -64,10 +64,45 @@ pub struct AgentRow {
     pub held_back_count: usize,
     /// Upgrades nothing will apply, so the pending count can never reach zero.
     pub deferred_count: usize,
+    /// Updates a run was asked to install and that did not move. This is the
+    /// most red-worthy fact the system holds - something tried and failed,
+    /// silently - and until now it was invisible until you opened the machine.
+    #[serde(default)]
+    pub blocked_count: usize,
+    /// Updates deliberately set aside. They are subtracted from every other
+    /// count, so without this number a machine whose only pending updates are
+    /// ignored reads "none", which is the one thing this product must not say.
+    #[serde(default)]
+    pub ignored_count: usize,
+    /// Set when dpkg is stuck part-way through an upgrade: nothing else on
+    /// this machine can run until it is finished or rolled back.
+    #[serde(default)]
+    pub mid_upgrade: bool,
     /// Virtual machines this host runs, and how many of them PatchPanel has
     /// never heard from. A hypervisor is the only place an unmanaged machine
     /// is visible at all.
+    /// Which pool this machine is in, and when it was last patched. Both live
+    /// on the row so the fleet table can answer "is the schedule working"
+    /// without opening thirteen pages.
     #[serde(default)]
+    pub pool: String,
+    #[serde(default)]
+    pub last_patched: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_patch_ok: Option<bool>,
+    /// Whether anything is expected of a person about this machine's updates:
+    /// `yours` (nothing is scheduled), `scheduled` (a pool has it in hand),
+    /// `missed` (a run happened and left it behind), `failed` (the last run
+    /// failed), or `clean`.
+    #[serde(default)]
+    pub patch_state: String,
+    /// The human half of that: when the next run is, or what went wrong.
+    #[serde(default)]
+    pub patch_note: String,
+    /// The same thing in a few words, for a table cell. A sentence in a cell
+    /// wraps to three lines and makes the row unreadable.
+    #[serde(default)]
+    pub patch_short: String,
     pub guest_count: usize,
     #[serde(default)]
     pub unmanaged_guests: usize,
@@ -88,6 +123,37 @@ pub struct RunningCommand {
     pub id: Uuid,
     pub kind: String,
     pub started_at: DateTime<Utc>,
+}
+
+/// What someone decided about one guest's backups.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupRule {
+    /// Why, in their words. Worth keeping: "why is that not backed up" is a
+    /// question that gets asked six months later, by which time the reason is
+    /// the only part anyone needs.
+    pub reason: String,
+    /// How many days may pass before it counts as a gap. 0 means never count
+    /// it at all.
+    pub every_days: i64,
+    /// Quiet until this moment, then back to normal by itself.
+    ///
+    /// A snooze that does not expire is just hiding, and hiding is how a
+    /// dashboard starts lying. This one has a date on it and the row says
+    /// what that date is.
+    #[serde(default)]
+    pub snooze_until: Option<DateTime<Utc>>,
+}
+
+/// The newest version a vendor publishes for a watched application.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatestVersion {
+    pub name: String,
+    pub version: String,
+    pub checked_at: DateTime<Utc>,
+    pub error: Option<String>,
+    /// Where this answer came from, so a changed check is refetched at once.
+    #[serde(default)]
+    pub url: String,
 }
 
 /// An update somebody decided not to install, at a particular version.
@@ -114,6 +180,10 @@ pub struct DeviceProbeRow {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CommandRow {
+    /// Who asked: empty or "manual" for a person, "pool:<name>" for a
+    /// scheduled run.
+    #[serde(default)]
+    pub source: String,
     pub id: Uuid,
     pub agent_id: AgentId,
     pub kind: String,
@@ -123,6 +193,52 @@ pub struct CommandRow {
     pub summary: String,
     pub detail: String,
     pub progress: String,
+}
+
+/// Something outside PatchPanel that is supposed to happen on a schedule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Job {
+    pub name: String,
+    /// How often it is meant to run. 0 means nobody said, so it can be late
+    /// but never overdue - the portal will not invent an expectation.
+    pub every_hours: i64,
+    pub first_seen: DateTime<Utc>,
+    pub last_at: Option<DateTime<Utc>>,
+    pub last_ok: Option<bool>,
+    pub last_detail: String,
+    /// What it reported about the world, newest values.
+    pub facts: std::collections::BTreeMap<String, String>,
+    /// Somebody said they do not want to hear about this one. It still runs,
+    /// still reports, and still keeps its history - it simply stops asking
+    /// for attention.
+    #[serde(default)]
+    pub muted: bool,
+    /// The last run said it worked, and its own output contradicted it.
+    #[serde(default)]
+    pub last_suspect: bool,
+}
+
+/// One recorded run of an external job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRun {
+    pub at: DateTime<Utc>,
+    pub ok: bool,
+    pub detail: String,
+    /// What it printed, as far back as it was willing to send. Empty for runs
+    /// old enough to have been pruned, and for jobs that never send one.
+    #[serde(default)]
+    pub log: String,
+    /// Reported ok while its own output reported problems.
+    #[serde(default)]
+    pub suspect: bool,
+}
+
+/// One change to one of a job's facts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobFactChange {
+    pub key: String,
+    pub value: String,
+    pub at: DateTime<Utc>,
 }
 
 /// A published agent build, used to drive self-update.
@@ -215,6 +331,20 @@ impl Db {
             CREATE INDEX IF NOT EXISTS device_probes_by_time
                 ON device_probes (device_id, checked_at DESC);
 
+            -- The last reading that actually succeeded.
+            --
+            -- A probe that fails tells you the device did not answer. It does
+            -- not tell you the firewall stopped being end of life, or that its
+            -- ninety-one pending updates were installed - but overwriting the
+            -- report with the failure said exactly that, and every appliance
+            -- card went blank the moment the collector had a bad minute.
+            -- Absence of news is not news.
+            CREATE TABLE IF NOT EXISTS device_last_good (
+                device_id TEXT PRIMARY KEY,
+                seen_at   TEXT NOT NULL,
+                report    TEXT NOT NULL
+            );
+
             -- How long each scan problem has been going on. A mirror that
             -- answers "service unavailable" once and works on the next try is
             -- not a coverage gap, and warning about it teaches people to
@@ -241,6 +371,124 @@ impl Db {
                 PRIMARY KEY (agent_id, name, source, version)
             );
 
+            -- The newest version a vendor publishes, fetched once for the
+            -- whole fleet rather than by every agent that runs the software.
+            CREATE TABLE IF NOT EXISTS version_latest (
+                name       TEXT PRIMARY KEY,
+                version    TEXT NOT NULL DEFAULT '',
+                checked_at TEXT NOT NULL,
+                error      TEXT,
+                -- The URL the answer came from. Editing a check has to take
+                -- effect now, not in twelve hours' time when the cache expires
+                -- - otherwise correcting a wrong source appears to do nothing.
+                url        TEXT NOT NULL DEFAULT ''
+            );
+
+            -- Patching policy, and which machines it applies to. A machine
+            -- belongs to at most one pool: two rules with different reboot
+            -- policies make "why did that restart" unanswerable.
+            CREATE TABLE IF NOT EXISTS pools (
+                name        TEXT PRIMARY KEY,
+                scope       TEXT NOT NULL DEFAULT 'none',
+                reboot      TEXT NOT NULL DEFAULT 'never',
+                schedule    TEXT NOT NULL DEFAULT '{"kind":"manual"}',
+                concurrency INTEGER NOT NULL DEFAULT 1,
+                exclude     TEXT NOT NULL DEFAULT '[]',
+                last_run    TEXT
+            );
+            CREATE TABLE IF NOT EXISTS pool_members (
+                agent_id TEXT PRIMARY KEY,
+                pool     TEXT NOT NULL
+            );
+
+            -- How often each guest is actually meant to be backed up.
+            --
+            -- Started life as a yes/no exemption, which forced a choice
+            -- between being nagged on everyone else's schedule and vanishing
+            -- from the count entirely. Most guests are neither: a scratch VM
+            -- genuinely does not need backing up, but plenty of others just
+            -- need it less often than the default, and calling those a gap
+            -- every week teaches people to ignore the number - which is the
+            -- same failure as not counting them at all.
+            --
+            -- `every_days` is the window: 0 means do not track this one.
+            -- Absent means the fleet default.
+            CREATE TABLE IF NOT EXISTS backup_exempt (
+                host     TEXT NOT NULL,
+                guest    TEXT NOT NULL,
+                reason   TEXT NOT NULL DEFAULT '',
+                since    TEXT NOT NULL,
+                PRIMARY KEY (host, guest)
+            );
+
+            -- Work PatchPanel does not do, reported by whatever does.
+            --
+            -- A cron job that backs up the routers and updates dynamic DNS is
+            -- invisible from here, and the failure mode that matters is not
+            -- the one it can report: a script that errors can shout, but a
+            -- script that stopped running entirely - disabled unit, full disk,
+            -- rebuilt box - says nothing at all, and silence reads exactly
+            -- like success. `every_hours` is what turns that silence into a
+            -- statement, by making an absent check-in a thing the portal can
+            -- notice on the job's behalf.
+            CREATE TABLE IF NOT EXISTS jobs (
+                name        TEXT PRIMARY KEY,
+                every_hours INTEGER NOT NULL DEFAULT 0,
+                first_seen  TEXT NOT NULL,
+                last_at     TEXT,
+                last_ok     INTEGER,
+                last_detail TEXT NOT NULL DEFAULT '',
+                facts       TEXT NOT NULL DEFAULT '{}'
+            );
+
+            -- Every check-in, so the calendar can show that it ran on the days
+            -- it ran. Unlike a device probe, "nothing changed" is the whole
+            -- point here, so these are not deduplicated.
+            CREATE TABLE IF NOT EXISTS job_runs (
+                name   TEXT NOT NULL,
+                at     TEXT NOT NULL,
+                ok     INTEGER NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (name, at)
+            );
+            CREATE INDEX IF NOT EXISTS job_runs_by_time ON job_runs (at DESC);
+
+            -- Facts a job reports about the world - a public IP, a record
+            -- count. Written only when the value actually moves, so the table
+            -- is a history of changes rather than of check-ins.
+            CREATE TABLE IF NOT EXISTS job_facts (
+                name  TEXT NOT NULL,
+                key   TEXT NOT NULL,
+                value TEXT NOT NULL,
+                at    TEXT NOT NULL,
+                PRIMARY KEY (name, key, at)
+            );
+
+            -- Which machines have been asked to forward their journal.
+            --
+            -- Held here rather than on the agent, for the reason that has caught
+            -- this project four times: an agent restarts and forgets, and a
+            -- portal that reads "off" from that amnesia is confidently wrong.
+            -- The portal re-asks on every connection instead, so the switch
+            -- survives a restart, a self-update and a reboot without the agent
+            -- having to remember anything at all.
+            CREATE TABLE IF NOT EXISTS log_forward (
+                agent_id     TEXT PRIMARY KEY,
+                min_severity TEXT NOT NULL DEFAULT 'warning',
+                since        TEXT NOT NULL
+            );
+
+            -- How long one sender's lines are kept.
+            --
+            -- Per sender rather than one global number, because the senders are
+            -- not alike: a firewall forwarding its filter log produces a day in
+            -- an hour, while a quiet host could keep a week in the same space.
+            -- Absent means the default.
+            CREATE TABLE IF NOT EXISTS log_retention (
+                source TEXT PRIMARY KEY,
+                hours  INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS agent_builds (
                 version TEXT NOT NULL,
                 os      TEXT NOT NULL,
@@ -263,6 +511,85 @@ impl Db {
             if conn.prepare(&probe).is_err() {
                 conn.execute(ddl, [])?;
                 tracing::info!(column = col, "added agents column");
+            }
+        }
+
+        // Same for tables that gained a column after they first shipped.
+        // `CREATE TABLE IF NOT EXISTS` leaves an existing table alone, so a
+        // database created before the column existed would fail every query
+        // that reads it - silently, since the caller treats an error as "no
+        // data" and shows nothing.
+        for (table, col, ddl) in [
+            (
+                "version_latest",
+                "url",
+                "ALTER TABLE version_latest ADD COLUMN url TEXT NOT NULL DEFAULT ''",
+            ),
+            // Who asked for a command. Without it a scheduled run and a button
+            // press are indistinguishable afterwards, which makes "is the
+            // schedule actually working" a question nobody can answer.
+            (
+                "commands",
+                "source",
+                "ALTER TABLE commands ADD COLUMN source TEXT NOT NULL DEFAULT ''",
+            ),
+            // How often this guest is meant to be backed up. Existing rows
+            // are all "never" decisions, and 0 is exactly that.
+            (
+                "backup_exempt",
+                "every_days",
+                "ALTER TABLE backup_exempt ADD COLUMN every_days INTEGER NOT NULL DEFAULT 0",
+            ),
+            // "I know, tell me later." Different from a cadence, which says
+            // how often you want the backup, and different from not tracking
+            // it, which says never ask again. This one expires on its own.
+            // What the run actually printed. Worth keeping next to the run
+            // rather than only the two-line summary: the summary says a backup
+            // failed, the log says which router refused and why.
+            // Jobs somebody has decided not to be told about. Kept listed and
+            // still recorded - a decision, not a disappearance - but out of
+            // the attention list and out of the badge.
+            (
+                "jobs",
+                "muted",
+                "ALTER TABLE jobs ADD COLUMN muted INTEGER NOT NULL DEFAULT 0",
+            ),
+            // Reported ok, but the output disagreed. Stored rather than
+            // recomputed, so the page and the badge cannot read one run two
+            // different ways.
+            // Left in place for databases that already have it: dropping a
+            // column in SQLite means rebuilding the table, and one nothing
+            // reads costs nothing.
+            (
+                "jobs",
+                "rules",
+                "ALTER TABLE jobs ADD COLUMN rules TEXT NOT NULL DEFAULT '[]'",
+            ),
+            (
+                "jobs",
+                "last_suspect",
+                "ALTER TABLE jobs ADD COLUMN last_suspect INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "job_runs",
+                "suspect",
+                "ALTER TABLE job_runs ADD COLUMN suspect INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "job_runs",
+                "log",
+                "ALTER TABLE job_runs ADD COLUMN log TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "backup_exempt",
+                "snooze_until",
+                "ALTER TABLE backup_exempt ADD COLUMN snooze_until TEXT NOT NULL DEFAULT ''",
+            ),
+        ] {
+            let probe = format!("SELECT {col} FROM {table} LIMIT 1");
+            if conn.prepare(&probe).is_err() {
+                conn.execute(ddl, [])?;
+                tracing::info!(table, column = col, "added column");
             }
         }
 
@@ -352,6 +679,259 @@ impl Db {
 
     // -- inventory ----------------------------------------------------------
 
+    // -----------------------------------------------------------------
+    // Pools
+    // -----------------------------------------------------------------
+
+    pub fn pools(&self) -> Result<Vec<crate::pools::Pool>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT name, scope, reboot, schedule, concurrency, exclude, last_run
+             FROM pools ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let schedule: String = r.get(3)?;
+            let exclude: String = r.get(5)?;
+            let last: Option<String> = r.get(6)?;
+            Ok(crate::pools::Pool {
+                name: r.get(0)?,
+                scope: serde_json::from_value(serde_json::Value::String(r.get(1)?))
+                    .unwrap_or(crate::pools::Scope::None),
+                reboot: serde_json::from_value(serde_json::Value::String(r.get(2)?))
+                    .unwrap_or(crate::pools::RebootPolicy::Never),
+                schedule: serde_json::from_str(&schedule)
+                    .unwrap_or(crate::pools::Schedule::Manual),
+                concurrency: r.get::<_, i64>(4)?.max(1) as usize,
+                exclude: serde_json::from_str(&exclude).unwrap_or_default(),
+                last_run: last.map(|t| parse_time(&t)),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// What is expected of one guest's backups.
+    ///
+    /// Absent means the fleet default. `every_days` of 0 means this guest is
+    /// not tracked at all - a decision, recorded with its reason, rather than
+    /// a guest quietly dropped from the list.
+    pub fn backup_rules(&self) -> Result<std::collections::HashMap<String, BackupRule>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT host, guest, reason, every_days, snooze_until FROM backup_exempt")?;
+        let rows = stmt.query_map([], |r| {
+            let until: String = r.get(4)?;
+            Ok((
+                format!("{}/{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?),
+                BackupRule {
+                    reason: r.get(2)?,
+                    every_days: r.get(3)?,
+                    snooze_until: (!until.is_empty()).then(|| parse_time(&until)),
+                },
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?)
+    }
+
+    pub fn set_backup_rule(
+        &self,
+        host: &str,
+        guest: &str,
+        reason: &str,
+        every_days: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        // Setting a cadence answers the question a snooze was deferring, so
+        // it clears one rather than leaving two rules disagreeing.
+        conn.execute(
+            "INSERT OR REPLACE INTO backup_exempt
+                (host, guest, reason, since, every_days, snooze_until)
+             VALUES (?1, ?2, ?3, ?4, ?5, '')",
+            params![host, guest, reason, Utc::now().to_rfc3339(), every_days],
+        )?;
+        Ok(())
+    }
+
+    /// Go quiet about this guest until a date, keeping everything else.
+    pub fn snooze_backup(&self, host: &str, guest: &str, until: DateTime<Utc>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT reason, every_days FROM backup_exempt WHERE host = ?1 AND guest = ?2",
+                params![host, guest],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        // A snoozed guest with no rule of its own is still on the fleet
+        // default, not exempt - the default has to be written explicitly or
+        // `every_days` of 0 would silently mean "never track this again".
+        let (reason, every_days) = existing.unwrap_or_else(|| (String::new(), -1));
+        conn.execute(
+            "INSERT OR REPLACE INTO backup_exempt
+                (host, guest, reason, since, every_days, snooze_until)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                host,
+                guest,
+                reason,
+                Utc::now().to_rfc3339(),
+                every_days,
+                until.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_backup_rule(&self, host: &str, guest: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "DELETE FROM backup_exempt WHERE host = ?1 AND guest = ?2",
+            params![host, guest],
+        )?)
+    }
+
+    /// When each machine last had a patch run, and whether it worked.
+    pub fn last_patch_runs(
+        &self,
+    ) -> Result<std::collections::HashMap<String, (DateTime<Utc>, Option<bool>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, MAX(created_at), ok FROM commands
+             WHERE kind = 'apply_patches' GROUP BY agent_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let ok: Option<i64> = r.get(2)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                (parse_time(&r.get::<_, String>(1)?), ok.map(|v| v != 0)),
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?)
+    }
+
+    pub fn put_pool(&self, pool: &crate::pools::Pool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        // Keep the existing last_run: editing a policy is not a run.
+        conn.execute(
+            "INSERT INTO pools (name, scope, reboot, schedule, concurrency, exclude)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(name) DO UPDATE SET
+                scope = ?2, reboot = ?3, schedule = ?4, concurrency = ?5, exclude = ?6",
+            params![
+                pool.name,
+                serde_json::to_value(pool.scope)?.as_str().unwrap_or("none"),
+                serde_json::to_value(pool.reboot)?.as_str().unwrap_or("never"),
+                serde_json::to_string(&pool.schedule)?,
+                pool.concurrency as i64,
+                serde_json::to_string(&pool.exclude)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_pool(&self, name: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM pool_members WHERE pool = ?1", params![name])?;
+        Ok(conn.execute("DELETE FROM pools WHERE name = ?1", params![name])? > 0)
+    }
+
+    pub fn set_pool_last_run(&self, name: &str, at: DateTime<Utc>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE pools SET last_run = ?2 WHERE name = ?1",
+            params![name, at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn pool_members(&self, name: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT agent_id FROM pool_members WHERE pool = ?1 ORDER BY agent_id")?;
+        let rows = stmt.query_map(params![name], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every machine's pool, for showing membership without a query per row.
+    pub fn pool_of_each(&self) -> Result<std::collections::HashMap<String, String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT agent_id, pool FROM pool_members")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?)
+    }
+
+    /// Move a machine into a pool, or out of every pool when `pool` is empty.
+    pub fn set_pool_member(&self, agent: AgentId, pool: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        if pool.is_empty() {
+            conn.execute(
+                "DELETE FROM pool_members WHERE agent_id = ?1",
+                params![agent.to_string()],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT OR REPLACE INTO pool_members (agent_id, pool) VALUES (?1, ?2)",
+                params![agent.to_string(), pool],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Has this machine had a patch run since `since`?
+    ///
+    /// The command log is the record of what a pool has already done, so there
+    /// is no separate run state to fall out of step with reality.
+    pub fn patched_since(&self, agent: AgentId, since: DateTime<Utc>) -> Result<bool> {
+        self.command_since(agent, since, "apply_patches")
+    }
+
+    pub fn rebooted_since(&self, agent: AgentId, since: DateTime<Utc>) -> Result<bool> {
+        self.command_since(agent, since, "reboot")
+    }
+
+    fn command_since(&self, agent: AgentId, since: DateTime<Utc>, kind: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM commands
+             WHERE agent_id = ?1 AND kind = ?2 AND created_at >= ?3",
+            params![agent.to_string(), kind, since.to_rfc3339()],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// What the vendor currently publishes for each watched application.
+    pub fn latest_versions(&self) -> Result<Vec<LatestVersion>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT name, version, checked_at, error, url FROM version_latest")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(LatestVersion {
+                name: r.get(0)?,
+                version: r.get(1)?,
+                checked_at: parse_time(&r.get::<_, String>(2)?),
+                error: r.get(3)?,
+                url: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn set_latest_version(
+        &self,
+        name: &str,
+        version: &str,
+        error: Option<&str>,
+        url: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO version_latest (name, version, checked_at, error, url)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, version, Utc::now().to_rfc3339(), error, url],
+        )?;
+        Ok(())
+    }
+
     /// Updates this machine's operator has set aside, and at which version.
     pub fn ignores(&self, id: AgentId) -> Result<Vec<IgnoredUpdate>> {
         let conn = self.conn.lock().unwrap();
@@ -398,13 +978,18 @@ impl Db {
     /// saying something about 4.6.2, and when 4.7 appears the question is
     /// worth asking again. Applied wherever an inventory is read, so the fleet
     /// counts and the machine page cannot disagree about what is pending.
-    fn hide_ignored(conn: &Connection, id: AgentId, inv: &mut Inventory) {
+    ///
+    /// Returns how many updates it removed. Subtracting silently is what made
+    /// an all-ignored machine read "none"; the count has to survive so the row
+    /// can say "none - 3 ignored" instead.
+    fn hide_ignored(conn: &Connection, id: AgentId, inv: &mut Inventory) -> usize {
         let Ok(ignores) = Self::ignores_with(conn, id) else {
-            return;
+            return 0;
         };
         if ignores.is_empty() {
-            return;
+            return 0;
         }
+        let before = inv.updates.len();
         inv.updates.retain(|u| {
             !ignores
                 .iter()
@@ -412,6 +997,7 @@ impl Db {
         });
         inv.blocked
             .retain(|n| !ignores.iter().any(|i| &i.name == n));
+        before - inv.updates.len()
     }
 
     /// Which scan problems have lasted long enough to be worth reporting.
@@ -489,13 +1075,20 @@ impl Db {
     /// report carries its own `checked_at`, so a stale one says so honestly.
     pub fn store_inventory(&self, id: AgentId, inv: &Inventory) -> Result<()> {
         let mut inv = inv.clone();
-        if inv.devices.is_empty() || inv.discovered.is_empty() {
+        if inv.devices.is_empty() || inv.discovered.is_empty() || inv.swept_at.is_none() {
             if let Some(prev) = self.inventory(id)? {
                 if inv.devices.is_empty() {
                     inv.devices = prev.devices;
                 }
                 if inv.discovered.is_empty() {
                     inv.discovered = prev.discovered;
+                }
+                // An agent that has restarted has not swept yet and reports no
+                // time, which is not the same as "never swept" - the hosts it
+                // carries forward were found at some point, and dropping the
+                // timestamp would present them as ageless.
+                if inv.swept_at.is_none() {
+                    inv.swept_at = prev.swept_at;
                 }
             }
         }
@@ -527,6 +1120,66 @@ impl Db {
     /// - reachability, version, update count or the error - and otherwise the
     /// existing row's timestamp is left alone as the last time it was seen
     /// this way.
+    /// Remember a reading that worked, so a later failure has something to
+    /// fall back to.
+    pub fn record_last_good(&self, report: &pp_proto::DeviceReport) -> Result<()> {
+        if !report.reachable {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO device_last_good (device_id, seen_at, report)
+             VALUES (?1, ?2, ?3)",
+            params![
+                report.id,
+                report.checked_at.to_rfc3339(),
+                serde_json::to_string(report)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The last successful reading for every device that has ever had one.
+    pub fn last_good_probes(&self) -> Result<std::collections::HashMap<String, pp_proto::DeviceReport>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT device_id, report FROM device_last_good")?;
+        let rows = stmt.query_map([], |r| {
+            let id: String = r.get(0)?;
+            let doc: String = r.get(1)?;
+            Ok((id, doc))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (id, doc) = row?;
+            if let Ok(report) = serde_json::from_str::<pp_proto::DeviceReport>(&doc) {
+                out.insert(id, report);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Forget a device entirely, including what it last looked like.
+    /// Drop remembered readings for devices no longer declared.
+    pub fn prune_last_good(&self, keep: &[String]) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT device_id FROM device_last_good")?;
+        let ids: Vec<String> = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        drop(stmt);
+        let mut gone = 0;
+        for id in ids {
+            if !keep.iter().any(|k| k == &id) {
+                conn.execute(
+                    "DELETE FROM device_last_good WHERE device_id = ?1",
+                    params![id],
+                )?;
+                gone += 1;
+            }
+        }
+        Ok(gone)
+    }
+
     pub fn record_probe(
         &self,
         collector: &str,
@@ -577,6 +1230,10 @@ impl Db {
     /// record - which is the one thing a history is for.
     pub fn rename_device(&self, from: &str, to: &str) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE OR REPLACE device_last_good SET device_id = ?2 WHERE device_id = ?1",
+            params![from, to],
+        )?;
         Ok(conn.execute(
             "UPDATE OR REPLACE device_probes SET device_id = ?2 WHERE device_id = ?1",
             params![from, to],
@@ -618,7 +1275,7 @@ impl Db {
             .flatten()
             .and_then(|t| serde_json::from_str::<Inventory>(&t).ok())
             .map(|mut inv| {
-                Self::hide_ignored(&conn, id, &mut inv);
+                let _ = Self::hide_ignored(&conn, id, &mut inv);
                 inv
             }))
     }
@@ -697,13 +1354,14 @@ impl Db {
             let boot_time: Option<String> = r.get(14)?;
 
             let last_seen = parse_time(&last_seen);
+            let mut ignored = 0;
             let inv: Option<Inventory> = inventory
                 .and_then(|t| serde_json::from_str::<Inventory>(&t).ok())
                 .map(|mut i| {
                     // The fleet counts have to agree with the machine page
                     // about what is pending, so the same filter runs here.
                     if let Ok(agent) = id.parse::<AgentId>() {
-                        Self::hide_ignored(&conn, agent, &mut i);
+                        ignored = Self::hide_ignored(&conn, agent, &mut i);
                     }
                     i
                 });
@@ -745,6 +1403,15 @@ impl Db {
                 scan_issue_count: inv.as_ref().map(|i| i.scan_issues.len()).unwrap_or(0),
                 held_back_count: inv.as_ref().map(|i| i.held_back.len()).unwrap_or(0),
                 deferred_count: inv.as_ref().map(|i| i.deferred.len()).unwrap_or(0),
+                blocked_count: inv.as_ref().map(|i| i.blocked.len()).unwrap_or(0),
+                ignored_count: ignored,
+                mid_upgrade: inv.as_ref().is_some_and(|i| i.mid_upgrade.is_some()),
+                pool: String::new(),
+                last_patched: None,
+                last_patch_ok: None,
+                patch_state: String::new(),
+                patch_note: String::new(),
+                patch_short: String::new(),
                 guest_count: inv
                     .as_ref()
                     .and_then(|i| i.virt.as_ref())
@@ -780,6 +1447,297 @@ impl Db {
         Ok(n > 0)
     }
 
+    // -- log forwarding -----------------------------------------------------
+
+    /// How long to keep one sender's lines, where it has been set.
+    pub fn log_retention(&self) -> Result<std::collections::HashMap<String, i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT source, hours FROM log_retention")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn set_log_retention(&self, source: &str, hours: Option<i64>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        match hours {
+            Some(h) => conn.execute(
+                "INSERT OR REPLACE INTO log_retention (source, hours) VALUES (?1, ?2)",
+                params![source, h],
+            )?,
+            None => conn.execute(
+                "DELETE FROM log_retention WHERE source = ?1",
+                params![source],
+            )?,
+        };
+        Ok(())
+    }
+
+    /// Ask this machine to forward, or stop asking.
+    pub fn set_log_forward(&self, id: AgentId, on: bool, min_severity: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        if on {
+            conn.execute(
+                "INSERT OR REPLACE INTO log_forward (agent_id, min_severity, since)
+                 VALUES (?1, ?2, ?3)",
+                params![id.to_string(), min_severity, Utc::now().to_rfc3339()],
+            )?;
+        } else {
+            conn.execute(
+                "DELETE FROM log_forward WHERE agent_id = ?1",
+                params![id.to_string()],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// What this machine has been asked for, and when it was asked.
+    ///
+    /// The timestamp matters: "nothing has arrived" only means something once
+    /// enough time has passed for something to have arrived. Without it, a
+    /// machine that was switched on ten seconds ago is reported as broken.
+    pub fn log_forward(&self, id: AgentId) -> Result<Option<(String, DateTime<Utc>)>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT min_severity, since FROM log_forward WHERE agent_id = ?1",
+                params![id.to_string()],
+                |r| {
+                    let since: String = r.get(1)?;
+                    Ok((r.get::<_, String>(0)?, parse_time(&since)))
+                },
+            )
+            .optional()?)
+    }
+
+    // -- external jobs ------------------------------------------------------
+
+    /// Record a check-in, returning any facts whose value changed.
+    ///
+    /// `every_hours` is sticky: a script that reports its cadence once should
+    /// not have to repeat it, and a later run that omits it must not quietly
+    /// turn overdue detection off.
+    pub fn record_job_run(
+        &self,
+        name: &str,
+        ok: bool,
+        detail: &str,
+        every_hours: Option<i64>,
+        facts: &std::collections::BTreeMap<String, String>,
+        at: Option<DateTime<Utc>>,
+        log: &str,
+        suspect: bool,
+    ) -> Result<Vec<JobFactChange>> {
+        let conn = self.conn.lock().unwrap();
+        // `at` is for a reporter speaking on another job's behalf: one cron
+        // entry that watches four scripts is reporting runs that happened
+        // hours ago, and recording those as "now" would mean a job could never
+        // be late as long as the watcher was alive.
+        let now = at.unwrap_or_else(Utc::now);
+        let now_s = now.to_rfc3339();
+
+        let existing: Option<(i64, String, Option<String>)> = conn
+            .query_row(
+                "SELECT every_hours, facts, last_at FROM jobs WHERE name = ?1",
+                params![name],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+
+        // A watcher repeats itself - it reports the same run every time it
+        // wakes up - so an older observation must never walk the clock back.
+        let newest = existing
+            .as_ref()
+            .and_then(|(_, _, last)| last.as_deref())
+            .map(parse_time)
+            .is_none_or(|prev| now >= prev);
+
+        let mut merged: std::collections::BTreeMap<String, String> = existing
+            .as_ref()
+            .and_then(|(_, f, _)| serde_json::from_str(f).ok())
+            .unwrap_or_default();
+        let every = every_hours
+            .filter(|h| *h > 0)
+            .or_else(|| existing.as_ref().map(|(h, _, _)| *h))
+            .unwrap_or(0);
+
+        let mut changed = Vec::new();
+        for (k, v) in facts {
+            if merged.get(k).map(String::as_str) != Some(v.as_str()) {
+                changed.push(JobFactChange {
+                    key: k.clone(),
+                    value: v.clone(),
+                    at: now,
+                });
+                conn.execute(
+                    "INSERT OR REPLACE INTO job_facts (name, key, value, at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![name, k, v, now_s],
+                )?;
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+
+        // An observation older than what is already stored still earns its
+        // history row - it is evidence a run happened - but it does not become
+        // the job's current state.
+        let sql = if newest {
+            "INSERT INTO jobs
+                (name, every_hours, first_seen, last_at, last_ok, last_detail, facts,
+                 last_suspect)
+             VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(name) DO UPDATE SET
+                every_hours = ?2, last_at = ?3, last_ok = ?4, last_detail = ?5, facts = ?6,
+                last_suspect = ?7"
+        } else {
+            // An observation older than the stored one earns its history row
+            // but must not become the job's current state - including its
+            // suspicion, which belongs to whichever run is newest.
+            "INSERT INTO jobs
+                (name, every_hours, first_seen, last_at, last_ok, last_detail, facts,
+                 last_suspect)
+             VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(name) DO UPDATE SET every_hours = ?2, facts = ?6"
+        };
+        conn.execute(
+            sql,
+            params![
+                name,
+                every,
+                now_s,
+                ok as i64,
+                detail,
+                serde_json::to_string(&merged)?,
+                suspect as i64
+            ],
+        )?;
+        // Keyed by the run's own time, so a watcher reporting the same run
+        // every fifteen minutes overwrites one row instead of accumulating
+        // ninety-six copies of the same log.
+        conn.execute(
+            "INSERT OR REPLACE INTO job_runs (name, at, ok, detail, log, suspect)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![name, now_s, ok as i64, detail, log, suspect as i64],
+        )?;
+        Ok(changed)
+    }
+
+    pub fn jobs(&self) -> Result<Vec<Job>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT name, every_hours, first_seen, last_at, last_ok, last_detail, facts, muted,
+                    last_suspect
+             FROM jobs ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let first_seen: String = r.get(2)?;
+            let last_at: Option<String> = r.get(3)?;
+            let last_ok: Option<i64> = r.get(4)?;
+            let facts: String = r.get(6)?;
+            Ok(Job {
+                name: r.get(0)?,
+                every_hours: r.get(1)?,
+                first_seen: parse_time(&first_seen),
+                last_at: last_at.as_deref().map(parse_time),
+                last_ok: last_ok.map(|v| v != 0),
+                last_detail: r.get(5)?,
+                facts: serde_json::from_str(&facts).unwrap_or_default(),
+                muted: r.get::<_, i64>(7)? != 0,
+                last_suspect: r.get::<_, i64>(8)? != 0,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Check-ins since a point in time, oldest first, for the calendar.
+    pub fn job_runs_since(&self, since: DateTime<Utc>) -> Result<Vec<(String, DateTime<Utc>, bool, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT name, at, ok, detail FROM job_runs WHERE at >= ?1 ORDER BY at ASC",
+        )?;
+        let rows = stmt.query_map(params![since.to_rfc3339()], |r| {
+            let at: String = r.get(1)?;
+            let ok: i64 = r.get(2)?;
+            Ok((r.get(0)?, parse_time(&at), ok != 0, r.get(3)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Recent runs of one job, newest first, with whatever each one printed.
+    pub fn job_runs(&self, name: &str, limit: usize) -> Result<Vec<JobRun>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT at, ok, detail, log, suspect FROM job_runs
+             WHERE name = ?1 ORDER BY at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![name, limit as i64], |r| {
+            let at: String = r.get(0)?;
+            let ok: i64 = r.get(1)?;
+            Ok(JobRun {
+                at: parse_time(&at),
+                ok: ok != 0,
+                detail: r.get(2)?,
+                log: r.get(3)?,
+                suspect: r.get::<_, i64>(4)? != 0,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Drop the text of old runs, keeping the runs themselves.
+    ///
+    /// The fact that something ran on a Tuesday in March is small and worth
+    /// keeping forever; what it printed is neither. Losing the text while
+    /// keeping the row means the calendar stays complete.
+    pub fn prune_job_logs(&self, older_than_days: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = (Utc::now() - Duration::days(older_than_days)).to_rfc3339();
+        Ok(conn.execute(
+            "UPDATE job_runs SET log = '' WHERE at < ?1 AND log <> ''",
+            params![cutoff],
+        )?)
+    }
+
+    /// When each of a job's facts last changed, newest first.
+    pub fn job_fact_history(&self, name: &str, limit: usize) -> Result<Vec<JobFactChange>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT key, value, at FROM job_facts WHERE name = ?1 ORDER BY at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![name, limit as i64], |r| {
+            let at: String = r.get(2)?;
+            Ok(JobFactChange {
+                key: r.get(0)?,
+                value: r.get(1)?,
+                at: parse_time(&at),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn set_job_muted(&self, name: &str, muted: bool) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "UPDATE jobs SET muted = ?2 WHERE name = ?1",
+            params![name, muted as i64],
+        )?)
+    }
+
+    pub fn forget_job(&self, name: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM job_runs WHERE name = ?1", params![name])?;
+        conn.execute("DELETE FROM job_facts WHERE name = ?1", params![name])?;
+        Ok(conn.execute("DELETE FROM jobs WHERE name = ?1", params![name])?)
+    }
+
+    /// How often a job is allowed to be late before it counts as overdue.
+    ///
+    /// A quarter past due, and never less than an hour: a daily job that runs
+    /// at 03:00 and once at 03:20 is not news, and a warning that fires on
+    /// ordinary jitter is one people learn to ignore.
+    pub fn job_grace(every_hours: i64) -> Duration {
+        Duration::minutes((every_hours * 60 / 4).max(60))
+    }
+
     // -- manifest -----------------------------------------------------------
 
     pub fn manifest(&self) -> Result<Manifest> {
@@ -807,15 +1765,25 @@ impl Db {
 
     // -- commands -----------------------------------------------------------
 
-    pub fn record_command(&self, id: Uuid, agent_id: AgentId, cmd: &Command) -> Result<()> {
+    /// Record a dispatched command. `source` is who asked: "manual" for a
+    /// person, "pool:<name>" for a scheduled run.
+    pub fn record_command(
+        &self,
+        id: Uuid,
+        agent_id: AgentId,
+        cmd: &Command,
+        source: &str,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO commands (id, agent_id, kind, created_at) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO commands (id, agent_id, kind, created_at, source)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 id.to_string(),
                 agent_id.to_string(),
                 command_kind(cmd),
                 Utc::now().to_rfc3339(),
+                source,
             ],
         )?;
         Ok(())
@@ -856,16 +1824,51 @@ impl Db {
         Ok(())
     }
 
+    /// Everything that ran since a point in time, oldest first.
+    ///
+    /// A calendar needs a range rather than a page: "the last 500 commands"
+    /// is a different window on every fleet and on every day.
+    pub fn commands_since(&self, since: DateTime<Utc>) -> Result<Vec<CommandRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, agent_id, kind, created_at, finished_at, ok, summary, detail,
+                    progress, source
+             FROM commands WHERE created_at >= ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![since.to_rfc3339()], |r| {
+            let id: String = r.get(0)?;
+            let agent_id: String = r.get(1)?;
+            let created_at: String = r.get(3)?;
+            let finished_at: Option<String> = r.get(4)?;
+            let ok: Option<i64> = r.get(5)?;
+            Ok(CommandRow {
+                id: id.parse().unwrap_or_default(),
+                agent_id: agent_id.parse().unwrap_or_default(),
+                kind: r.get(2)?,
+                created_at: parse_time(&created_at),
+                finished_at: finished_at.as_deref().map(parse_time),
+                ok: ok.map(|v| v != 0),
+                summary: r.get(6)?,
+                detail: r.get(7)?,
+                progress: r.get(8)?,
+                source: r.get::<_, Option<String>>(9)?.unwrap_or_default(),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn commands(&self, agent_id: Option<AgentId>, limit: usize) -> Result<Vec<CommandRow>> {
         let conn = self.conn.lock().unwrap();
         let (sql, filter) = match agent_id {
             Some(id) => (
-                "SELECT id, agent_id, kind, created_at, finished_at, ok, summary, detail, progress
+                "SELECT id, agent_id, kind, created_at, finished_at, ok, summary, detail,
+                        progress, source
                  FROM commands WHERE agent_id = ?1 ORDER BY created_at DESC LIMIT ?2",
                 Some(id.to_string()),
             ),
             None => (
-                "SELECT id, agent_id, kind, created_at, finished_at, ok, summary, detail, progress
+                "SELECT id, agent_id, kind, created_at, finished_at, ok, summary, detail,
+                        progress, source
                  FROM commands ORDER BY created_at DESC LIMIT ?2",
                 None,
             ),
@@ -888,6 +1891,7 @@ impl Db {
                 summary: r.get(6)?,
                 detail: r.get(7)?,
                 progress: r.get(8)?,
+                source: r.get(9)?,
             })
         };
 
@@ -963,6 +1967,11 @@ pub fn command_kind(cmd: &Command) -> &'static str {
         Command::Reboot { .. } => "reboot",
         Command::ProbeDevices { .. } => "probe_devices",
         Command::Discover => "discover",
+        // On and off are different actions in a history: "who turned this off"
+        // is a question somebody eventually asks.
+        Command::JournalVolume => "journal_volume",
+        Command::ConfigureSyslog { enable: true, .. } => "syslog_on",
+        Command::ConfigureSyslog { .. } => "syslog_off",
         Command::InstallPrerequisites => "install_prerequisites",
         Command::RestartAgent => "restart_agent",
         Command::WriteSource { .. } => "write_source",
