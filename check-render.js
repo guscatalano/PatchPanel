@@ -138,6 +138,7 @@ async function run() {
   }
 
   await checkDevices();
+  await checkOverview();
 
   console.log(failures ? "\n" + failures + " check(s) failed" : "\neverything renders");
   process.exit(failures ? 1 : 0);
@@ -150,7 +151,7 @@ async function run() {
 async function checkDevices() {
   console.log("  devices table");
 
-  const rows = JSON.parse(process.env.PP_DEVICES || '{"devices":[],"unmanaged":[]}');
+  const rows = JSON.parse(process.env.PP_DEVICES || '{"devices":[],"network":[],"sweeps":[]}');
   if (!rows.devices.length) {
     check("has at least one device to render", false, "no devices declared on the portal");
     return;
@@ -158,10 +159,12 @@ async function checkDevices() {
 
   DOC = {
     "device-rows": el("device-rows"),
-    "unmanaged-rows": el("unmanaged-rows"),
+    "network-rows": el("network-rows"),
     "devices-empty": el("devices-empty"),
     "devices-eol": el("devices-eol"),
-    "unmanaged-empty": el("unmanaged-empty"),
+    "network-empty": el("network-empty"),
+    "network-note": el("network-note"),
+    "sweep-age": el("sweep-age"),
     "dev-hint": el("dev-hint"),
   };
   globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => rows });
@@ -191,6 +194,93 @@ async function checkDevices() {
     try { new Function(code); } catch (e) { evil.push(code.slice(0, 70)); }
   }
   check("handlers survive a hostile id", evil.length === 0, evil.join(" | "));
+
+  console.log("  network table");
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => rows });
+  await loadDevices();
+  const net = DOC["network-rows"].innerHTML;
+  const hosts = rows.network || [];
+  check("one row per host", (net.match(/<tr /g) || []).length === hosts.length,
+    `${(net.match(/<tr /g) || []).length} rows for ${hosts.length} hosts`);
+  // A managed machine must be named rather than listed as a mystery: showing
+  // the fleet's own machines as unexplained is the failure this view exists to
+  // stop, and it is invisible unless something asserts it.
+  const named = hosts.filter((h) => h.known).length;
+  check("every accounted host is named",
+    named === 0 || (net.match(/unexplained/g) || []).length === hosts.length - named,
+    `${named} accounted, ${(net.match(/unexplained/g) || []).length} marked unexplained`);
+  check("no undefined rendered", !net.includes("undefined"), "found 'undefined'");
+
+  // An address is not typed by anyone, but it does come off the network, and it
+  // goes straight into an inline handler.
+  const hostile = JSON.parse(JSON.stringify(rows));
+  hostile.network = [Object.assign({}, hosts[0] || { open_ports: [], services: [] }, {
+    ip: `1.2.3.4" onmouseover="alert(1)`,
+    known: { role: "agent", name: `a'b"c`, agent: `x") ; alert(1);("` },
+  })];
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => hostile });
+  await loadDevices();
+  const rude = [];
+  for (const h of DOC["network-rows"].innerHTML.matchAll(/\son[a-z]+="([^"]*)"/g)) {
+    const code = h[1].replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&lt;/g, "<");
+    try { new Function(code); } catch (e) { rude.push(code.slice(0, 70)); }
+  }
+  check("handlers survive a hostile address", rude.length === 0, rude.join(" | "));
 }
 
 run().catch((e) => { console.log("threw: " + (e && e.stack || e)); process.exit(1); });
+
+
+// The Overview list is derived entirely on the server, so what this proves is
+// the other half: that the page draws every item it is given, escapes the text
+// it puts in attributes, and produces buttons that actually run. Two identical
+// bugs have shipped where an inline handler was closed early by a quote and
+// the button looked perfectly normal while doing nothing.
+async function checkOverview() {
+  console.log("  overview");
+  const fleet = JSON.parse(process.env.PP_FLEET || "null");
+  if (!fleet || !fleet.attention) {
+    console.log("    -- no fleet fixture, skipped");
+    return;
+  }
+  REV = fleet.manifest_revision;
+  DOC = {
+    needs: el("needs"),
+    "needs-sub": el("needs-sub"),
+    "needs-none": el("needs-none"),
+    gist: el("gist"),
+  };
+  drawNeeds(fleet);
+
+  const html = DOC.needs.innerHTML;
+  check("one row per item", (html.match(/class="need t/g) || []).length === fleet.attention.length,
+    fleet.attention.length + " expected");
+  check("no undefined rendered", !/undefined/.test(html));
+  // An HTML entity that reaches here from the API has been escaped twice and
+  // will render as literal text: the wording belongs to the page, not the
+  // payload.
+  check("no double-escaped entities", !/&amp;(middot|mdash|nbsp);/.test(html));
+
+  const bad = [];
+  for (const h of html.matchAll(/\son[a-z]+="([^"]*)"/g)) {
+    const code = h[1].replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&lt;/g, "<");
+    try { new Function(code); } catch (e) { bad.push(code.slice(0, 70)); }
+  }
+  check("every attention handler parses", bad.length === 0, bad.join(" | "));
+
+  // A pool named with a quote reaches the list through patch_note, and the
+  // list wraps it in a title attribute.
+  const nasty = JSON.parse(JSON.stringify(fleet));
+  nasty.attention = [{
+    tier: 3, say: `the "a'b" pool <broke>`, tail: `x" onerror="1`,
+    action: "Go", link: "#machines",
+    who: [{ name: `q"uote`, context: "<i>", why: `a'b` }],
+  }];
+  drawNeeds(nasty);
+  const evil = [];
+  for (const h of DOC.needs.innerHTML.matchAll(/\son[a-z]+="([^"]*)"/g)) {
+    const code = h[1].replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&lt;/g, "<");
+    try { new Function(code); } catch (e) { evil.push(code.slice(0, 70)); }
+  }
+  check("handlers survive a hostile pool name", evil.length === 0, evil.join(" | "));
+}

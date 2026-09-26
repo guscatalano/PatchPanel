@@ -16,8 +16,12 @@ use crate::exec::{self, Progress};
 // the Linux backend cannot even be type-checked from a Windows dev machine -
 // which is exactly how a literal tab inside a char literal reached a release.
 // Dispatch below is still cfg'd; only the compilation is unconditional.
+// Visible to the crate, not just to this module: the session layer reaches in
+// for the few things that are genuinely Linux-shaped, such as writing an
+// rsyslog rule. Private, those references only fail to compile on Linux, which
+// a Windows host build never notices.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-mod linux;
+pub(crate) mod linux;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod windows;
 

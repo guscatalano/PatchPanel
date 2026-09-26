@@ -354,9 +354,12 @@ pub async fn virtualization(p: &Progress) -> Option<Virtualization> {
                 kind: "hyper-v".into(),
                 state: g.state,
                 managed: false,
+                last_backup: None,
             })
             .collect(),
         note: String::new(),
+        // Hyper-V's own backup story is not one PatchPanel reads.
+        backups: None,
     })
 }
 

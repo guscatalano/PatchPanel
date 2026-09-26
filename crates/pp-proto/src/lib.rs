@@ -11,10 +11,10 @@ use uuid::Uuid;
 pub mod devices;
 pub mod manifest;
 
-pub use devices::{
-    DeviceReport, DeviceSpec, DiscoveredHost, DiscoveryScan, Probe, OID_SYS_DESCR,
+pub use devices::{DeviceReport, DeviceSpec, DiscoveredHost, DiscoveredService, DiscoveryScan, HaAutoUpdate, HostIdentity, OID_SYS_DESCR, Probe, Scanner};
+pub use manifest::{
+    AppSource, AppSpec, Ensure, Manifest, PatchPolicy, SourcePolicy, VersionCheck,
 };
-pub use manifest::{AppSource, AppSpec, Ensure, Manifest, PatchPolicy, SourcePolicy};
 
 /// Bumped whenever a frame shape changes incompatibly. The portal refuses
 /// agents that speak a different major protocol rather than guessing.
@@ -243,6 +243,56 @@ pub struct Guest {
     /// The agent cannot know, and it is the whole point of listing them.
     #[serde(default)]
     pub managed: bool,
+    /// When this guest was last backed up, from the backup files that exist
+    /// rather than from a job claiming to have run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_backup: Option<DateTime<Utc>>,
+}
+
+/// How a host's backups are going.
+///
+/// Not a backup product: the question here is only "is this happening, and is
+/// anything stuck". A backup existing is not the same as a backup restoring,
+/// and nothing below claims otherwise.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Backups {
+    /// Jobs running right now. One that has been running for hours is the
+    /// usual shape of "stuck".
+    #[serde(default)]
+    pub running: Vec<BackupJob>,
+    /// The most recent finished jobs, newest first.
+    #[serde(default)]
+    pub recent: Vec<BackupJob>,
+    /// Why the backup state could not be read, when it could not. Empty is
+    /// not the same as "no backups", and this is what tells them apart.
+    #[serde(default)]
+    pub note: String,
+}
+
+/// One backup job as the hypervisor recorded it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupJob {
+    /// The hypervisor's task id, for finding it in its own UI.
+    pub id: String,
+    /// Which guest, when the job names one.
+    #[serde(default)]
+    pub guest: String,
+    pub started: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished: Option<DateTime<Utc>>,
+    /// `OK`, or whatever the hypervisor said went wrong.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub ok: bool,
+    /// The tail of what the job printed, for a job that failed.
+    ///
+    /// Only fetched for failures. A status of "OK" needs no explanation, and
+    /// pulling the log of every successful nightly backup would be a lot of
+    /// text nobody reads - while "why did that fail" is a question the status
+    /// alone can never answer, which is the whole reason this field exists.
+    #[serde(default)]
+    pub log: String,
 }
 
 /// This machine's place in the virtualization stack.
@@ -262,6 +312,9 @@ pub struct Virtualization {
     /// Why the guest list could not be read, when it could not.
     #[serde(default)]
     pub note: String,
+    /// How this host's backups are going.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backups: Option<Backups>,
 }
 
 /// A piece of hardware fwupd can see, whether or not it has an update.
@@ -392,6 +445,16 @@ pub struct AvailableUpdate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Inventory {
     pub collected_at: DateTime<Utc>,
+    /// When the discovery sweep that produced `discovered` finished.
+    ///
+    /// Separate from `collected_at` because a sweep runs on its own cadence: a
+    /// package refresh five minutes ago does not mean the network was looked at
+    /// five minutes ago, and a list of hosts with no honest age on it is a list
+    /// nobody can tell is stale. `None` from an agent that has not swept since
+    /// it started; the portal carries the stored value forward in that case, the
+    /// same way it carries `discovered` itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swept_at: Option<DateTime<Utc>>,
     pub packages: Vec<Package>,
     pub updates: Vec<AvailableUpdate>,
     pub reboot_required: bool,
@@ -442,6 +505,12 @@ pub struct Inventory {
     /// Set when dpkg is stuck part-way through an upgrade.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mid_upgrade: Option<MidUpgrade>,
+    /// Where this machine is forwarding its syslog, if it is. Read back off
+    /// disk on every scan rather than held in memory: an agent that restarts
+    /// forgets, and the portal must not conclude "off" from an agent's
+    /// amnesia.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syslog_forward: Option<SyslogForward>,
     /// Firmware updates offered for this machine's hardware.
     #[serde(default)]
     pub firmware: Vec<FirmwareUpdate>,
@@ -506,6 +575,37 @@ pub enum Command {
     },
     /// Sweep the configured CIDRs for undeclared devices.
     Discover,
+
+    /// Count what the journal holds at each severity, without forwarding any of
+    /// it.
+    ///
+    /// Asked for before turning forwarding on, because the gap between levels is
+    /// enormous and invisible until it is too late: a host can hold a hundred
+    /// warnings and fifty thousand info lines for the same day, and choosing
+    /// between them blind is how somebody ends up shipping a firehose.
+    JournalVolume,
+
+    /// Start or stop forwarding this machine's syslog to the portal.
+    ///
+    /// Deliberately per-machine and never part of a manifest: it writes to
+    /// `/etc/rsyslog.d` and reloads a service, which is a change to the
+    /// machine, and changes here get asked for rather than applied because a
+    /// document said so.
+    ///
+    /// It fills a gap the hourly inventory cannot: a ZFS checksum error, an OOM
+    /// kill, a correctable memory fault or a crash-looping unit happens between
+    /// scans and leaves nothing in a package list behind it.
+    ConfigureSyslog {
+        /// False removes the configuration and reloads, leaving no trace but
+        /// the backup.
+        #[serde(default)]
+        enable: bool,
+        /// `warning`, `err`, `notice`, `info`. Anything below this is not sent,
+        /// which is what keeps this a trickle rather than the twenty thousand
+        /// lines an hour a firewall will happily produce.
+        #[serde(default = "default_syslog_severity")]
+        min_severity: String,
+    },
     /// Replace an apt source file. Validated with `apt-get update` and rolled
     /// back automatically if apt rejects the result, so a bad edit cannot
     /// leave the machine unable to install anything.
@@ -619,6 +719,30 @@ pub enum ClientMsg {
         line: String,
     },
     CommandResult(CommandResult),
+    /// Journal lines, for a machine that has been asked to forward them.
+    ///
+    /// Sent over the connection that already exists rather than over a syslog
+    /// socket: most of this fleet has no rsyslog, and installing one to gain a
+    /// port is a worse trade than reusing the link the agent is already on.
+    ///
+    /// Batched, because a host under load emits warnings in bursts and a frame
+    /// per line would spend the connection on framing.
+    JournalLines {
+        lines: Vec<JournalLine>,
+    },
+}
+
+/// One line out of a machine's journal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JournalLine {
+    pub at: DateTime<Utc>,
+    /// Syslog priority, 0-7. Kept as the number the journal reports rather than
+    /// a word, so the portal decides how to render it in one place.
+    pub priority: i64,
+    /// `SYSLOG_IDENTIFIER`, which is the unit or program name.
+    #[serde(default)]
+    pub tag: String,
+    pub message: String,
 }
 
 /// Portal -> agent.
@@ -637,4 +761,23 @@ pub enum ServerMsg {
     Command(CommandEnvelope),
     /// Terminal: the portal is closing the connection and why.
     Error { message: String },
+}
+
+fn default_syslog_severity() -> String {
+    // Warnings and worse. The host-level events worth knowing about - disk
+    // errors, OOM kills, machine checks - are all at this level or above, and
+    // everything below it is the noise that makes a log unreadable.
+    "warning".to_string()
+}
+
+/// What a machine is currently forwarding, as read off its own disk.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyslogForward {
+    /// Where it sends. Recorded so a machine pointed at the wrong portal is
+    /// visible rather than merely "on".
+    pub target: String,
+    pub min_severity: String,
+    /// Which file says so, so somebody on the box can find and undo it without
+    /// PatchPanel's help.
+    pub path: String,
 }

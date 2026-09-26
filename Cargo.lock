@@ -1643,7 +1643,7 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "pp-agent"
-version = "0.4.37"
+version = "0.5.66"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1655,6 +1655,7 @@ dependencies = [
  "ipnet",
  "os_info",
  "pp-proto",
+ "quick-xml",
  "regex",
  "reqwest",
  "serde",
@@ -1669,8 +1670,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pp-mcp"
+version = "0.5.66"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "pp-portal"
-version = "0.4.37"
+version = "0.5.66"
 dependencies = [
  "anyhow",
  "axum",
@@ -1683,6 +1697,8 @@ dependencies = [
  "ipnet",
  "pp-proto",
  "rcgen",
+ "regex",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1696,7 +1712,7 @@ dependencies = [
 
 [[package]]
 name = "pp-proto"
-version = "0.4.37"
+version = "0.5.66"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1721,6 +1737,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

@@ -22,6 +22,8 @@ pub fn routes(state: SharedState) -> Router {
     Router::new()
         .route("/install.sh", get(install_sh))
         .route("/install.ps1", get(install_ps1))
+        .route("/pp-report.sh", get(pp_report_sh))
+        .route("/pp-unraid-scripts.sh", get(pp_unraid_scripts_sh))
         .route("/download/{file}", get(download))
         .with_state(state)
 }
@@ -156,6 +158,44 @@ fi
             (header::CACHE_CONTROL, "no-store"),
         ],
         script,
+    )
+        .into_response()
+}
+
+/// The job-reporting library, with this portal's address already in it.
+///
+/// Served rather than pasted because the alternative is the same twenty lines
+/// copied into every script on the fleet, diverging quietly - and the part most
+/// worth getting right, the exit trap, is exactly the part someone editing a
+/// copy will drop.
+///
+/// Outside the admin-bearer middleware, like the agent installer: fetching it
+/// reveals nothing a client cannot already see, and needing a token to download
+/// the thing that carries the token is a loop.
+async fn pp_report_sh(headers: HeaderMap, State(state): State<SharedState>) -> Response {
+    let host = portal_host(&headers, &state);
+    let body = include_str!("../../../deploy/pp-report.sh")
+        .replace("PP_URL:-http://localhost", &format!("PP_URL:-http://{host}"));
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/x-shellscript")],
+        body,
+    )
+        .into_response()
+}
+
+/// A watcher for Unraid's User Scripts plugin.
+///
+/// Unraid's own API cannot see that plugin at all, so the only way to know
+/// whether those scripts are running is something on the box that reads the
+/// logs the plugin already writes. One cron entry covers every script,
+/// including ones added later.
+async fn pp_unraid_scripts_sh(headers: HeaderMap, State(state): State<SharedState>) -> Response {
+    let host = portal_host(&headers, &state);
+    let body = include_str!("../../../deploy/pp-unraid-scripts.sh")
+        .replace("PP_URL:-http://localhost", &format!("PP_URL:-http://{host}"));
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/x-shellscript")],
+        body,
     )
         .into_response()
 }

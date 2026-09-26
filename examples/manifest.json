@@ -80,12 +80,13 @@
     }
   ],
 
-  "_comment_discovery": "Optional sweeps that surface devices nobody declared. Capped at 1024 hosts per range.",
+  "_comment_discovery": "Optional sweeps that surface devices nobody declared. Capped at 1024 hosts per range. use_nmap hands the range to nmap where the collector has it, which names the software on each open port instead of just the port; without nmap the built-in TCP sweep runs and every host it reports says so.",
   "discovery": [
     {
       "cidr": "10.20.0.0/24",
       "ports": [80, 443, 22, 23, 502, 8080, 1883],
-      "site": "plant-a"
+      "site": "plant-a",
+      "use_nmap": true
     }
   ],
 

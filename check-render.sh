@@ -79,4 +79,10 @@ host = sys.argv[1]
 print(json.dumps(json.load(urllib.request.urlopen(f'http://{host}/api/devices', timeout=15))))
 " "$PORTAL")"
 
-PP_FIXTURES="$FIXTURES" PP_DEVICES="$DEVICES" node "$OUT"
+FLEET="$(python3 -c "
+import json, sys, urllib.request
+host = sys.argv[1]
+print(json.dumps(json.load(urllib.request.urlopen(f'http://{host}/api/fleet', timeout=15))))
+" "$PORTAL")"
+
+PP_FIXTURES="$FIXTURES" PP_DEVICES="$DEVICES" PP_FLEET="$FLEET" node "$OUT"

@@ -4,8 +4,10 @@
 
 mod config;
 mod exec;
+mod journal;
 mod hardware;
 mod platform;
+mod nmap;
 mod probe;
 mod release;
 mod repos;
@@ -518,6 +520,10 @@ async fn probe_once(target: String, kind: String, arg: Option<String>) -> Result
 
     let spec = DeviceSpec {
         collector: String::new(),
+        url: String::new(),
+        latest_url: String::new(),
+        latest_pointer: None,
+        latest_regex: None,
         id: "adhoc".into(),
         label: String::new(),
         target,

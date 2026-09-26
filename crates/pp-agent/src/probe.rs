@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use ipnet::IpNet;
-use pp_proto::{DeviceReport, DeviceSpec, DiscoveredHost, DiscoveryScan, Probe, OID_SYS_DESCR};
+use pp_proto::{
+    DeviceReport, DeviceSpec, DiscoveredHost, DiscoveryScan, Probe, Scanner, OID_SYS_DESCR,
+};
 use regex::Regex;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -65,6 +67,13 @@ pub async fn probe_one(spec: &DeviceSpec) -> DeviceReport {
     let mut report = DeviceReport {
         id: spec.id.clone(),
         target: spec.target.clone(),
+        // Port 0 because only the address is wanted. `resolve` already
+        // handles a bare address, so this does no lookup for a target that is
+        // one, and it is the same resolution the probe itself goes on to use.
+        resolved_ip: resolve(&spec.target, 0)
+            .await
+            .ok()
+            .map(|a| a.ip().to_string()),
         reachable: false,
         firmware: None,
         detail: String::new(),
@@ -93,6 +102,35 @@ pub async fn probe_one(spec: &DeviceSpec) -> DeviceReport {
         }
         Ok(Err(e)) => report.error = Some(format!("{e:#}")),
         Err(_) => report.error = Some("probe timed out".into()),
+    }
+
+    // If the operator said where the current release is published, go and
+    // find out. Only for probes that do not already answer it themselves -
+    // a firewall counting its own pending packages knows better than a
+    // version string comparison does.
+    if report.reachable && !spec.latest_url.is_empty() && !report.updates_known {
+        if let Some(installed) = report.firmware.clone() {
+            match latest_version(spec).await {
+                Ok(latest) => {
+                    let behind = newer_version(&latest, &installed);
+                    report.updates = usize::from(behind);
+                    report.updates_known = true;
+                    report.detail = format!(
+                        "{}\nlatest published: {latest}{}",
+                        report.detail.trim_end(),
+                        if behind { " - this is behind" } else { " - up to date" }
+                    );
+                }
+                Err(e) => {
+                    // Unknown, not current: an unreachable release feed says
+                    // nothing about the device.
+                    report.detail = format!(
+                        "{}\ncould not read the published version: {e:#}",
+                        report.detail.trim_end()
+                    );
+                }
+            }
+        }
     }
 
     // Drift is only meaningful when we both expect a version and read one.
@@ -312,7 +350,204 @@ const UNRAID_QUERY: &str = "{ online \
     server { name } \
     info { os { distro release kernel } } \
     array { state } \
-    notifications { overview { unread { total info warning alert } } } }";
+    notifications { overview { unread { total info warning alert } } \
+      list(filter: { type: UNREAD, offset: 0, limit: 10 }) { title subject importance } } }";
+
+/// Ask Home Assistant what it is running, and install what it is allowed to.
+///
+/// One request answers everything: `/api/states` carries an `update.*` entity
+/// per component, with what is installed, what is available, and whether HA
+/// itself is set to auto-update it. `device_class` separates HA's own software
+/// from the firmware of the devices it manages, which is the line that decides
+/// what PatchPanel will touch.
+async fn home_assistant(spec: &DeviceSpec) -> Result<(Option<String>, String, Extra)> {
+    let Probe::HomeAssistant {
+        token,
+        insecure,
+        auto_update,
+    } = &spec.probe
+    else {
+        anyhow::bail!("not a home assistant probe");
+    };
+
+    let base = if spec.target.starts_with("http") {
+        spec.target.trim_end_matches('/').to_string()
+    } else {
+        format!("https://{}", spec.target.trim_end_matches('/'))
+    };
+    let client = reqwest::Client::builder()
+        .timeout(PROBE_TIMEOUT)
+        .danger_accept_invalid_certs(*insecure)
+        .user_agent(concat!("patchpanel-agent/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+
+    let resp = client
+        .get(format!("{base}/api/states"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("asking home assistant for its state")?;
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        anyhow::bail!("home assistant rejected the token (401)");
+    }
+    let states: serde_json::Value = resp.error_for_status()?.json().await?;
+
+    struct Pending {
+        entity: String,
+        title: String,
+        installed: String,
+        latest: String,
+        firmware: bool,
+    }
+
+    let mut version = String::new();
+    let mut pending: Vec<Pending> = Vec::new();
+    let mut total = 0usize;
+    let mut ha_auto = 0usize;
+
+    for e in states.as_array().map(Vec::as_slice).unwrap_or_default() {
+        let entity = e
+            .get("entity_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if !entity.starts_with("update.") {
+            continue;
+        }
+        total += 1;
+        let attr = |k: &str| {
+            e.pointer(&format!("/attributes/{k}"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        if entity == "update.home_assistant_core_update" {
+            version = attr("installed_version");
+        }
+        if e.pointer("/attributes/auto_update")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            ha_auto += 1;
+        }
+        if e.get("state").and_then(|v| v.as_str()) != Some("on") {
+            continue;
+        }
+        pending.push(Pending {
+            entity: entity.to_string(),
+            title: attr("friendly_name").max(attr("title")),
+            installed: attr("installed_version"),
+            latest: attr("latest_version"),
+            firmware: attr("device_class") == "firmware",
+        });
+    }
+
+    let (fw, sw): (Vec<&Pending>, Vec<&Pending>) = pending.iter().partition(|p| p.firmware);
+
+    let mut summary = format!(
+        "Home Assistant {version}\n{total} component(s) tracked, {} with an update \
+         ({} software, {} device firmware)\n{ha_auto} set to auto-update by Home Assistant itself",
+        pending.len(),
+        sw.len(),
+        fw.len()
+    );
+    for p in pending.iter().take(12) {
+        summary.push_str(&format!(
+            "\n  {} {} -> {}{}",
+            if p.title.is_empty() { &p.entity } else { &p.title },
+            p.installed,
+            p.latest,
+            if p.firmware { "  (firmware)" } else { "" }
+        ));
+    }
+
+    // The only place in PatchPanel where looking at something can change it,
+    // so it is opt-in, scoped, and says exactly what it did.
+    let wanted: Vec<&&Pending> = match auto_update {
+        pp_proto::HaAutoUpdate::Off => Vec::new(),
+        pp_proto::HaAutoUpdate::Software => sw.iter().collect(),
+        pp_proto::HaAutoUpdate::Everything => sw.iter().chain(fw.iter()).collect(),
+    };
+    if !wanted.is_empty() {
+        summary.push_str(&format!("\n\ninstalling {} update(s):", wanted.len()));
+        for p in wanted {
+            let r = client
+                .post(format!("{base}/api/services/update/install"))
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "entity_id": p.entity }))
+                .send()
+                .await;
+            let outcome = match r {
+                Ok(resp) if resp.status().is_success() => "started".to_string(),
+                Ok(resp) => format!("refused ({})", resp.status().as_u16()),
+                Err(e) => format!("failed ({e})"),
+            };
+            summary.push_str(&format!("\n  {}: {outcome}", p.entity));
+        }
+        summary.push_str(
+            "\n\nHome Assistant takes its own backup before updating itself, and applies \
+             the result on its own schedule.",
+        );
+    }
+
+    Ok((
+        (!version.is_empty()).then_some(version),
+        summary,
+        Extra {
+            updates: Some(pending.len()),
+            reboot_required: false,
+            eol: false,
+            eol_note: String::new(),
+        },
+    ))
+}
+
+/// The version the vendor currently publishes for this device.
+///
+/// Most appliances report what they are running and say nothing about whether
+/// that is current. Given a feed, the comparison can be made here rather than
+/// by a person who has to go and look it up.
+async fn latest_version(spec: &DeviceSpec) -> Result<String> {
+    let insecure = match &spec.probe {
+        Probe::Http { insecure, .. }
+        | Probe::Opnsense { insecure, .. }
+        | Probe::Unraid { insecure, .. } => *insecure,
+        _ => false,
+    };
+    let client = reqwest::Client::builder()
+        .timeout(PROBE_TIMEOUT)
+        .danger_accept_invalid_certs(insecure)
+        .user_agent(concat!("patchpanel-agent/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+
+    let body = client
+        .get(&spec.latest_url)
+        .send()
+        .await
+        .context("fetching the published version")?
+        .error_for_status()?
+        .text()
+        .await?;
+
+    let found = if let Some(pointer) = &spec.latest_pointer {
+        let doc: serde_json::Value = serde_json::from_str(&body)?;
+        doc.pointer(pointer)
+            .map(|v| match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .ok_or_else(|| anyhow::anyhow!("nothing at {pointer}"))?
+    } else if let Some(re) = &spec.latest_regex {
+        capture(re, &body)?.ok_or_else(|| anyhow::anyhow!("the pattern matched nothing"))?
+    } else {
+        body.trim().to_string()
+    };
+
+    let version = found.trim().trim_start_matches(['v', 'V']).to_string();
+    if version.is_empty() {
+        anyhow::bail!("no version in the response");
+    }
+    Ok(version)
+}
 
 async fn unraid(spec: &DeviceSpec) -> Result<(Option<String>, String, Extra)> {
     let Probe::Unraid {
@@ -397,6 +632,37 @@ async fn unraid(spec: &DeviceSpec) -> Result<(Option<String>, String, Extra)> {
         summary.push_str(&format!(
             "\n{unread} unread notification(s): {alerts} alert(s), {warns} warning(s)"
         ));
+        // The counts alone say something is wrong without saying what, which
+        // is the least useful shape a warning can take. Unraid's own notify
+        // command is how scripts on the box report failures - the User Scripts
+        // plugin is invisible to this API, but anything it runs that calls
+        // notify is not - so the titles are the only place a failed backup
+        // script is nameable from here.
+        if let Some(list) = doc
+            .pointer("/data/notifications/list")
+            .and_then(|v| v.as_array())
+        {
+            for n in list.iter().take(5) {
+                let title = n.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                let subject = n.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+                let importance = n
+                    .get("importance")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("INFO");
+                if title.is_empty() && subject.is_empty() {
+                    continue;
+                }
+                summary.push_str(&format!(
+                    "\n  [{}] {title}{}",
+                    importance.to_lowercase(),
+                    if subject.is_empty() || subject == title {
+                        String::new()
+                    } else {
+                        format!(" - {subject}")
+                    }
+                ));
+            }
+        }
     }
 
     // Whether it is behind. Unraid does not report this itself, so the only
@@ -612,6 +878,8 @@ async fn run_probe(spec: &DeviceSpec) -> Result<(Option<String>, String, Extra)>
 
         Probe::Unraid { .. } => unraid(spec).await,
 
+        Probe::HomeAssistant { .. } => home_assistant(spec).await,
+
         Probe::Snmp {
             community,
             oid,
@@ -743,7 +1011,7 @@ fn truncate(s: &str, n: usize) -> String {
 pub async fn discover(scans: &[DiscoveryScan], known: &[DeviceSpec]) -> Vec<DiscoveredHost> {
     let mut out = Vec::new();
     for scan in scans {
-        match sweep(scan, known).await {
+        match run_scan(scan, known).await {
             Ok(hosts) => out.extend(hosts),
             Err(e) => tracing::warn!(cidr = %scan.cidr, error = %e, "discovery sweep failed"),
         }
@@ -751,21 +1019,84 @@ pub async fn discover(scans: &[DiscoveryScan], known: &[DeviceSpec]) -> Vec<Disc
     out
 }
 
-async fn sweep(scan: &DiscoveryScan, known: &[DeviceSpec]) -> Result<Vec<DiscoveredHost>> {
-    let net: IpNet = scan.cidr.parse().with_context(|| format!("bad CIDR `{}`", scan.cidr))?;
+/// One range, by whichever scanner is actually available.
+///
+/// A range asking for nmap on a collector that has none is not a failed sweep -
+/// the built-in one still finds the hosts - but it is a different answer to the
+/// question, so every row it produces carries why. The alternative is a Network
+/// tab where "no services identified" and "nothing was looking" render
+/// identically.
+async fn run_scan(scan: &DiscoveryScan, known: &[DeviceSpec]) -> Result<Vec<DiscoveredHost>> {
+    let hosts = range(&scan.cidr)?;
+
+    let mut note = String::new();
+    let mut found = if scan.use_nmap {
+        // A range that asked for nmap gets nmap. Fetching it is implementing
+        // that request rather than making a decision of its own - the same call
+        // `install_prerequisites` makes for fwupd, and for the same reason: a
+        // tool that is missing should not quietly downgrade the answer.
+        #[cfg(target_os = "linux")]
+        if crate::platform::linux::which_nmap().is_none() {
+            let p = crate::exec::Progress::detached();
+            match crate::platform::linux::install_nmap(&p).await {
+                Ok(msg) => tracing::info!(%msg, "installed nmap for discovery"),
+                Err(e) => tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "could not install nmap; the built-in sweep will be used"
+                ),
+            }
+        }
+        match crate::nmap::sweep(scan).await {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::warn!(
+                    cidr = %scan.cidr,
+                    error = %format!("{e:#}"),
+                    "nmap discovery failed; falling back to the built-in sweep"
+                );
+                note = format!(
+                    "nmap was asked for and did not run ({e:#}), so these ports come from the \
+                     built-in TCP sweep and nothing here is service-identified"
+                );
+                sweep(&hosts, &scan.ports).await
+            }
+        }
+    } else {
+        sweep(&hosts, &scan.ports).await
+    };
+
+    for host in &mut found {
+        // Only the manifest this agent was handed, and deliberately: the portal
+        // is the only place that knows the whole fleet, so this answers "did I
+        // probe it" and the portal answers "is it accounted for".
+        host.unmanaged = !known
+            .iter()
+            .any(|d| d.target == host.ip || d.target.starts_with(&format!("{}:", host.ip)));
+        host.scan_note = note.clone();
+    }
+    Ok(found)
+}
+
+/// The addresses a range covers, refusing anything absurd.
+///
+/// Checked before either scanner runs: nmap will happily accept a /8 and spend
+/// a week on it.
+fn range(cidr: &str) -> Result<Vec<IpAddr>> {
+    let net: IpNet = cidr.parse().with_context(|| format!("bad CIDR `{cidr}`"))?;
     let hosts: Vec<IpAddr> = net.hosts().take(MAX_SCAN_HOSTS + 1).collect();
     if hosts.len() > MAX_SCAN_HOSTS {
-        anyhow::bail!(
-            "`{}` covers more than {MAX_SCAN_HOSTS} hosts; narrow the range",
-            scan.cidr
-        );
+        anyhow::bail!("`{cidr}` covers more than {MAX_SCAN_HOSTS} hosts; narrow the range");
     }
+    Ok(hosts)
+}
 
+async fn sweep(hosts: &[IpAddr], ports: &[u16]) -> Vec<DiscoveredHost> {
     let sem = Arc::new(Semaphore::new(SCAN_CONCURRENCY));
-    let ports = Arc::new(scan.ports.clone());
+    let ports = Arc::new(ports.to_vec());
     let mut tasks = Vec::new();
 
     for ip in hosts {
+        let ip = *ip;
         let sem = sem.clone();
         let ports = ports.clone();
         tasks.push(tokio::spawn(async move {
@@ -776,14 +1107,11 @@ async fn sweep(scan: &DiscoveryScan, known: &[DeviceSpec]) -> Result<Vec<Discove
 
     let mut found = Vec::new();
     for t in tasks {
-        if let Ok(Some(mut host)) = t.await {
-            host.unmanaged = !known.iter().any(|d| {
-                d.target == host.ip || d.target.starts_with(&format!("{}:", host.ip))
-            });
+        if let Ok(Some(host)) = t.await {
             found.push(host);
         }
     }
-    Ok(found)
+    found
 }
 
 async fn scan_host(ip: IpAddr, ports: &[u16]) -> Option<DiscoveredHost> {
@@ -821,10 +1149,18 @@ async fn scan_host(ip: IpAddr, ports: &[u16]) -> Option<DiscoveredHost> {
     }
 
     (!open.is_empty()).then(|| DiscoveredHost {
+        // The built-in sweep learns none of this: it opens a socket and reads
+        // what comes back. Empty is the honest answer, not a gap to fill.
+        identity: Default::default(),
         ip: ip.to_string(),
         open_ports: open,
         hint,
         unmanaged: true,
+        // A connect and a banner read establish nothing per port beyond "it
+        // answered", which `open_ports` already says.
+        services: Vec::new(),
+        scanner: Scanner::Tcp,
+        scan_note: String::new(),
     })
 }
 

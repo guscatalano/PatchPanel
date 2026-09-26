@@ -2,10 +2,13 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+
 use anyhow::{Context, Result};
 use pp_proto::{
     AppSource, AvailableUpdate, BootReport, Cleanup, Disk, Ensure, FirmwareDevice, FirmwareUpdate,
-    Guest, MidUpgrade, Package, Repository, ScanIssue, Severity, Virtualization,
+    BackupJob, Backups, Guest, MidUpgrade, Package, Repository, ScanIssue, Severity,
+    Virtualization,
 };
 
 use super::{AppOutcome, Backend, Platform};
@@ -1774,11 +1777,27 @@ pub async fn virtualization(p: &Progress) -> Option<Virtualization> {
     if role.is_empty() {
         return None;
     }
+
+    // On a hypervisor, how its backups are going - and when each guest was
+    // last actually written somewhere.
+    let mut backups = None;
+    if host {
+        if let Some((state, per_guest)) = proxmox_backups(p).await {
+            for (vmid, at) in per_guest {
+                if let Some(g) = guests.iter_mut().find(|g| g.id == vmid) {
+                    g.last_backup = Some(at);
+                }
+            }
+            backups = Some(state);
+        }
+    }
+
     Some(Virtualization {
         role,
         platform,
         guests,
         note: note.trim().to_string(),
+        backups,
     })
 }
 
@@ -1807,6 +1826,7 @@ fn parse_pve(text: &str, kind: &str) -> Vec<Guest> {
             kind: kind.to_string(),
             state,
             managed: false,
+            last_backup: None,
         });
     }
     out
@@ -1817,6 +1837,66 @@ fn parse_pve(text: &str, kind: &str) -> Vec<Guest> {
 /// On Linux that means fwupd: without it a physical machine's firmware is
 /// simply not looked at, and nothing says so. Package managers are already
 /// present by definition - a machine without one could not have got here.
+/// Install nmap, for a discovery range that asked for it.
+///
+/// Setting `use_nmap` on a scan is the operator saying they want nmap; going
+/// and getting it is implementing that, not deciding it. Deliberately narrow:
+/// it only runs when a scan has asked, and a failure falls back to the built-in
+/// sweep with the note that already explains itself.
+pub async fn install_nmap(p: &Progress) -> Result<String> {
+    if which_nmap().is_some() {
+        return Ok("nmap is already installed".into());
+    }
+    p.line("nmap is missing; installing it");
+
+    if std::path::Path::new("/usr/bin/apt-get").exists() {
+        exec::run("apt-get", &["-qq", "update"], p).await?;
+        let o = exec::run_with_timeout(
+            "env",
+            &[
+                "DEBIAN_FRONTEND=noninteractive",
+                "apt-get",
+                "-y",
+                "install",
+                "nmap",
+            ],
+            p,
+            Duration::from_secs(600),
+        )
+        .await?;
+        if o.code != 0 {
+            anyhow::bail!("apt could not install nmap:\n{}", exec::tail(&o.text, 800));
+        }
+    } else if std::path::Path::new("/usr/bin/dnf").exists() {
+        let o = exec::run_with_timeout(
+            "dnf",
+            &["-y", "install", "nmap"],
+            p,
+            Duration::from_secs(600),
+        )
+        .await?;
+        if o.code != 0 {
+            anyhow::bail!("dnf could not install nmap:\n{}", exec::tail(&o.text, 800));
+        }
+    } else {
+        anyhow::bail!("no apt or dnf here, so nmap cannot be installed automatically");
+    }
+
+    match which_nmap() {
+        Some(path) => Ok(format!("installed nmap at {path}")),
+        None => anyhow::bail!("the install reported success but nmap is still not on this machine"),
+    }
+}
+
+/// Where nmap is, if it is anywhere. Checked by path rather than by `PATH`,
+/// which a systemd unit trims.
+pub fn which_nmap() -> Option<String> {
+    ["/usr/bin/nmap", "/usr/local/bin/nmap", "/bin/nmap"]
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(|p| (*p).to_string())
+}
+
 pub async fn install_prerequisites(pf: &Platform, p: &Progress) -> Result<String> {
     let mut log = Vec::new();
 
@@ -1866,6 +1946,218 @@ pub async fn install_prerequisites(pf: &Platform, p: &Progress) -> Result<String
     } else {
         anyhow::bail!("{}\n\nfwupdmgr is still not on PATH.", log.join("\n"))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Proxmox backups
+// ---------------------------------------------------------------------------
+
+/// A job still running after this long is the usual shape of "stuck".
+const BACKUP_STUCK_HOURS: i64 = 12;
+
+/// How this host's backups are going, and when each guest was last backed up.
+///
+/// Two sources, because they answer different questions. The task list says
+/// what ran and whether it finished; the backup storage says what actually
+/// exists. A job that reports success having written nothing is a real failure
+/// mode, so the guest's date comes from the files, not from the job.
+///
+/// `pvesh` talks to the local API as root, so no token is needed and nothing
+/// has to be configured.
+/// The tail of one Proxmox task's log.
+///
+/// Through `pvesh` rather than by reading `/var/log/pve/tasks/` directly: the
+/// path layout is Proxmox's business and it hashes the last character of the
+/// UPID into the directory name, which is exactly the sort of detail that
+/// changes between versions and breaks quietly. The API is what Proxmox
+/// supports.
+async fn task_log(node: &str, upid: &str, p: &Progress) -> String {
+    /// Enough to see the error and what led to it, not the whole transfer.
+    const LINES: &str = "80";
+    let Some(v) = json_from(
+        "pvesh",
+        &[
+            "get",
+            &format!("/nodes/{node}/tasks/{upid}/log"),
+            "--limit",
+            LINES,
+            "--output-format",
+            "json",
+        ],
+        p,
+    )
+    .await
+    else {
+        return String::new();
+    };
+    // Each entry is `{"n": <line number>, "t": "<text>"}`. Ordered by `n`,
+    // because the API does not promise the array is sorted and a log printed
+    // out of order is worse than none.
+    let Some(rows) = v.as_array() else {
+        return String::new();
+    };
+    let mut lines: Vec<(i64, String)> = rows
+        .iter()
+        .filter_map(|r| {
+            Some((
+                r.get("n").and_then(|n| n.as_i64()).unwrap_or(0),
+                r.get("t").and_then(|t| t.as_str())?.to_string(),
+            ))
+        })
+        .collect();
+    lines.sort_by_key(|(n, _)| *n);
+    lines
+        .into_iter()
+        .map(|(_, t)| t)
+        .collect::<Vec<_>>()
+        .join("
+")
+}
+
+pub async fn proxmox_backups(p: &Progress) -> Option<(Backups, Vec<(String, DateTime<Utc>)>)> {
+    if !std::path::Path::new("/usr/bin/pvesh").exists() {
+        return None;
+    }
+    let node = gethostname::gethostname().to_string_lossy().into_owned();
+    let mut out = Backups::default();
+
+    match json_from(
+        "pvesh",
+        &[
+            "get",
+            &format!("/nodes/{node}/tasks"),
+            "--typefilter",
+            "vzdump",
+            "--limit",
+            "40",
+            "--output-format",
+            "json",
+        ],
+        p,
+    )
+    .await
+    {
+        Some(v) => {
+            for task in v.as_array().map(Vec::as_slice).unwrap_or_default() {
+                let get = |k: &str| task.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let secs = |k: &str| task.get(k).and_then(|x| x.as_i64());
+                let Some(started) = secs("starttime").and_then(|t| DateTime::from_timestamp(t, 0))
+                else {
+                    continue;
+                };
+                let finished = secs("endtime").and_then(|t| DateTime::from_timestamp(t, 0));
+                let status = get("status");
+                let upid = get("upid");
+                let failed = !status.is_empty() && status != "OK";
+                let job = BackupJob {
+                    // Only a failure earns the round trip. A nightly backup that
+                    // said OK explains itself; one that did not is the thing the
+                    // status alone can never account for.
+                    log: if failed {
+                        task_log(&node, &upid, p).await
+                    } else {
+                        String::new()
+                    },
+                    id: upid,
+                    guest: get("id"),
+                    started,
+                    finished,
+                    ok: status == "OK",
+                    status: if status.is_empty() {
+                        "running".to_string()
+                    } else {
+                        status
+                    },
+                };
+                if job.finished.is_none() {
+                    out.running.push(job);
+                } else {
+                    out.recent.push(job);
+                }
+            }
+        }
+        None => out.note = "could not read the task list from pvesh".into(),
+    }
+
+    // What is actually on disk, per guest.
+    let mut last: std::collections::HashMap<String, DateTime<Utc>> = Default::default();
+    if let Some(stores) = json_from(
+        "pvesh",
+        &["get", &format!("/nodes/{node}/storage"), "--output-format", "json"],
+        p,
+    )
+    .await
+    {
+        for store in stores.as_array().map(Vec::as_slice).unwrap_or_default() {
+            let name = store.get("storage").and_then(|s| s.as_str()).unwrap_or("");
+            let content = store.get("content").and_then(|s| s.as_str()).unwrap_or("");
+            let active = store.get("active").and_then(|s| s.as_i64()).unwrap_or(0) != 0;
+            if name.is_empty() || !content.contains("backup") || !active {
+                continue;
+            }
+            let Some(items) = json_from(
+                "pvesh",
+                &[
+                    "get",
+                    &format!("/nodes/{node}/storage/{name}/content"),
+                    "--content",
+                    "backup",
+                    "--output-format",
+                    "json",
+                ],
+                p,
+            )
+            .await
+            else {
+                continue;
+            };
+            for item in items.as_array().map(Vec::as_slice).unwrap_or_default() {
+                let vmid = match item.get("vmid") {
+                    Some(serde_json::Value::Number(n)) => n.to_string(),
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    _ => continue,
+                };
+                let Some(at) = item
+                    .get("ctime")
+                    .and_then(|c| c.as_i64())
+                    .and_then(|t| DateTime::from_timestamp(t, 0))
+                else {
+                    continue;
+                };
+                last.entry(vmid)
+                    .and_modify(|e| {
+                        if at > *e {
+                            *e = at;
+                        }
+                    })
+                    .or_insert(at);
+            }
+        }
+    }
+
+    if out.running.is_empty() && out.recent.is_empty() && last.is_empty() && out.note.is_empty() {
+        out.note = "no backup jobs and no backup files found on this host".into();
+    }
+
+    out.recent.sort_by(|a, b| b.started.cmp(&a.started));
+    out.recent.truncate(10);
+    Some((out, last.into_iter().collect()))
+}
+
+/// Run something that prints JSON, and parse it.
+async fn json_from(prog: &str, args: &[&str], p: &Progress) -> Option<serde_json::Value> {
+    let o = exec::run(prog, args, p).await.ok()?;
+    if !o.ok() {
+        return None;
+    }
+    let text = o.text.trim();
+    let start = text.find(['[', '{'])?;
+    serde_json::from_str(&text[start..]).ok()
+}
+
+/// Has a running job been going long enough to look stuck?
+pub fn looks_stuck(job: &BackupJob) -> bool {
+    Utc::now().signed_duration_since(job.started).num_hours() >= BACKUP_STUCK_HOURS
 }
 
 #[cfg(test)]
@@ -2184,4 +2476,127 @@ The following packages have been kept back:
         assert_eq!(rel.len(), 1);
         assert_eq!(rel[0].1, vec!["netscript-2.4".to_string()]);
     }
+}
+
+
+/// Where the forwarding rule lives. Numbered so it loads after the
+/// distribution's own rules and cannot be mistaken for one of them.
+pub const SYSLOG_CONF: &str = "/etc/rsyslog.d/60-patchpanel.conf";
+
+/// Turn forwarding on or off, and say what actually happened.
+///
+/// Only ever called because somebody asked for this machine specifically. It
+/// writes one file and reloads one service, and on the way out it verifies the
+/// result rather than reporting success because the write returned no error -
+/// an rsyslog that refuses the config keeps running with the old rules and says
+/// nothing, which looks identical to working.
+pub async fn configure_syslog(
+    enable: bool,
+    target: &str,
+    min_severity: &str,
+    p: &Progress,
+) -> Result<String> {
+    if !enable {
+        if !std::path::Path::new(SYSLOG_CONF).exists() {
+            return Ok("forwarding was not configured; nothing to remove".into());
+        }
+        // Kept beside it rather than deleted, the same as a source file: the
+        // undo has to be possible without this tool.
+        let backup = format!("{SYSLOG_CONF}.removed");
+        let _ = std::fs::rename(SYSLOG_CONF, &backup);
+        p.line("removed the forwarding rule");
+        reload_rsyslog(p).await?;
+        return Ok(format!(
+            "forwarding stopped; the previous rule is at {backup}"
+        ));
+    }
+
+    // Severity names rsyslog accepts. Rejected here rather than written and
+    // discovered broken at reload, which would take the machine's logging with
+    // it until somebody noticed.
+    const LEVELS: [&str; 8] = [
+        "emerg", "alert", "crit", "err", "warning", "notice", "info", "debug",
+    ];
+    let level = min_severity.trim().to_lowercase();
+    if !LEVELS.contains(&level.as_str()) {
+        anyhow::bail!("{min_severity:?} is not an rsyslog severity; use one of {LEVELS:?}");
+    }
+    if target.trim().is_empty() {
+        anyhow::bail!("no portal address to forward to");
+    }
+
+    // A journald-only host has nowhere to put this, and saying so is better
+    // than writing a file nothing will ever read.
+    let has_rsyslog = ["/usr/sbin/rsyslogd", "/sbin/rsyslogd", "/usr/bin/rsyslogd"]
+        .iter()
+        .any(|p| std::path::Path::new(p).exists());
+    if !has_rsyslog {
+        anyhow::bail!(
+            "rsyslog is not installed here, so there is nothing to configure. \
+             A journald-only host needs a different mechanism."
+        );
+    }
+
+    let conf = format!(
+        "# Written by PatchPanel. Remove this file and reload rsyslog to stop.\n\
+         # Only {level} and worse is sent, so this stays a trickle.\n\
+         *.{level} @{target}\n"
+    );
+    p.line(&format!("writing {SYSLOG_CONF}"));
+    std::fs::write(SYSLOG_CONF, &conf)
+        .with_context(|| format!("writing {SYSLOG_CONF}"))?;
+
+    // rsyslog can check a config without loading it, which is the difference
+    // between finding out now and finding out when logging has stopped.
+    let check = exec::run("rsyslogd", &["-N1"], p).await;
+    if let Ok(o) = &check {
+        if o.code != 0 {
+            let _ = std::fs::remove_file(SYSLOG_CONF);
+            anyhow::bail!(
+                "rsyslog rejected the configuration, so it was removed and nothing changed:\n{}",
+                exec::tail(&o.text, 800)
+            );
+        }
+    }
+
+    reload_rsyslog(p).await?;
+    Ok(format!("forwarding {level} and worse to {target}"))
+}
+
+async fn reload_rsyslog(p: &Progress) -> Result<()> {
+    // A reload, not a restart: restarting drops whatever is in flight, and the
+    // point of this is not to lose lines.
+    for args in [
+        &["reload", "rsyslog"][..],
+        &["restart", "rsyslog"][..],
+    ] {
+        if let Ok(o) = exec::run("systemctl", args, p).await {
+            if o.code == 0 {
+                return Ok(());
+            }
+        }
+    }
+    anyhow::bail!("could not reload rsyslog; the file was written but is not in effect")
+}
+
+/// What this machine is forwarding, read back off disk.
+///
+/// Observed rather than remembered. An agent that restarts has no idea what it
+/// configured last week, and reporting "off" from that ignorance is how the
+/// portal ends up confidently wrong.
+pub fn syslog_forward() -> Option<pp_proto::SyslogForward> {
+    let text = std::fs::read_to_string(SYSLOG_CONF).ok()?;
+    let line = text
+        .lines()
+        .find(|l| !l.trim_start().starts_with('#') && l.contains('@'))?;
+    let (selector, target) = line.split_once('@')?;
+    Some(pp_proto::SyslogForward {
+        target: target.trim().to_string(),
+        min_severity: selector
+            .trim()
+            .trim_start_matches("*.")
+            .trim()
+            .to_string(),
+        path: SYSLOG_CONF.to_string(),
+    })
 }

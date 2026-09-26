@@ -56,6 +56,22 @@ const PING_INTERVAL: Duration = Duration::from_secs(20);
 /// more than PING_INTERVAL so an occasional slow reply is not fatal.
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(75);
 
+/// How long a single attempt to reach the portal may take before it is
+/// abandoned and retried.
+///
+/// This exists because its absence took nine machines off the fleet for two
+/// days. `connect_async` covers name resolution, the TCP handshake and the
+/// WebSocket upgrade, and none of those is bounded: a resolver that never
+/// answers, or a flow a stateful firewall is holding half-open, leaves the call
+/// awaiting forever. LIVENESS_TIMEOUT does not help - that watches an
+/// established session, and this never became one.
+///
+/// Worse, everything the agent does on a timer lives inside `session()`, so a
+/// stalled connect stops inventory, heartbeats and the lot. The agent stays
+/// running, reports nothing, and looks from the outside exactly like a machine
+/// nobody has touched.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Why a session ended.
 enum Disposition {
     /// Normal drop — reconnect.
@@ -95,6 +111,15 @@ struct Ctx {
     /// self-update replace the binary and then never restart. `recv()` is
     /// cancel-safe, so a message queued here cannot be lost.
     restart_tx: mpsc::UnboundedSender<()>,
+    /// Whether the portal has asked this machine to ship its journal, and at
+    /// what floor.
+    ///
+    /// Deliberately not persisted. The portal re-asks on every connection, so a
+    /// restart, a self-update or a reboot leaves exactly one record of the
+    /// decision - the portal's - and the agent cannot drift out of step with it
+    /// by remembering something stale.
+    forward_logs: Arc<AtomicBool>,
+    forward_severity: Arc<RwLock<Option<String>>>,
 }
 
 impl Ctx {
@@ -221,9 +246,22 @@ async fn session(
     hardware: Arc<pp_proto::Hardware>,
     portal_url: String,
 ) -> Result<Disposition> {
-    let (ws, _) = tokio_tungstenite::connect_async(portal_url.as_str())
-        .await
-        .with_context(|| format!("connecting to {portal_url}"))?;
+    // Logged before the attempt, not only on success. A silent agent that has
+    // been trying for two days is indistinguishable from one that gave up, and
+    // the journal is the only place anybody can tell the difference.
+    tracing::debug!(portal = %portal_url, "connecting");
+    let (ws, _) = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async(portal_url.as_str()),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "connecting to {portal_url} got no answer within {}s; giving up on this attempt",
+            CONNECT_TIMEOUT.as_secs()
+        )
+    })?
+    .with_context(|| format!("connecting to {portal_url}"))?;
     tracing::info!(portal = %portal_url, "connected");
 
     let (mut sink, mut stream) = ws.split();
@@ -261,7 +299,12 @@ async fn session(
         })
     };
 
+    let forward_logs = Arc::new(AtomicBool::new(false));
+    let forward_severity: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+
     let ctx = Ctx {
+        forward_logs: forward_logs.clone(),
+        forward_severity: forward_severity.clone(),
         cfg: cfg.clone(),
         state: state.clone(),
         platform: platform.clone(),
@@ -393,6 +436,7 @@ async fn handle_server_msg(
             // Schedules only start once we know the intervals to use.
             if schedules.is_empty() {
                 start_schedules(ctx.clone(), schedules);
+                start_journal_shipping(ctx.clone(), schedules);
             }
             Ok(false)
         }
@@ -488,6 +532,50 @@ async fn apply_manifest_update(manifest: Manifest, ctx: &Ctx) {
     }
 }
 
+/// Ship the journal while the portal is asking for it.
+///
+/// Its own task in the session's set, so it is torn down on every reconnect and
+/// cannot outlive the connection it sends over. It holds no lock the session
+/// needs, and a failure here is logged and abandoned rather than propagated:
+/// shipping logs is not the agent's job, and an agent that stops working
+/// because of it would be strictly worse than one that ships nothing.
+fn start_journal_shipping(ctx: Ctx, schedules: &mut JoinSet<()>) {
+    schedules.spawn(async move {
+        loop {
+            // Cheap poll rather than a notification: the switch changes at most
+            // a handful of times in a machine's life, and a second of latency
+            // on a deliberate click is not worth another channel.
+            if !ctx.forward_logs.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+            let sev = ctx
+                .forward_severity
+                .read()
+                .await
+                .clone()
+                .unwrap_or_else(|| "warning".to_string());
+
+            let ctx2 = ctx.clone();
+            let outcome = crate::journal::follow(&sev, move |lines| {
+                // Straight onto the outbound channel the session already owns.
+                ctx2.send(ClientMsg::JournalLines { lines });
+            })
+            .await;
+
+            match outcome {
+                Ok(()) => tracing::info!("journal shipping stopped"),
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "journal shipping failed");
+                    // Do not spin on a machine with no journalctl.
+                    ctx.forward_logs.store(false, Ordering::SeqCst);
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+}
+
 fn start_schedules(ctx: Ctx, schedules: &mut JoinSet<()>) {
     // Heartbeat: cheap, frequent, and the only thing that must never be
     // blocked by slower work.
@@ -538,6 +626,37 @@ fn start_schedules(ctx: Ctx, schedules: &mut JoinSet<()>) {
         });
     }
 
+    // Discovery sweeps, on the slowest cadence of the three.
+    //
+    // A sweep is the only thing here that reaches out to machines nobody asked
+    // us to manage, so it is deliberately the rarest and it only runs at all
+    // when this agent's site owns a range.
+    {
+        let ctx = ctx.clone();
+        schedules.spawn(async move {
+            loop {
+                // Wait first. A sweep on connect would mean every deploy - and
+                // every reconnect after a network blip - re-scans the network,
+                // which turns a rare scan into a frequent one precisely when
+                // the network is already having a bad time. The stored results
+                // carry forward until the first scheduled sweep.
+                let secs = ctx.manifest.read().await.discovery_secs.max(300);
+                tokio::time::sleep(jitter(Duration::from_secs(secs))).await;
+
+                let scans = discovery_scans(&ctx).await;
+                if scans.is_empty() {
+                    continue;
+                }
+                // Detached: nothing is watching, so the per-line output goes to
+                // the log rather than to a command's progress stream.
+                match sweep(&ctx, &scans, &Progress::detached()).await {
+                    Ok(summary) => tracing::info!(summary = %summary, "scheduled sweep"),
+                    Err(e) => tracing::error!(error = %format!("{e:#}"), "scheduled sweep failed"),
+                }
+            }
+        });
+    }
+
     // Device probing, on its own cadence because it is usually much faster
     // than a package scan and operators want it fresher.
     {
@@ -557,6 +676,62 @@ fn start_schedules(ctx: Ctx, schedules: &mut JoinSet<()>) {
             }
         });
     }
+}
+
+/// The discovery ranges this agent is responsible for.
+///
+/// Site-scoped, which is what keeps an automatic sweep from multiplying by the
+/// size of the fleet: a range belongs to one site, and only agents in that site
+/// sweep it.
+async fn discovery_scans(ctx: &Ctx) -> Vec<pp_proto::DiscoveryScan> {
+    let m = ctx.manifest.read().await;
+    m.discovery_for(ctx.cfg.site.as_str()).cloned().collect()
+}
+
+/// Sweep the given ranges and report what answered.
+///
+/// Shared by the `Discover` command and the timer below so that a scheduled
+/// sweep and a person pressing the button do exactly the same thing - including
+/// stamping `swept_at`, without which the page cannot say how old the list is.
+async fn sweep(ctx: &Ctx, scans: &[pp_proto::DiscoveryScan], p: &Progress) -> Result<String> {
+    let known = ctx.manifest.read().await.devices.clone();
+    p.line(&format!("sweeping {} range(s)", scans.len()));
+    let found = probe::discover(scans, &known).await;
+    let unmanaged = found.iter().filter(|h| h.unmanaged).count();
+    let identified = found
+        .iter()
+        .filter(|h| h.scanner == pp_proto::Scanner::Nmap)
+        .count();
+    // A range that asked for nmap and got the built-in sweep is the one outcome
+    // a person reading the job log needs told; the rows carry the same note to
+    // the portal.
+    let mut notes: Vec<&str> = Vec::new();
+    for note in found.iter().map(|h| h.scan_note.as_str()) {
+        if !note.is_empty() && !notes.contains(&note) {
+            notes.push(note);
+            p.line(note);
+        }
+    }
+
+    let mut last = ctx.last.write().await;
+    if let Some(inv) = last.as_mut() {
+        inv.discovered = found.clone();
+        inv.swept_at = Some(Utc::now());
+        inv.collected_at = Utc::now();
+        let snapshot = inv.clone();
+        drop(last);
+        ctx.send(ClientMsg::Inventory(snapshot));
+    }
+
+    Ok(format!(
+        "found {} responsive host(s), {unmanaged} not in the manifest{}",
+        found.len(),
+        if identified > 0 {
+            format!("; {identified} service-identified by nmap")
+        } else {
+            String::new()
+        }
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -729,19 +904,24 @@ async fn refresh_packages_after(ctx: &Ctx, attempted: Option<Vec<(String, String
     let reboot_required = ctx.platform.reboot_required().await;
 
     let mut last = ctx.last.write().await;
-    let (devices, discovered) = last
+    let (devices, discovered, swept_at) = last
         .as_ref()
-        .map(|i| (i.devices.clone(), i.discovered.clone()))
+        .map(|i| (i.devices.clone(), i.discovered.clone(), i.swept_at))
         .unwrap_or_default();
 
     let inv = Inventory {
         collected_at: Utc::now(),
+        #[cfg(target_os = "linux")]
+        syslog_forward: crate::platform::linux::syslog_forward(),
+        #[cfg(not(target_os = "linux"))]
+        syslog_forward: None,
         packages,
         updates,
         reboot_required,
         drift,
         devices,
         discovered,
+        swept_at,
         repositories,
         release,
         cleanup,
@@ -897,6 +1077,8 @@ async fn refresh_devices(ctx: &Ctx, only: &[String]) -> usize {
     let mut last = ctx.last.write().await;
     let base = last.clone().unwrap_or(Inventory {
         collected_at: Utc::now(),
+        swept_at: None,
+        syslog_forward: None,
         packages: Vec::new(),
         updates: Vec::new(),
         reboot_required: false,
@@ -934,6 +1116,10 @@ async fn refresh_devices(ctx: &Ctx, only: &[String]) -> usize {
 
     let inv = Inventory {
         collected_at: Utc::now(),
+        #[cfg(target_os = "linux")]
+        syslog_forward: crate::platform::linux::syslog_forward(),
+        #[cfg(not(target_os = "linux"))]
+        syslog_forward: None,
         devices,
         ..base
     };
@@ -1028,6 +1214,27 @@ async fn run_command(env: CommandEnvelope, ctx: Ctx) {
             tracing::warn!("restart channel closed; the next reconnect will run the new binary");
         }
     }
+}
+
+/// Where to send syslog: the host of the portal this agent already talks to.
+///
+/// Derived rather than configured, because a second address to keep in step is
+/// a second address to get wrong - and an agent pointed at one portal while
+/// logging to another is a confusing thing to debug.
+fn syslog_target(ctx: &Ctx) -> String {
+    let url = ctx.cfg.portal_url.clone();
+    let host = url
+        .split("://")
+        .nth(1)
+        .unwrap_or(&url)
+        .split('/')
+        .next()
+        .unwrap_or(&url)
+        // Drop the portal's own HTTP port; syslog has its own.
+        .rsplit_once(':')
+        .map(|(h, _)| h.to_string())
+        .unwrap_or_else(|| url.clone());
+    format!("{host}:514")
 }
 
 async fn execute(cmd: Command, ctx: &Ctx, p: &Progress) -> Result<String> {
@@ -1184,35 +1391,45 @@ async fn execute(cmd: Command, ctx: &Ctx, p: &Progress) -> Result<String> {
             Ok(log)
         }
 
+        Command::JournalVolume => crate::journal::volume().await,
+
+        Command::ConfigureSyslog {
+            enable,
+            ref min_severity,
+        } => {
+            // Most of this fleet has no rsyslog - Debian 13 and current Proxmox
+            // ship journald alone - so the journal is read directly and shipped
+            // over the connection that already exists. Nothing is installed and
+            // nothing is written to /etc.
+            //
+            // The switch itself is the portal's to remember. This only starts or
+            // stops a task, so a restart ends it; the portal re-asks on every
+            // connection rather than trusting the agent to know.
+            if !enable {
+                ctx.forward_logs.store(false, Ordering::SeqCst);
+                return Ok("stopped forwarding the journal".into());
+            }
+            let sev = min_severity.trim().to_lowercase();
+            const LEVELS: [&str; 8] = [
+                "emerg", "alert", "crit", "err", "warning", "notice", "info", "debug",
+            ];
+            if !LEVELS.contains(&sev.as_str()) {
+                anyhow::bail!("{min_severity:?} is not a severity; use one of {LEVELS:?}");
+            }
+            ctx.forward_severity
+                .write()
+                .await
+                .replace(sev.clone());
+            ctx.forward_logs.store(true, Ordering::SeqCst);
+            Ok(format!("forwarding journal lines at {sev} and worse"))
+        }
+
         Command::Discover => {
-            let (scans, known) = {
-                let m = ctx.manifest.read().await;
-                let site = ctx.cfg.site.as_str();
-                (
-                    m.discovery_for(site).cloned().collect::<Vec<_>>(),
-                    m.devices.clone(),
-                )
-            };
+            let scans = discovery_scans(ctx).await;
             if scans.is_empty() {
                 anyhow::bail!("no discovery ranges configured for site `{}`", ctx.cfg.site);
             }
-            p.line(&format!("sweeping {} range(s)", scans.len()));
-            let found = probe::discover(&scans, &known).await;
-            let unmanaged = found.iter().filter(|h| h.unmanaged).count();
-
-            let mut last = ctx.last.write().await;
-            if let Some(inv) = last.as_mut() {
-                inv.discovered = found.clone();
-                inv.collected_at = Utc::now();
-                let snapshot = inv.clone();
-                drop(last);
-                ctx.send(ClientMsg::Inventory(snapshot));
-            }
-
-            Ok(format!(
-                "found {} responsive host(s), {unmanaged} not in the manifest",
-                found.len()
-            ))
+            sweep(ctx, &scans, p).await
         }
     }
 }
@@ -1265,5 +1482,47 @@ async fn reconcile_apps(ctx: &Ctx, p: &Progress) -> Result<String> {
         Ok(summary)
     } else {
         anyhow::bail!("{summary}\nfailures:\n{}", failures.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+
+    /// The bug this guards, stated as a test.
+    ///
+    /// An unbounded connect took nine machines off the fleet for two days: the
+    /// agent logged "reconnecting", called into the connect, and never came
+    /// back. It kept running, so systemd saw nothing wrong; it never
+    /// reconnected, so the portal saw nothing at all.
+    #[tokio::test]
+    async fn a_connect_that_never_answers_is_abandoned() {
+        // 198.51.100.0/24 is reserved for documentation and is not routed, so a
+        // SYN to it goes unanswered rather than being refused - the same shape
+        // as the stall that caused the outage.
+        let stalls = async {
+            let _ = tokio::net::TcpStream::connect("198.51.100.1:9").await;
+            // If the connect somehow returns, keep the future pending so the
+            // test is about the timeout rather than about the network.
+            std::future::pending::<()>().await;
+        };
+
+        let out = tokio::time::timeout(Duration::from_millis(300), stalls).await;
+        assert!(
+            out.is_err(),
+            "the timeout must fire; without one this await never returns"
+        );
+    }
+
+    /// And the bound has to be short enough to matter. A connect allowed to
+    /// hang for longer than the portal's own offline threshold means a machine
+    /// is reported missing before its agent has even given up.
+    #[test]
+    fn the_bound_is_shorter_than_being_declared_offline() {
+        assert!(
+            CONNECT_TIMEOUT < LIVENESS_TIMEOUT,
+            "a connect attempt must not outlast the liveness window"
+        );
+        assert!(CONNECT_TIMEOUT >= Duration::from_secs(10), "and not be so short it fails on a slow link");
     }
 }

@@ -32,6 +32,25 @@ pub struct DeviceSpec {
     /// gets probed by one machine, and the only question is which.
     #[serde(default)]
     pub collector: String,
+    /// Where to go to do something about it: the device's own management
+    /// page. PatchPanel does not update appliances, so the next step is always
+    /// somewhere else, and hunting for the address is the boring part.
+    #[serde(default)]
+    pub url: String,
+    /// Where to learn the version this device *should* be running.
+    ///
+    /// Most appliances will tell you what they are running and nothing about
+    /// whether that is current - the two halves come from different places.
+    /// Given both, PatchPanel can say "behind" instead of just printing a
+    /// number nobody can judge.
+    #[serde(default)]
+    pub latest_url: String,
+    /// RFC-6901 pointer into the response, e.g. `/homeassistant/default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_pointer: Option<String>,
+    /// Regex with one capture group, for a response that is not JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_regex: Option<String>,
     /// Firmware the device is supposed to be running. A mismatch is reported
     /// as drift; PatchPanel never pushes firmware itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,6 +142,24 @@ pub enum Probe {
         check_releases: bool,
     },
 
+    /// Ask Home Assistant what it is running, and optionally keep it there.
+    ///
+    /// HA tracks updates for itself, its add-ons, and every device it manages
+    /// - 85 of them on a modest install - which is far more than its `/config`
+    /// endpoint admits to. It also has no read-only credential: a long-lived
+    /// token can do anything the user can, so the only meaningful control over
+    /// what PatchPanel does with it is here, in `auto_update`.
+    HomeAssistant {
+        /// Profile > Security > Long-lived access tokens.
+        token: String,
+        #[serde(default)]
+        insecure: bool,
+        /// What PatchPanel installs by itself. Off by default: this is the one
+        /// probe that can change the thing it is looking at.
+        #[serde(default)]
+        auto_update: HaAutoUpdate,
+    },
+
     /// Open a TCP port and optionally read whatever banner comes back.
     Tcp {
         port: u16,
@@ -131,6 +168,22 @@ pub enum Probe {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         version_regex: Option<String>,
     },
+}
+
+/// How much of Home Assistant PatchPanel keeps updated by itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HaAutoUpdate {
+    /// Report only. Home Assistant updates on its own terms, or you do.
+    #[default]
+    Off,
+    /// Home Assistant itself, its operating system, supervisor and add-ons.
+    /// Not the firmware of the devices it manages.
+    Software,
+    /// The above, and device firmware. Firmware is the one thing here that can
+    /// leave hardware that does not come back, so it is never included by
+    /// accident.
+    Everything,
 }
 
 fn default_check_hours() -> u32 {
@@ -148,6 +201,18 @@ pub const OID_SYS_DESCR: &str = "1.3.6.1.2.1.1.1.0";
 pub struct DeviceReport {
     pub id: String,
     pub target: String,
+    /// The address this target actually resolved to, from the collector that
+    /// probed it.
+    ///
+    /// Devices are declared by name and a sweep finds addresses, so nothing can
+    /// connect "192.168.6.1" to "winetown router" without this - and the portal
+    /// is the wrong place to resolve it, because that would mean blocking DNS
+    /// lookups inside an endpoint the dashboard polls every few seconds. The
+    /// collector has already resolved the name in order to probe it, so this
+    /// costs nothing and, unlike a lookup done later somewhere else, it is the
+    /// address the probe genuinely spoke to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_ip: Option<String>,
     pub reachable: bool,
     /// Extracted version string, when the probe was able to find one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,6 +262,17 @@ pub struct DiscoveryScan {
     /// Site whose collector performs the sweep.
     #[serde(default)]
     pub site: String,
+    /// Hand this range to `nmap` instead of the built-in connect sweep.
+    ///
+    /// Opt-in because it is a second binary that may not be installed, and
+    /// because a version scan is an order of magnitude more traffic than a
+    /// connect is - it speaks each protocol rather than reading whatever the
+    /// port happens to say first. What it buys is the difference between "22
+    /// is open" and "Dropbear sshd 2022.82", which is what decides whether a
+    /// row is actionable. A collector without nmap falls back to the sweep and
+    /// says so on every host it reports.
+    #[serde(default)]
+    pub use_nmap: bool,
 }
 
 fn default_probe_ports() -> Vec<u16> {
@@ -208,9 +284,109 @@ fn default_probe_ports() -> Vec<u16> {
 pub struct DiscoveredHost {
     pub ip: String,
     pub open_ports: Vec<u16>,
-    /// Best-effort identification from banners, e.g. "SSH-2.0-dropbear".
+    /// Best-effort identification: a banner line from the built-in sweep, or
+    /// the software nmap named, e.g. "Dropbear sshd 2022.82".
     #[serde(default)]
     pub hint: String,
     /// False once a `DeviceSpec` in the manifest covers this address.
     pub unmanaged: bool,
+    /// What each open port turned out to be. Only ever the ports a scanner
+    /// actually spoke to and recognised, so a short list against a long
+    /// `open_ports` means most of them are still a mystery.
+    #[serde(default)]
+    pub services: Vec<DiscoveredService>,
+    /// Which scanner produced this row.
+    ///
+    /// On the wire rather than inferred from the manifest, because the manifest
+    /// says what was asked for and this says what happened. A range set to use
+    /// nmap on a collector that has none comes back from the built-in sweep,
+    /// and a row with no services then means "nothing was identified" rather
+    /// than "nothing could be".
+    #[serde(default)]
+    pub scanner: Scanner,
+    /// Why this row came from a different scanner than the one asked for.
+    ///
+    /// Repeated on every host of the affected sweep: a discovery result is a
+    /// list of hosts and nothing else, so there is nowhere else for a sweep to
+    /// leave a note that survives the trip to the portal.
+    #[serde(default)]
+    pub scan_note: String,
+    /// What the scanner concluded about the host itself. Empty from the
+    /// built-in sweep, which cannot see any of it.
+    #[serde(default)]
+    pub identity: HostIdentity,
+}
+
+/// What nmap concluded about a host itself, as opposed to one of its ports.
+///
+/// Every field here is a guess with a stated confidence, which is why the
+/// accuracy travels with the name. An OS fingerprint reported as fact is the
+/// kind of thing somebody acts on and then spends an afternoon confused by.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HostIdentity {
+    /// Best OS match, and how sure nmap is of it, 0-100.
+    #[serde(default)]
+    pub os: String,
+    #[serde(default)]
+    pub os_accuracy: u8,
+    /// Other matches it considered, best first. Kept because a 90% and an 88%
+    /// guess are not the same thing as one confident answer.
+    #[serde(default)]
+    pub os_alternatives: Vec<String>,
+    /// Hardware address and the vendor that owns its OUI prefix. Only present
+    /// on the scanner's own segment - a MAC does not cross a router - and the
+    /// single most reliable identifier here, because it is assigned rather than
+    /// inferred.
+    #[serde(default)]
+    pub mac: String,
+    #[serde(default)]
+    pub mac_vendor: String,
+    /// Seconds of uptime nmap inferred from TCP timestamps. Approximate, absent
+    /// more often than not, and discarded below an hour - see `nmap.rs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uptime_secs: Option<i64>,
+    /// Platform CPEs from the OS fingerprint, e.g. `cpe:/o:linux:linux_kernel:5.4`.
+    /// The one machine-readable identifier in the record, and what a CVE list
+    /// wants as its query.
+    #[serde(default)]
+    pub os_cpe: Vec<String>,
+}
+
+/// One open port, as far as the scanner could tell.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredService {
+    pub port: u16,
+    /// The protocol the scanner spoke, in nmap's vocabulary: "ssh", "http",
+    /// "ssl/http". Never filled in from the port number alone - that is a
+    /// lookup table, not evidence, and the port is already in `open_ports`.
+    #[serde(default)]
+    pub name: String,
+    /// The software behind it, e.g. "Dropbear sshd". Empty when the scanner
+    /// recognised the protocol but not what was speaking it.
+    #[serde(default)]
+    pub product: String,
+    #[serde(default)]
+    pub version: String,
+    /// Whatever else the probe learned, in nmap's own words - "Ubuntu Linux;
+    /// protocol 2.0" for an OpenSSH banner, "workgroup: WORKGROUP" for SMB.
+    /// Often the most informative field on the row and the one most likely to
+    /// name the distribution.
+    #[serde(default)]
+    pub extra: String,
+    /// The CPE identifiers nmap matched, e.g. `cpe:/o:linux:linux_kernel`.
+    /// Machine-readable and worth keeping verbatim: it is the only field here
+    /// that another tool could join on.
+    #[serde(default)]
+    pub cpe: Vec<String>,
+}
+
+/// How a host was found.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scanner {
+    /// The agent's own connect sweep: open ports, and the first line anything
+    /// volunteered.
+    #[default]
+    Tcp,
+    Nmap,
 }

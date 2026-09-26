@@ -9,8 +9,34 @@ use axum::routing::get;
 use axum::Router;
 
 pub fn routes() -> Router {
-    Router::new().route("/", get(|| async { Html(INDEX) }))
+    Router::new()
+        .route("/", get(|| async { Html(INDEX) }))
+        // Browsers and monitoring tools ask for this whether or not the page
+        // declares an icon, and a 404 on every visit is noise in the log.
+        .route("/favicon.ico", get(favicon))
+        .route("/favicon.svg", get(favicon))
 }
+
+/// The same mark the page declares inline, served for anything that asks for
+/// it by path. Vector, so one asset covers every size, and no binary file has
+/// to ship beside a single-binary portal.
+async fn favicon() -> impl axum::response::IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "image/svg+xml"),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        FAVICON,
+    )
+}
+
+const FAVICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="12" fill="#161a20"/>
+  <rect x="10" y="18" width="44" height="28" rx="4" fill="none" stroke="#58a6ff" stroke-width="4"/>
+  <circle cx="22" cy="32" r="4" fill="#3fb950"/>
+  <circle cx="32" cy="32" r="4" fill="#3fb950"/>
+  <circle cx="42" cy="32" r="4" fill="#d29922"/>
+</svg>"##;
 
 const INDEX: &str = r##"<!doctype html>
 <html lang="en">
@@ -18,6 +44,7 @@ const INDEX: &str = r##"<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PatchPanel</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='12' fill='%23161a20'/><rect x='10' y='18' width='44' height='28' rx='4' fill='none' stroke='%2358a6ff' stroke-width='4'/><circle cx='22' cy='32' r='4' fill='%233fb950'/><circle cx='32' cy='32' r='4' fill='%233fb950'/><circle cx='42' cy='32' r='4' fill='%23d29922'/></svg>">
 <style>
   :root {
     color-scheme: light dark;
@@ -62,14 +89,21 @@ const INDEX: &str = r##"<!doctype html>
     font-size: 11px; font-family: var(--mono); line-height: 17px;
     background: var(--warn); color: var(--panel); }
   .badge.bad { background: var(--bad); }
+  /* Nothing to do is worth saying, not hiding: a zero in the same place the
+     number lives reads at a glance as "checked, and fine". */
+  .badge.ok { background: var(--ok); }
   main { padding: 20px; max-width: 1400px; margin: 0 auto; }
   section { display: none; }
   section.active { display: block; }
 
-  .tiles { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin-bottom: 20px; }
-  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
-  .tile .n { font-size: 26px; font-weight: 600; line-height: 1.1; font-variant-numeric: tabular-nums; }
-  .tile .l { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  /* Eleven of these wrapped onto two rows and pushed the fleet table below
+     the fold. They are a glance, not a dashboard: number beside label, sized
+     to the content, wrapping only when the window genuinely cannot hold them. */
+  .tiles { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 6px 10px; display: flex; align-items: baseline; gap: 6px; }
+  .tile .n { font-size: 17px; font-weight: 600; line-height: 1.2; font-variant-numeric: tabular-nums; }
+  .tile .l { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
   .tile.warn .n { color: var(--warn); }
   .tile.bad .n { color: var(--bad); }
 
@@ -165,6 +199,148 @@ const INDEX: &str = r##"<!doctype html>
   .namefld:hover { border-color: var(--line); }
   .namefld:focus { border-color: var(--accent); background: var(--bg); outline: none; }
   .namefld::placeholder { color: var(--muted); font-style: italic; }
+  /* Two weeks at a glance. Days are equal width so the shape of a schedule -
+     nightly, weekly, nothing - is visible without reading any of it. */
+  .calwrap { overflow-x: auto; }
+  .calhead, .cal { display: grid; grid-template-columns: repeat(7, minmax(74px, 1fr)); gap: 4px; }
+  .calhead { margin: 10px 14px 4px; }
+  .calhead div { font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase;
+    color: var(--muted); }
+  .cal { margin: 0 14px 12px; }
+  .cal .day { border: 1px solid var(--line); border-radius: 7px; padding: 5px 6px 8px;
+    min-height: 96px; background: var(--bg); display: flex; flex-direction: column; gap: 3px; }
+  .cal .day.out { opacity: .3; }
+  .cal .day.today { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+  .cal .d { font-family: var(--mono); font-size: 10px; color: var(--muted);
+    display: flex; justify-content: space-between; align-items: baseline; }
+  .cal .d b { color: var(--ink); font-size: 12px; }
+  .cal .day.today .d b { color: var(--accent); }
+  /* A repeating schedule has exactly one thing to say, and three pixels is
+     enough to say it. Spelling out "05:00 fun" on fourteen identical cells
+     spends a grid on nine characters. */
+  .cal .tick { height: 3px; border-radius: 2px; background: var(--accent); opacity: .4;
+    flex: none; }
+  .cal .ev { border-left: 2px solid var(--muted); padding-left: 5px; font-size: 10.5px;
+    line-height: 1.3; overflow: hidden; flex: none; white-space: normal; }
+  .cal .ev .t { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+  .cal .ev .o { color: var(--muted); display: block; }
+  .cal .ev.ran { border-left-color: var(--ink); }
+  .cal .ev.nothing { border-left-color: var(--line); color: var(--muted); }
+  .cal .ev.failed { border-left-color: var(--bad); }
+  .cal .ev.manual { border-left-color: var(--accent); }
+  .cal .ev.job { border-left-style: dotted; }
+  .cal .ev.next { border-left-style: dashed; border-left-color: var(--accent); }
+  .callegend { display: flex; flex-wrap: wrap; gap: 6px 15px; margin: 0 14px 12px;
+    font-size: 11.5px; color: var(--muted); }
+  .callegend span { display: inline-flex; align-items: center; gap: 6px; }
+  .callegend em { width: 13px; border-top: 2px solid var(--muted); font-style: normal; }
+  .callegend em.ink { border-color: var(--ink); }
+  .callegend em.bad { border-color: var(--bad); }
+  .callegend em.acc { border-color: var(--accent); }
+  .callegend em.next { border-top-style: dashed; border-color: var(--accent); }
+  /* The attention list. The left rule is the only colour on a row, and it
+     carries the whole scale: red means the numbers on this page are not known
+     to be true, amber means a person must act and nothing else will, grey
+     means it is waiting on you but nothing is degrading meanwhile. */
+  /* One machine with a long second line used to widen the Machine column for
+     every row and throw the whole table into horizontal scroll. The cap is
+     what stops one row from degrading twelve others. */
+  td.machine { max-width: 320px; }
+  td.machine .msg { overflow: hidden; text-overflow: ellipsis; }
+  /* Same cap for the same reason: one embedded box answering on six ports with
+     a version string on each is wider than every other column put together. */
+  td.svc { max-width: 300px; }
+  td.what { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+  td.svc div { overflow: hidden; text-overflow: ellipsis; }
+  /* Most machines have security updates, so a pill there discriminates
+     nothing - the shape is identical down the column. Colour on the numeral
+     does the same work and leaves the row's one pill for its verdict. */
+  .sec { color: var(--bad); }
+  .of { color: var(--muted); }
+  .need { display: grid; grid-template-columns: 3px minmax(0,1fr) auto;
+    align-items: center; gap: 0 14px; padding: 9px 14px 9px 0;
+    border-bottom: 1px solid var(--line); }
+  .need:last-child { border-bottom: 0; }
+  .need .rule { align-self: stretch; background: var(--muted); border-radius: 0 2px 2px 0; }
+  .need.t1 .rule, .need.t2 .rule { background: var(--bad); }
+  .need.t3 .rule { background: var(--warn); }
+  .need .what { min-width: 0; }
+  .need .tail { color: var(--muted); font-size: 12.5px; margin-top: 1px; }
+  /* The count doubles as the control: it says how many, and opens them. */
+  .disc { font: inherit; font-size: 11.5px; font-family: var(--mono); margin-left: 6px;
+    padding: 0 6px; border-radius: 10px; border: 1px solid var(--line);
+    background: transparent; color: var(--muted); cursor: pointer; }
+  .disc:hover { border-color: var(--accent); color: var(--accent); }
+  .who { margin-top: 6px; border-left: 1px solid var(--line); padding-left: 11px; }
+  .who > div { display: grid; grid-template-columns: minmax(120px,1fr) minmax(120px,1fr) 2fr;
+    gap: 10px; font-size: 12px; color: var(--muted); padding: 2px 0; }
+  .who b { font-family: var(--mono); font-size: 12px; font-weight: 500; color: var(--ink); }
+  .proof { padding: 16px 14px; color: var(--muted); font-size: 13.5px; }
+  .proof b { color: var(--ok); font-weight: 600; }
+  h2 .sub { font-weight: 400; color: var(--muted); margin-left: 9px; font-size: 12px; }
+  /* Eleven tiles, replaced by one sentence. Every one of them was either a
+     number that also appeared in the table below it, or a number that should
+     have been a row on the list above. */
+  .gist { display: flex; flex-wrap: wrap; gap: 3px 9px; align-items: baseline;
+    padding: 10px 14px; margin-bottom: 14px; font-size: 13.5px; color: var(--muted);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 9px; }
+  .gist b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .gist span:not(:last-child)::after { content: " \00b7"; opacity: .5; }
+  /* What the jobs know, as a board rather than a list. These are a handful
+     of values somebody checks at a glance - an address, a filename, a date -
+     so they get room and alignment instead of being crammed onto a row. */
+  .board { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 12px; margin-bottom: 14px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 9px;
+    overflow: hidden; }
+  .panel > h3 { margin: 0; padding: 9px 13px; font-size: 12px; font-weight: 600;
+    letter-spacing: .04em; text-transform: uppercase; color: var(--muted);
+    border-bottom: 1px solid var(--line); display: flex; gap: 8px; align-items: baseline; }
+  .panel > h3 .when { margin-left: auto; text-transform: none; letter-spacing: 0;
+    font-weight: 400; font-size: 11.5px; }
+  .reading { display: grid; grid-template-columns: minmax(70px, auto) 1fr auto;
+    gap: 3px 12px; align-items: baseline; padding: 8px 13px;
+    border-bottom: 1px solid var(--line); }
+  .reading:last-child { border-bottom: 0; }
+  .reading .k { color: var(--muted); font-size: 12.5px; }
+  /* The value is the thing being read, so it gets the weight and the
+     tabular figures; everything around it stays quiet. */
+  .reading .v { font-family: var(--mono); font-size: 13px; color: var(--ink);
+    font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
+  .reading .since { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+  /* Something that moved in the last day is usually why you opened the page. */
+  .reading.fresh .since { color: var(--accent); }
+  tr.clicky { cursor: pointer; }
+  tr.clicky.open td { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  /* The expansion is one cell spanning the table, so it must not inherit the
+     nowrap that keeps the columns tidy. */
+  tr.detail > td { white-space: normal; background: var(--bg);
+    border-bottom: 2px solid var(--accent); }
+  tr.clicky:hover td { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  .jobgroup { display: flex; align-items: baseline; gap: 10px; padding: 9px 14px 5px;
+    border-bottom: 1px solid var(--line); background: var(--bg); }
+  .jobgroup b { font-size: 12px; letter-spacing: .04em; text-transform: uppercase; }
+  .job { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 4px 14px;
+    padding: 10px 14px; border-bottom: 1px solid var(--line); align-items: start; }
+  .job:last-of-type { border-bottom: 0; }
+  .job .nm { font-family: var(--mono); font-size: 13px; }
+  .job .facts { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 4px; }
+  .job .facts b { font-family: var(--mono); font-weight: 500; }
+  .job .when { text-align: right; white-space: nowrap; }
+  .devgrid { display: grid; gap: 12px; margin: 12px 14px;
+    grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); }
+  .dev { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px;
+    background: color-mix(in srgb, var(--panel) 55%, transparent); }
+  .dev.bad { border-color: var(--bad); }
+  .dev.warn { border-color: var(--warn); }
+  .dev h3 { margin: 0 0 2px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+  .dev .ver { font-family: var(--mono); font-size: 18px; margin: 8px 0 2px; }
+  /* A remembered reading is still worth showing - it is the last thing that
+     was true - but it must not look like a fresh one. */
+  .dev .ver.stale { color: var(--muted); }
+  .dev .foot { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
   .fld { padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px;
     background: var(--bg); color: var(--ink); font: inherit; }
   .back { display: inline-block; margin-bottom: 14px; color: var(--accent); cursor: pointer; font-size: 13px; }
@@ -218,40 +394,55 @@ const INDEX: &str = r##"<!doctype html>
   <header>
     <h1>PatchPanel</h1>
     <span class="rev" id="rev"></span>
-    <span class="pill" id="paused" hidden
-      title="You are typing, or have something selected. The page refreshes every few seconds and that would discard it, so it is holding still until you are done.">live updates paused</span>
+    <span class="pill" id="paused" hidden onclick="resumeUpdates()"
+      style="cursor:pointer"
+      title="You are typing, or have something selected. The page refreshes every few seconds and that would discard it, so it is holding still. Click to resume now - anything unsaved in a field is kept, the selection is dropped.">live updates paused &mdash; resume</span>
     <nav>
-      <button data-tab="fleet" class="active">Fleet<span class="badge" id="badge-fleet" hidden></span></button>
-      <button data-tab="devices">Devices<span class="badge" id="badge-devices" hidden></span></button>
-      <button data-tab="add">Add machine</button>
-      <button data-tab="manifest">Manifest</button>
-      <button data-tab="activity">Activity</button>
+      <button data-tab="overview" class="active">Overview<span class="badge" id="badge-overview" hidden></span></button>
+      <button data-tab="machines">Machines<span class="badge" id="badge-machines" hidden></span></button>
+      <button data-tab="schedule">Schedule</button>
+      <button data-tab="jobs">Jobs<span class="badge" id="badge-jobs" hidden></span></button>
+      <button data-tab="logs">Logs<span class="badge" id="badge-logs" hidden></span></button>
+      <button data-tab="discovered">Network<span class="badge" id="badge-network" hidden></span></button>
+      <button data-tab="backups">Backups<span class="badge" id="badge-backups" hidden></span></button>
+      <button data-tab="setup">&#9881; Setup</button>
     </nav>
   </header>
 
   <main>
-    <section id="fleet" class="active">
-      <div class="tiles" id="tiles"></div>
+    <section id="overview" class="active">
       <div class="card">
-        <h2>Agents</h2>
+        <h2>Needs you <span id="needs-sub" class="sub"></span></h2>
+        <div id="needs"></div>
+        <div class="proof" id="needs-none" hidden></div>
+      </div>
+      <div class="gist" id="gist"></div>
+    </section>
+
+    <section id="fleet">
+      <div class="card">
+        <h2>Machines</h2>
+        <div class="step" style="padding-bottom:0">
+          <input id="fleet-filter" placeholder="filter machines, pools, versions&hellip;"
+            spellcheck="false" oninput="filterRows('fleet-filter','agents')"
+            style="width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink);font-size:12.5px">
+        </div>
         <div class="scroll"><table>
           <thead><tr>
-            <th>Host</th><th>IP</th><th>OS</th><th>Site</th>
-            <th>Updates</th><th>Drift</th><th>Devices</th><th>Rev</th><th>Seen</th><th></th>
+            <th>Machine</th><th>Pool</th><th>Updates</th>
+            <th>Last patched</th><th>Seen</th><th></th>
           </tr></thead>
           <tbody id="agents"></tbody>
         </table></div>
         <div class="empty" id="agents-empty" hidden>No agents have enrolled yet.</div>
       </div>
       <div class="card">
-        <h2>Fleet actions</h2>
+        <h2>Look again <span class="sub">none of these change a machine</span></h2>
         <div class="bar">
           <button class="act" title="Re-read packages and updates on every connected machine. Changes nothing."
             onclick="broadcast('collect_inventory')">Rescan all</button>
-          <button class="act" title="Make every machine's applications match the manifest."
-            onclick="broadcast('apply_manifest')">Apply manifest to all</button>
-          <button class="act" title="Re-probe every declared IoT device now."
-            onclick="broadcast('probe_devices')">Probe devices</button>
+          <button class="act" title="Re-probe every declared appliance now."
+            onclick="broadcast('probe_devices')">Probe appliances</button>
           <button class="act" title="Sweep the manifest's discovery ranges for undeclared devices."
             onclick="broadcast('discover')">Run discovery</button>
           <span id="broadcast-msg" class="msg"></span>
@@ -263,33 +454,200 @@ const INDEX: &str = r##"<!doctype html>
       <div id="agent-body"></div>
     </section>
 
+    <section id="backups">
+      <div class="card">
+        <h2>Backups</h2>
+        <div class="step">
+          <div class="note">
+            Whether backups are happening, and whether anything is stuck. Read from each
+            hypervisor by its own agent &mdash; what ran, from the job list, and what exists,
+            from the backup storage. A job reporting success having written nothing is a real
+            failure, so a guest's date comes from the files.
+            <br><br>
+            <b>A backup existing is not a backup restoring.</b> Nothing here is a test restore.
+          </div>
+          <div id="backup-tiles" class="tiles" style="margin-top:14px"></div>
+        </div>
+      </div>
+
+      <div id="backup-alerts"></div>
+
+      <div class="card">
+        <h2>Guests</h2>
+        <div class="scroll scrolly"><table>
+          <thead><tr>
+            <th>Guest</th><th>Host</th><th>Type</th><th>State</th>
+            <th>Agent</th><th>Last backup</th><th></th>
+          </tr></thead>
+          <tbody id="backup-guests"></tbody>
+        </table></div>
+        <div class="empty" id="backup-empty" hidden>
+          No hypervisors are reporting. A Proxmox host with an agent reports its guests and
+          their backups automatically.
+        </div>
+      </div>
+
+      <div id="backup-hosts"></div>
+    </section>
+
+    <section id="pools">
+      <div class="card">
+        <h2>Create a pool</h2>
+        <div class="step">
+          <div class="note">
+            A pool decides what happens to a set of machines and when. A machine belongs to
+            at most one, so there is always a single answer to &ldquo;why did that reboot&rdquo;.
+            New pools patch <b>nothing</b> until you say otherwise.
+          </div>
+          <div class="bar" style="padding-left:0;padding-right:0;gap:10px;flex-wrap:wrap">
+            <input id="pool-name" class="fld" style="width:180px" placeholder="name, e.g. servers">
+            <select id="pool-scope" class="fld">
+              <option value="none">patch nothing</option>
+              <option value="security">security updates only</option>
+              <option value="all">everything installable</option>
+            </select>
+            <select id="pool-reboot" class="fld">
+              <option value="never">never reboot</option>
+              <option value="if-needed">reboot if it asks for one</option>
+            </select>
+            <select id="pool-when" class="fld" onchange="poolWhenChanged()">
+              <option value="manual">only when I press the button</option>
+              <option value="daily">daily</option>
+              <option value="weekly">weekly</option>
+            </select>
+            <select id="pool-dow" class="fld" hidden>
+              <option value="0">Monday</option><option value="1">Tuesday</option>
+              <option value="2">Wednesday</option><option value="3">Thursday</option>
+              <option value="4">Friday</option><option value="5">Saturday</option>
+              <option value="6">Sunday</option>
+            </select>
+            <input id="pool-time" class="fld" type="time" value="03:00" hidden>
+            <label class="msg">at once <input id="pool-conc" class="fld" type="number"
+              min="1" max="50" value="1" style="width:70px"></label>
+            <button class="act primary" onclick="savePool()">Create</button>
+            <span class="status" id="pool-status"></span>
+          </div>
+          <div class="msg">Times are the portal's local clock.</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Schedule <span class="sub">three weeks back, two forward &mdash; the portal's local clock</span></h2>
+        <div class="step">
+          <div class="msg">Mostly the past, on purpose: what a schedule <em>will</em> do is
+            derivable from the schedule itself, but what it <em>did</em> is not derivable from
+            anything else. Only the next occurrence of each pool is spelled out; later ones
+            are ticks.</div>
+        </div>
+        <div class="calwrap">
+          <div class="calhead"><div>Mon</div><div>Tue</div><div>Wed</div><div>Thu</div><div>Fri</div><div>Sat</div><div>Sun</div></div>
+          <div id="pool-calendar" class="cal"></div>
+        </div>
+        <div class="callegend">
+          <span><em class="ink"></em> ran, installed something</span>
+          <span><em></em> ran, nothing to install</span>
+          <span><em class="bad"></em> failed</span>
+          <span><em class="acc"></em> you did it by hand</span>
+          <span><em style="border-top-style:dotted"></em> a job elsewhere checked in</span>
+          <span><em class="next"></em> next occurrence</span>
+        </div>
+      </div>
+
+      <div id="pool-list"></div>
+
+      
+      <div class="card">
+        <h2>Membership</h2>
+        <div class="scroll scrolly"><table>
+          <thead><tr><th>Machine</th><th>OS</th><th>Pending</th><th>Pool</th></tr></thead>
+          <tbody id="pool-members"></tbody>
+        </table></div>
+      </div>
+    </section>
+
+    <section id="jobs">
+      <div id="job-status"></div>
+
+      <div class="card">
+        <h2>Jobs elsewhere <span class="sub">work PatchPanel does not do, reported by whatever does</span></h2>
+        <div class="step">
+          <div class="msg">A script that fails can tell you. A script that has
+            <b>stopped running</b> cannot &mdash; and silence looks exactly like success.
+            Tell PatchPanel how often each one should run and it will notice the silence
+            on its behalf. Check-ins also appear on the <a href="#schedule"
+            onclick="showTab('schedule');return false">schedule</a>, beside the runs
+            PatchPanel does own.</div>
+        </div>
+        <div id="job-rows"></div>
+        <div class="empty" id="jobs-empty" hidden>
+          Nothing checks in yet. <a href="#" onclick="showJobSetup();return false">How to add one</a>.
+        </div>
+        <div class="step" id="job-setup" hidden></div>
+      </div>
+
+      <div class="card" id="job-history" hidden></div>
+    </section>
+
     <section id="devices">
       <div class="card">
         <h2>Devices</h2>
         <div id="devices-eol" hidden></div>
-        <div class="scroll"><table>
-          <thead><tr>
-            <th>Device</th><th>Target</th><th>Site</th><th>Status</th>
-            <th>Firmware</th><th>Updates</th><th>Expected</th><th>Latency</th><th></th><th>Collector</th><th>Checked</th>
-          </tr></thead>
-          <tbody id="device-rows"></tbody>
-        </table></div>
+        <div id="device-rows" class="devgrid"></div>
         <div class="empty" id="devices-empty" hidden>
           No devices yet. Add a firewall or NAS under <b>Add machine</b>.
         </div>
       </div>
       <div class="card" id="device-history" hidden></div>
 
+    </section>
+
+    <section id="logs">
+      <div class="step">
+        <div class="msg">Two sources, one place: appliances that can only push syslog,
+          and machines whose agent has been asked to forward their journal. Turn a
+          machine on from its own page.</div>
+      </div>
       <div class="card">
-        <h2>Seen on the network, not in the manifest</h2>
+        <h2>Device logs <span class="sub" id="log-sub"></span></h2>
+        <div class="step">
+          <div class="msg">Syslog from things that cannot host an agent. A rolling
+            day, in one plain file per sender &mdash; this is not an archive, it is
+            the context you read when something looks wrong.</div>
+        </div>
+        <div id="log-silent"></div>
+        <div id="log-senders"></div>
+        <div class="empty" id="log-empty" hidden></div>
+      </div>
+
+      <div class="card" id="log-view" hidden></div>
+
+    </section>
+
+    <section id="discovered">
+      <div class="step">
+        <div class="msg">Everything that answered on the manifest's <code>discovery</code>
+          ranges, whether PatchPanel manages it or not. Machines and declared appliances
+          are named; anything nothing accounts for is marked, because that is the part
+          worth a look. Click a row for what the scan learned about it.</div>
+      </div>
+      <div class="card">
+        <h2>Seen on the network
+          <button class="act" style="float:right;padding:2px 8px;font-size:11.5px"
+            title="Sweep the manifest's discovery ranges again now, without waiting for the next automatic one. Read-only: it opens TCP connections, reads banners, and runs nmap on the ranges set to use it. It changes nothing."
+            onclick="scanNow(this)">Scan now</button></h2>
+        <div id="sweep-age"></div>
+        <div id="network-note"></div>
         <div class="scroll"><table>
-          <thead><tr><th>Address</th><th>Open ports</th><th>Banner</th><th>Site</th><th>Found by</th></tr></thead>
-          <tbody id="unmanaged-rows"></tbody>
+          <thead><tr><th>Address</th><th>What it is</th><th>Vendor</th><th>Open ports</th><th>Services</th><th>Found by</th></tr></thead>
+          <tbody id="network-rows"></tbody>
         </table></div>
-        <div class="empty" id="unmanaged-empty" hidden>
-          Nothing unaccounted for. Add a <code>discovery</code> range to the manifest to sweep for devices.
+        <div class="empty" id="network-empty" hidden>
+          Nothing has answered a sweep yet. Add a <code>discovery</code> range to the
+          manifest, and the collector for its site will sweep it on its own schedule.
         </div>
       </div>
+
+
     </section>
 
     <section id="add">
@@ -348,6 +706,7 @@ const INDEX: &str = r##"<!doctype html>
             <select id="dev-kind" onchange="deviceKindChanged()" class="fld">
               <option value="opnsense">OPNsense firewall</option>
               <option value="unraid">Unraid server</option>
+              <option value="homeassistant">Home Assistant</option>
             </select>
             <input id="dev-url" class="fld" style="min-width:320px"
               placeholder="https://router.example.net" oninput="deviceUrlChanged()">
@@ -390,6 +749,15 @@ const INDEX: &str = r##"<!doctype html>
           <button class="act" onclick="loadManifest()">Reload</button>
           <span id="manifest-msg" class="msg"></span>
         </div>
+        <div class="step">
+          <div class="msg">Publishing raises the revision; each machine picks it up on its
+            next check-in. To push it now, across the whole fleet:</div>
+          <div class="bar">
+            <button class="act" title="Install, upgrade or remove applications on every connected machine so it matches the manifest above. This changes systems."
+              onclick="broadcast('apply_manifest')">Apply manifest to all</button>
+            <span id="broadcast-msg2" class="msg"></span>
+          </div>
+        </div>
       </div>
       <div class="card">
         <h2>Agent builds</h2>
@@ -419,7 +787,25 @@ const $ = (id) => document.getElementById(id);
 let TOKEN = localStorage.getItem("pp_token") || "";
 // Read from the URL so a refresh, a bookmark, or a shared link all land on the
 // tab you were actually looking at.
-const TABS = ["fleet", "devices", "add", "manifest", "activity"];
+// A tab is a question, and more than one card can answer it: Machines shows
+// the agents and the appliances, because "what is everything running" does not
+// care which of them has an agent installed.
+const TAB_SECTIONS = {
+  overview: ["overview"],
+  machines: ["fleet", "devices"],
+  schedule: ["pools"],
+  jobs: ["jobs"],
+  logs: ["logs"],
+  discovered: ["discovered"],
+  backups: ["backups"],
+  setup: ["add", "manifest", "activity"],
+};
+const TABS = Object.keys(TAB_SECTIONS);
+// Links, bookmarks and muscle memory from the seven-tab layout still land
+// somewhere sensible rather than silently falling back to the first tab.
+const MOVED = { fleet: "machines", devices: "machines", pools: "schedule",
+  network: "discovered", unmanaged: "discovered",
+  add: "setup", manifest: "setup", activity: "setup" };
 // `#agent/<uuid>` opens one machine's page; anything else is a tab.
 // `#agent/<uuid>` opens a machine, `#agent/<uuid>/<pane>` opens it on one of
 // its tabs, so a bookmark or a shared link lands exactly where you were.
@@ -429,7 +815,8 @@ function routeOf(hash) {
     const [id, pane] = h.slice(6).split("/");
     return { tab: "agent", id, pane: pane || null };
   }
-  return { tab: TABS.includes(h) ? h : "fleet", id: null, pane: null };
+  const tab = TABS.includes(h) ? h : (MOVED[h] || "overview");
+  return { tab, id: null, pane: null };
 }
 let ROUTE = routeOf(location.hash);
 let TAB = ROUTE.tab;
@@ -509,8 +896,9 @@ function showTab(tab, id, pane) {
   // No nav button is highlighted on a detail page; it is not a tab.
   document.querySelectorAll("nav button").forEach((x) =>
     x.classList.toggle("active", x.dataset.tab === tab));
+  const shown = TAB_SECTIONS[tab] || [tab];
   document.querySelectorAll("section").forEach((s) =>
-    s.classList.toggle("active", s.id === tab));
+    s.classList.toggle("active", shown.includes(s.id)));
   if (location.hash.slice(1) !== want) location.hash = want;
   refresh();
 }
@@ -624,13 +1012,15 @@ function typingIn(el) {
 }
 
 function setHTML(el, html) {
-  if (!el || el.__lastHTML === html) return false;
+  if (!el) return false;
   if (typingIn(el)) {
     // Say so, rather than leaving a page that has quietly stopped updating.
+    // Only ever raised here; `refresh` lowers it at the start of each pass, so
+    // the state is recomputed rather than remembered.
     showPaused(true);
     return false;
   }
-  showPaused(false);
+  if (el.__lastHTML === html) return false;
   const open = new Set(
     [...el.querySelectorAll("details[open][data-k]")].map((d) => d.dataset.k)
   );
@@ -704,6 +1094,24 @@ function tailLog(details) {
   if (pre && details.open) pre.scrollTop = pre.scrollHeight;
 }
 
+// Let go of whatever is holding the page still.
+//
+// Unsaved text in a field is left alone - it is only the focus and the
+// selection that block a redraw, and an edited source file is guarded
+// separately by its own dirty flag.
+function resumeUpdates() {
+  try {
+    const sel = window.getSelection && window.getSelection();
+    if (sel) sel.removeAllRanges();
+  } catch (e) {
+    // No selection API; nothing to release.
+  }
+  const active = document.activeElement;
+  if (active && active.blur) active.blur();
+  showPaused(false);
+  refresh();
+}
+
 function showPaused(on) {
   const el = $("paused");
   if (el) el.hidden = !on;
@@ -721,6 +1129,15 @@ function jsq(value) {
     .replace(/'/g, "\\'")
     .replace(/\r?\n/g, "\\n");
   return "'" + js.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;") + "'";
+}
+
+// Sizes that stay honest at both ends. Rounding to KB turns a real file with
+// forty bytes in it into "0 KB", which reads as "nothing has arrived".
+function size(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1048576).toFixed(1)} MB`;
 }
 
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -752,32 +1169,50 @@ async function loadFleet() {
   const badge = (id, n, bad, title) => {
     const el = $(id);
     if (!el) return;
-    el.hidden = !n;
+    el.hidden = false;
     el.textContent = n > 99 ? "99+" : String(n);
-    el.className = "badge" + (bad ? " bad" : "");
+    el.className = "badge" + (n === 0 ? " ok" : bad ? " bad" : "");
     el.title = title;
   };
-  badge("badge-fleet", s.agents_pending || 0, false,
-    `${s.agents_pending || 0} machine(s) with updates to install`);
-  badge("badge-devices", (s.devices_pending || 0) + (s.devices_eol || 0), (s.devices_eol || 0) > 0,
-    `${s.devices_pending || 0} device(s) with updates` +
-    ((s.devices_eol || 0) ? `, ${s.devices_eol} at end of life` : ""));
-  $("tiles").innerHTML =
-    tile(s.online, "online") +
-    tile(s.offline, "offline", "warn") +
-    tile(s.pending_security, "security updates", "bad") +
-    tile(s.pending_updates, "updates to install", "warn") +
-    (s.deferred_updates ? tile(s.deferred_updates, "phased, not yet offered") : "") +
-    tile(s.needs_reboot, "need reboot", "warn") +
-    tile(s.app_drift, "app drift", "warn") +
-    tile(s.stale_manifest, "stale manifest", "warn") +
-    tile(s.devices, "devices") +
-    tile(s.devices_unreachable, "devices down", "bad") +
-    tile(s.devices_drifted, "firmware drift", "warn");
+  // The badge counts what needs a person, not what is pending: a machine a
+  // pool patches tonight is not something to nag about.
+  const worst = (d.attention || []).reduce((w, i) => Math.min(w, i.tier), 9);
+  badge("badge-overview", (d.attention || []).length, worst <= 2,
+    (d.attention || []).length
+      ? `${d.attention.length} thing(s) need you`
+      : "nothing needs you");
+  badge("badge-jobs", s.jobs_bad || 0, (s.jobs_bad || 0) > 0,
+    (s.jobs_bad || 0)
+      ? `${s.jobs_bad} job(s) failing or not checking in`
+      : "every job is reporting on time");
+  // Amber, not red: an unexplained host is worth a look, not an alarm.
+  badge("badge-network", s.unexplained_hosts || 0, false,
+    (s.unexplained_hosts || 0)
+      ? `${s.unexplained_hosts} host(s) answering that nothing here accounts for`
+      : "everything answering is accounted for");
+  // Red, because this one means a machine was asked to send logs and has not -
+  // which is a fault in PatchPanel, not in the machine.
+  // Amber, not red. "Asked and silent" usually means a quiet machine, and
+  // only sometimes means a fault - red is reserved for "do not trust what this
+  // page says", which this is not.
+  badge("badge-logs", s.logs_silent || 0, false,
+    (s.logs_silent || 0)
+      ? `${s.logs_silent} machine(s) asked to forward have sent nothing for over half an hour`
+      : "every machine asked to forward is sending");
+  badge("badge-backups", s.backups_at_risk || 0, (s.backups_at_risk || 0) > 0,
+    (s.backups_at_risk || 0)
+      ? `${s.backups_at_risk} running guest(s) with no recent backup`
+      : "nothing running is unprotected");
+  // Machines is a reference view; a reference view does not nag. The only
+  // thing it carries is an appliance nobody else will speak for.
+  badge("badge-machines", s.devices_eol || 0, (s.devices_eol || 0) > 0,
+    `${s.devices_eol || 0} appliance(s) past end of life`);
+  drawNeeds(d);
 
   $("agents-empty").hidden = d.agents.length > 0;
   const agentRows = d.agents.map((a) => {
-    const live = a.connected ? "on" : (a.online ? "on" : "off");
+    const live = (a.connected || a.online) ? "on"
+      : (Date.now() - new Date(a.last_seen).getTime() > 864e5 ? "bad" : "off");
     const busy = isBusy(a);
     const canAct = a.connected && !busy;
     const busyPill = busy
@@ -786,29 +1221,38 @@ async function loadFleet() {
     // Show the total, then flag the security subset in full words. The old
     // form rendered "1 sec 0" - which reads as a duration, and buried the
     // total behind an unexplained subtraction.
-    const unsafe_ = a.release_blockers > 0
-      ? ` <span class="pill bad" title="This machine's package sources are misconfigured; installing updates could break it. Open the machine for details.">unsafe</span>`
-      : "";
+    const unsafe_ = "";
     const actionable = a.actionable_count;
-    const stuck = a.deferred_count
-      ? ` <span class="msg" title="${a.deferred_count} update(s) the archive is withholding from this machine - a phased rollout. Nothing to do; they arrive on their own.">+${a.deferred_count} phased</span>`
+    const total = a.update_count;
+    // Phased and held-back explain the number; they are not separate things to
+    // act on. They belong in its tooltip rather than beside it, where they were
+    // two more pills on a row that already had five.
+    const why = [
+      a.deferred_count
+        ? `${a.deferred_count} phased - the archive is withholding them from this machine until the rollout reaches it. Nothing installs them; they arrive on their own.`
+        : "",
+      a.held_back_count ? `${a.held_back_count} held back - needs a full upgrade.` : "",
+      a.ignored_count ? `${a.ignored_count} ignored by you.` : "",
+    ].filter(Boolean).join(" ");
+    const sec = a.security_count
+      ? ` <span class="sec" title="${a.security_count} of these are security updates - patch these first">&middot; ${a.security_count} security</span>`
       : "";
-    const held = a.held_back_count
-      ? ` <span class="pill warn" title="${a.held_back_count} upgrade(s) apt will not apply without a full upgrade - often a kernel">${a.held_back_count} held</span>`
+    // One format, and it never changes shape between machines: the number you
+    // can act on, and - when the archive is withholding the difference - what
+    // it is a fraction of. "nothing to install" was one word away from "none",
+    // which hid exactly the distinction that matters.
+    const ignored = a.ignored_count
+      ? ` <span class="of">&middot; ${a.ignored_count} ignored</span>`
       : "";
     // Zero updates from a machine we could not scan is not "clean", it is
     // "unknown". Showing 0 there is the most dangerous thing this table could do.
     const upd = a.scan_issue_count
       ? `<span class="pill bad" title="Some package backends could not be scanned on this machine, so the real number is unknown. Open the machine for details.">not scanned</span>`
-      : (actionable
-          ? `${actionable}${a.security_count
-              ? ` <span class="pill bad" title="${a.security_count} of these are security updates - patch these first">${a.security_count} security</span>`
-              : ""}${held}`
-          : (a.deferred_count
-              // Everything pending is withheld by the archive, so there is
-              // nothing to install and the button is deliberately dead.
-              ? `<span class="msg">nothing to install</span>`
-              : `<span class="msg">none</span>${held}`));
+      : total === 0
+        ? `<span class="msg">none</span>${ignored}`
+        : `<span title="${esc(why)}">${actionable}</span>${
+            actionable === total ? "" : ` <span class="of" title="${esc(why)}">of ${total}</span>`
+          }${sec}${ignored}`;
     const dev = a.device_count
       ? `${a.device_count}${a.device_problem_count ? ` <span class="pill bad">${a.device_problem_count}</span>` : ""}`
       : "-";
@@ -821,21 +1265,61 @@ async function loadFleet() {
       hw.memory_mb ? `${(hw.memory_mb / 1024).toFixed(0)} GB` : "",
       hw.vendor,
     ].filter(Boolean).join(" · ");
-    const ips = (hw.ip_addresses || []).length
-      ? `${esc(hw.ip_addresses[0])}${hw.ip_addresses.length > 1 ? `<div class="msg">+${hw.ip_addresses.length - 1} more</div>` : ""}`
-      : "-";
-    return `<tr title="${esc(spec)}">
-      <td><span class="dot ${live}"></span><a href="#agent/${a.id}" style="color:inherit">${esc(a.hostname)}</a>${a.reboot_required ? ' <span class="pill warn">reboot</span>' : ""}${
-        a.guest_count ? ` <span class="pill" title="Hosts ${a.guest_count} virtual machine(s), ${a.unmanaged_guests} without an agent">${a.guest_count} VMs</span>` : ""}
-          <div class="msg">agent ${esc(a.agent_version)}</div></td>
-      <td class="mono">${ips}</td>
-      <td title="${esc(a.os_version)} ${esc(a.arch)}">${esc(a.os_version.length > 22 ? a.os_version.slice(0, 21) + "…" : a.os_version)}
-          <div class="msg mono">${esc(a.arch)}</div></td>
-      <td>${esc(a.site) || "-"}</td>
-      <td>${upd}${unsafe_}${held ? "" : ""}${stuck}${busyPill}</td>
-      <td>${a.drift_count ? `<span class="pill warn">${a.drift_count}</span>` : "-"}</td>
-      <td>${dev}</td>
-      <td class="mono">${a.applied_revision < REV ? `<span class="pill warn">r${a.applied_revision}</span>` : "r" + a.applied_revision}</td>
+    // The address is worth having, but not worth a column: nobody scans a
+    // list of IPs, they look one up.
+    const ipText = (hw.ip_addresses || []).join(", ");
+    // One pill per row, and it is the row's verdict rather than a label for a
+    // field: the highest-ranked thing true about this machine. Everything it
+    // displaced is either context on the quiet second line or a tooltip on the
+    // number it explains.
+    //
+    // Red does not mean severe here. Red means "do not trust the green on this
+    // row" - something failed, or the number is not known to be true. Amber
+    // means true, and waiting on a person. Held-back upgrades are deliberately
+    // absent: seven of thirteen machines have them, so a pill for it would put
+    // amber on half the table and say nothing. It lives in the number's
+    // tooltip, and gets one row of its own on Overview.
+    const VERDICTS = [
+      [a.mid_upgrade, "bad", "mid-upgrade",
+        "dpkg is part-way through an upgrade. Nothing else will run on this machine until it is finished or rolled back."],
+      [a.release_blockers > 0, "bad", "unsafe sources",
+        "This machine's package sources are misconfigured; installing updates could break it."],
+      [a.patch_state === "failed", "bad", "last run failed", a.patch_note],
+      [a.blocked_count > 0, "bad", `${a.blocked_count} blocked`,
+        `${a.blocked_count} update(s) a patch run was asked to install and that did not move.`],
+      [a.patch_state === "missed", "warn", "missed its run", a.patch_note],
+      [a.reboot_required, "warn", "reboot",
+        "This machine is waiting for a restart to finish applying updates."],
+      [!a.pool && actionable > 0, "warn", "no pool",
+        "Nothing patches this machine on a schedule."],
+    ];
+    const v = VERDICTS.find((x) => x[0]);
+    const extras = v
+      ? ` <span class="pill ${v[1]}" title="${esc(v[3] || "")}">${esc(v[2])}</span>`
+      : "";
+    const context = [
+      a.guest_count ? `${a.guest_count} VMs` : "",
+      a.device_count ? `${a.device_count} devices${a.device_problem_count ? " (!)" : ""}` : "",
+      a.drift_count ? `${a.drift_count} drift` : "",
+      a.applied_revision < REV ? `manifest r${a.applied_revision}` : "",
+    ].filter(Boolean).join(" · ");
+
+    return `<tr data-n="${esc(a.hostname.toLowerCase())} ${esc((a.pool || "").toLowerCase())} ${esc(a.os_version.toLowerCase())} ${esc(a.patch_state || "")}">
+      <td class="machine"><span class="dot ${live}"></span><a href="#agent/${a.id}" style="color:inherit"
+        title="${esc(spec)}${ipText ? " &middot; " + esc(ipText) : ""}">${esc(a.hostname)}</a>${extras}
+        <div class="msg">${esc(a.os_version)} <span class="mono">${esc(a.arch)}</span>${
+          context ? ` &middot; ${esc(context)}` : ""}</div></td>
+      <td>${a.pool
+        ? `<a href="#pools" style="color:inherit">${esc(a.pool)}</a>`
+        : '<span class="msg" title="No pool: nothing patches this machine on a schedule.">none</span>'}</td>
+      <td class="num">${upd}${unsafe_}${busyPill}
+        ${a.patch_short && a.patch_state !== "failed" && a.patch_state !== "missed"
+          ? `<div class="msg" title="${esc(a.patch_note)}">${esc(a.patch_short)}</div>`
+          : ""}</td>
+      <td>${a.last_patched
+        ? `${ago(a.last_patched)}${a.last_patch_ok === false ? ' <span class="pill bad">failed</span>' : ""}`
+        : '<span class="msg">never</span>'}</td>
+
       <td>${ago(a.last_seen)}</td>
       <td style="text-align:right; white-space:nowrap">
         <button class="act" ${canAct ? "" : "disabled"}
@@ -861,7 +1345,13 @@ async function loadFleet() {
 
 function since(iso) {
   if (!iso) return "-";
-  const s = Math.max(0, (Date.now() - new Date(iso)) / 1000);
+  return dur(Math.max(0, (Date.now() - new Date(iso)) / 1000));
+}
+
+// A span of seconds, coarsest two units. Kept separate from `since` because an
+// uptime arrives as a duration already, and rounding it to whole days would
+// hide the case that matters most - something that rebooted an hour ago.
+function dur(s) {
   const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
   if (d) return `${d}d ${h}h`;
   if (h) return `${h}h ${m}m`;
@@ -1067,11 +1557,84 @@ async function finishUpgrade(id, withDisk) {
   }
 }
 
+// Whether this machine's host is backing it up.
+//
+// Only shown for a machine some hypervisor in the fleet claims as a guest.
+// A backup existing is not a backup restoring, so the wording says what was
+// observed - a file, written at a time - and does not promise more.
+function backupCard(b) {
+  if (!b || !b.host) return "";
+  const age = b.last ? (Date.now() - new Date(b.last)) / 86400000 : null;
+  const stale = age === null || age > 8;
+
+  return `<div class="card"${stale ? ' style="border-color:var(--warn)"' : ""}>
+    <h2>Backups</h2>
+    <div class="step">
+      ${kv([
+        ["Host", esc(b.host)],
+        ["Last backup", b.last
+          ? `${ago(b.last)} <span class="msg">(${new Date(b.last).toLocaleString()})</span>`
+          : '<span class="pill warn">none found</span>'],
+      ])}
+      ${stale ? `<div class="note" style="border-color:var(--warn);margin-top:10px">
+        ${b.last
+          ? "The most recent backup file for this machine is over a week old."
+          : "No backup file for this machine was found on its host."}
+        Anything below that cannot be undone &mdash; a release upgrade, a firmware write &mdash;
+        has nothing to fall back on. A backup existing is still not proof it restores.
+      </div>` : ""}
+    </div>
+  </div>`;
+}
+
 // What this machine hosts, or what hosts it.
 //
 // A hypervisor is the one machine whose patch state affects every other
 // machine on it, and its guest list is where unmanaged machines show up -
 // which is exactly what a fleet tool is otherwise blind to.
+// Is backing up happening, and is anything stuck?
+//
+// That is the whole question. Not retention, not verification, not a second
+// backup dashboard - just whether jobs are running, finishing, and finishing
+// cleanly, plus a job that has been going long enough to be worth a look.
+function backupState(b) {
+  if (!b) return "";
+  const stuck = (b.running || []).filter(
+    (j) => (Date.now() - new Date(j.started)) / 3600000 >= 12);
+  const failed = (b.recent || []).filter((j) => !j.ok);
+
+  return `<div class="step">
+    <h3>Backups${(b.running || []).length ? ` &mdash; ${b.running.length} running` : ""}</h3>
+    ${b.note ? `<div class="note" style="border-color:var(--warn)">${esc(b.note)}</div>` : ""}
+    ${stuck.length ? `<div class="note" style="border-color:var(--bad)">
+      <b>${stuck.length} backup job(s) have been running for over 12 hours.</b>
+      That is usually a job that is stuck rather than one that is slow.
+      ${stuck.map((j) => `<div class="mono">${esc(j.guest || j.id)} &mdash; started ${ago(j.started)}</div>`).join("")}
+    </div>` : ""}
+    ${failed.length ? `<div class="note" style="border-color:var(--bad)">
+      <b>${failed.length} of the last ${(b.recent || []).length} job(s) failed.</b>
+      ${failed.slice(0, 3).map((j) => {
+        // The first line of the log that looks like the actual complaint. A
+        // status of "unable to create temporary directory" is the answer; the
+        // eighty lines of transfer progress around it are not.
+        const why = (j.log || "").split(/\r?\n/)
+          .find((l) => /error|failed|cannot|unable|no space|permission/i.test(l));
+        return `<div class="mono">${esc(j.guest || j.id)}: ${esc(j.status)}${
+          why ? `<div class="msg">${esc(why.trim().slice(0, 160))}</div>` : ""}</div>`;
+      }).join("")}
+    </div>` : ""}
+    ${(b.recent || []).length ? `<div class="scroll" style="max-height:200px;overflow:auto"><table>
+      <tbody>${b.recent.map((j) => `<tr>
+        <td class="mono">${esc(j.guest || "job")}</td>
+        <td>${j.ok ? '<span class="pill ok">ok</span>' : `<span class="pill bad">${esc(j.status)}</span>`}</td>
+        <td class="msg">${ago(j.started)}</td>
+      </tr>${j.log ? `<tr><td colspan="3">
+        <details><summary class="msg">what the job printed</summary>
+          <pre style="max-height:220px">${esc(j.log)}</pre></details></td></tr>` : ""}`).join("")}</tbody></table></div>`
+      : (b.note ? "" : `<div class="msg">No finished backup jobs recorded yet.</div>`)}
+  </div>`;
+}
+
 function virtCard(virt) {
   if (!virt) return "";
   const guests = virt.guests || [];
@@ -1100,7 +1663,7 @@ function virtCard(virt) {
       </div>
     </div>` : ""}
     <div class="scroll scrolly"><table>
-      <thead><tr><th>Guest</th><th>Id</th><th>Type</th><th>State</th><th>PatchPanel</th></tr></thead>
+      <thead><tr><th>Guest</th><th>Id</th><th>Type</th><th>State</th><th>PatchPanel</th><th>Last backup</th></tr></thead>
       <tbody>${guests.map((g) => {
         const on = (g.state || "").toLowerCase().startsWith("running");
         return `<tr${on ? "" : ' style="opacity:.55"'}>
@@ -1111,9 +1674,14 @@ function virtCard(virt) {
           <td>${g.managed
             ? '<span class="pill ok">managed</span>'
             : (on ? '<span class="pill warn">no agent</span>' : '<span class="pill">no agent</span>')}</td>
+          <td>${g.last_backup
+            ? `${ago(g.last_backup)}${(Date.now() - new Date(g.last_backup)) / 86400000 > 8
+                ? ' <span class="pill warn">stale</span>' : ""}`
+            : '<span class="msg">none</span>'}</td>
         </tr>`;
       }).join("")}</tbody>
     </table></div>
+    ${backupState(virt.backups)}
     <div class="bar"><span class="msg">${esc(virt.platform)} &middot;
       ${guests.filter((g) => g.managed).length} of ${guests.length} have an agent${
         virt.note ? ` &middot; ${esc(virt.note)}` : ""}</span></div>
@@ -1136,6 +1704,47 @@ function bootCard(boot) {
       </div>
       ${boot.detail ? `<pre>${esc(boot.detail)}</pre>` : ""}
     </div>
+  </div>`;
+}
+
+// Applications watched by version rather than managed by a package manager.
+//
+// A package manager answers "is anything newer in the repositories I am
+// configured for", which is not the same question as "am I running an old
+// version". Software from a vendor repository pinned to an old series reports
+// nothing pending while the vendor is major versions ahead. PatchPanel does
+// not update these - doing so would mean running vendor scripts as root - it
+// just refuses to let them hide.
+function trackedCard(tracked) {
+  if (!tracked.length) return "";
+  const behind = tracked.filter((t) => t.behind);
+
+  return `<div class="card">
+    <h2>Watched applications &mdash; ${tracked.length}${behind.length ? `, ${behind.length} behind` : ""}</h2>
+    ${behind.length ? `<div class="step"><div class="note" style="border-color:var(--warn)">
+      <b>${behind.length} application(s) are behind what the vendor publishes.</b>
+      These do not appear in the pending count because no package manager offers them &mdash;
+      the repository they came from carries an older series. PatchPanel will not update them;
+      it only tells you that they are behind.
+    </div></div>` : ""}
+    <div class="scroll scrolly"><table>
+      <thead><tr><th>Application</th><th>Installed</th><th>Published</th><th></th><th>Checked</th></tr></thead>
+      <tbody>${tracked.map((t) => `<tr>
+        <td>${esc(t.name)}<div class="mono msg">${esc(t.package)}</div>
+          ${t.note ? `<div class="msg">${esc(t.note)}</div>` : ""}
+          ${t.link ? `<div><a href="${esc(t.link)}" target="_blank" rel="noreferrer noopener" class="msg">vendor instructions</a></div>` : ""}</td>
+        <td class="mono">${esc(t.installed)}</td>
+        <td class="mono">${esc(t.latest) || '<span class="msg">unknown</span>'}</td>
+        <td>${t.error
+          ? `<span class="pill warn" title="${esc(t.error)}">could not check</span>`
+          : (t.suspect
+              ? `<span class="pill warn" title="The published version is older than the one installed, so this check is pointed at the wrong place. It is not evidence that the machine is current.">check looks wrong</span>`
+              : (t.behind
+                  ? '<span class="pill bad">behind</span>'
+                  : (t.latest ? '<span class="pill ok">current</span>' : '<span class="pill">unknown</span>')))}</td>
+        <td class="msg">${t.checked_at ? ago(t.checked_at) : "-"}</td>
+      </tr>`).join("")}</tbody>
+    </table></div>
   </div>`;
 }
 
@@ -1865,6 +2474,45 @@ async function loadAgent(id) {
         </div>
       </div></div>` : ""}
 
+      <div class="card">
+        <h2>Forward this machine's logs <span class="sub">off unless you turn it on</span></h2>
+        <div class="step">
+          <div class="msg">An inventory scan runs hourly and reads package state. A ZFS
+            checksum error, an OOM kill, a machine-check exception or a unit crash-looping
+            happens between scans and leaves nothing in a package list behind it. Forwarding
+            reads this machine's journal and sends <b>warnings and worse</b> over the
+            connection the agent already has, where a rolling day is kept.
+            <b>Nothing is installed and nothing is written to the machine</b> &mdash; no
+            rsyslog, no config file, no extra port. Stopping it ends a task.</div>
+          ${(inv.syslog_forward || null)
+            ? `<div class="bar" style="margin-top:10px">
+                 <span class="pill ok">forwarding ${esc(inv.syslog_forward.min_severity)} and worse</span>
+                 <span class="msg">to <span class="mono">${esc(inv.syslog_forward.target)}</span>
+                   via <span class="mono">${esc(inv.syslog_forward.path)}</span></span>
+                 <button class="act" ${d.connected && !busy ? "" : "disabled"} style="margin-left:auto"
+                   title="Count what this machine's journal holds at each level, over the last day."
+                   onclick="estimateVolume('${id}')">Estimate volume</button>
+                 <button class="act" ${d.connected && !busy ? "" : "disabled"}
+                   onclick="setForwarding('${id}', false)">Stop forwarding</button>
+               </div>`
+            : `<div class="bar" style="margin-top:10px">
+                 <span class="msg">Not forwarding.</span>
+                 <select id="fwd-sev" class="fld" style="margin-left:auto">
+                   <option value="warning" selected>warnings and worse</option>
+                   <option value="err">errors and worse</option>
+                   <option value="notice">notices and worse</option>
+                   <option value="info">everything (noisy)</option>
+                 </select>
+                 <button class="act" ${d.connected && !busy ? "" : "disabled"}
+                   title="Count what this machine's journal holds at each level, over the last day. Reads nothing out to the portal."
+                   onclick="estimateVolume('${id}')">Estimate volume</button>
+                 <button class="act" ${d.connected && !busy ? "" : "disabled"}
+                   onclick="setForwarding('${id}', true)">Start forwarding</button>
+               </div>`}
+          <div id="vol-out" class="msg" style="margin-top:8px"></div>
+        </div>
+      </div>
+
       <div class="grid2">
         <div class="card">
           <h2>Hardware</h2>
@@ -1908,6 +2556,8 @@ async function loadAgent(id) {
           </div>
         </div>
       </div>
+
+      ${backupCard(d.backup)}
 
       ${virtCard(inv.virt)}
 
@@ -1966,6 +2616,8 @@ async function loadAgent(id) {
             : (inv.collected_at ? `inventory collected ${ago(inv.collected_at)}` : "")}</span>
         </div>
       </div>
+
+      ${trackedCard(d.tracked || [])}
 
       ${firmwareCard(inv.firmware, d.id, d.connected, busy)}
 
@@ -2042,14 +2694,17 @@ async function loadAgent(id) {
 let DEV_KEY = { key: "", secret: "", from: "" };
 
 function deviceKindChanged() {
-  const unraid = $("dev-kind").value === "unraid";
-  $("dev-secret").hidden = unraid;
-  $("dev-keyfile-label").textContent = unraid
-    ? "API key file (a text file holding the key)"
-    : "API key file (the .txt OPNsense downloads)";
-  $("dev-hint").textContent = unraid
-    ? "Unraid: Settings > Management Access > API Keys. The VIEWER role with the INFO and OS resources is enough - do not use ADMIN."
-    : "OPNsense: System > Access > Users > your user > API keys. Give that user only the `System: Firmware` privilege.";
+  const kind = $("dev-kind").value;
+  // Only OPNsense uses a separate secret; the others carry a single token.
+  $("dev-secret").hidden = kind !== "opnsense";
+  $("dev-keyfile-label").textContent = kind === "opnsense"
+    ? "API key file (the .txt OPNsense downloads)"
+    : "key file (a text file holding the token)";
+  $("dev-hint").textContent = {
+    opnsense: "OPNsense: System > Access > Users > your user > API keys. Give that user only the `System: Firmware` privilege.",
+    unraid: "Unraid: Settings > Management Access > API Keys. The VIEWER role with the INFO and OS resources is enough - do not use ADMIN.",
+    homeassistant: "Home Assistant: your profile > Security > Long-lived access tokens > Create token. Paste the whole token. Include the port in the address, usually :8123.",
+  }[kind] || "";
 }
 
 // Derive an id from the address, since it is nearly always the right one.
@@ -2122,10 +2777,28 @@ async function addDevice() {
   // people have to hand.
   const target = raw.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
 
-  const probe = kind === "opnsense"
-    ? { type: "opnsense", api_key: DEV_KEY.key, api_secret: DEV_KEY.secret,
-        insecure: true, check_after_hours: 12 }
-    : { type: "unraid", api_key: DEV_KEY.key, insecure: true, check_releases: true };
+  // Home Assistant has no bespoke probe: it answers a plain HTTP request, and
+  // the generic one already reads a version out of JSON. What it needs is
+  // somewhere to learn the current release, which every device can now carry.
+  let latest = {};
+  let probe;
+  if (kind === "opnsense") {
+    probe = { type: "opnsense", api_key: DEV_KEY.key, api_secret: DEV_KEY.secret,
+              insecure: true, check_after_hours: 12 };
+  } else if (kind === "unraid") {
+    probe = { type: "unraid", api_key: DEV_KEY.key, insecure: true, check_releases: true };
+  } else {
+    // Home Assistant tracks updates for itself, its add-ons and every device
+    // it manages, so it answers the question directly - no release feed
+    // needed.
+    probe = {
+      // The wire name is snake_case, like every other variant.
+      type: "home_assistant",
+      token: DEV_KEY.key,
+      insecure: true,
+      auto_update: "off",
+    };
+  }
 
   say("saving\u2026", "run");
   try {
@@ -2137,9 +2810,13 @@ async function addDevice() {
         `Use its full name to tell them apart.`, "bad");
     }
     m.devices.push({
+      ...latest,
       id,
       label: $("dev-name").value.trim(),
       target,
+      // The address that was pasted in is the management page, near enough:
+      // it is where the operator just came from.
+      url: raw.startsWith("http") ? raw : `https://${target}`,
       site: "",
       collector: "",
       probe,
@@ -2203,6 +2880,55 @@ async function deviceHistory(id) {
 //
 // Only the label: the id is what probe history is recorded against, and
 // changing it would orphan everything remembered about the device.
+// Where to go to act on this device. Same shape as renaming: edited in place,
+// saved to the manifest, never touching the device itself.
+// Let PatchPanel install updates on a device that supports it.
+//
+// Everything else here only ever looks. This is the exception, so turning it
+// on is a deliberate answer to a question that spells out what changes.
+async function setAutoUpdate(id, value) {
+  if (value !== "off") {
+    const what = value === "everything"
+      ? "Home Assistant, its add-ons, AND the firmware of every device it manages"
+      : "Home Assistant, its operating system, supervisor and add-ons";
+    if (!confirm(
+      `Let PatchPanel install updates on this device?\n\nIt will install: ${what}.\n\n` +
+      "This happens on each probe, without asking again. Home Assistant takes its own " +
+      "backup before updating itself." +
+      (value === "everything"
+        ? "\n\nDevice firmware cannot be rolled back. A failed write can leave hardware unusable."
+        : "")
+    )) {
+      refresh();
+      return;
+    }
+  }
+  try {
+    const m = await api("/api/manifest");
+    const dev = (m.devices || []).find((d) => d.id === id);
+    if (!dev || !dev.probe) return;
+    dev.probe.auto_update = value;
+    await api("/api/manifest", { method: "PUT", body: JSON.stringify(m) });
+    refresh();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function setDeviceUrl(id, url) {
+  const clean = (url || "").trim();
+  try {
+    const m = await api("/api/manifest");
+    const dev = (m.devices || []).find((d) => d.id === id);
+    if (!dev || (dev.url || "") === clean) return;
+    dev.url = clean;
+    await api("/api/manifest", { method: "PUT", body: JSON.stringify(m) });
+    refresh();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
 async function renameDevice(id, label) {
   const clean = (label || "").trim();
   try {
@@ -2230,6 +2956,1002 @@ async function probeDevice(collectorId, id) {
   await cmd(collectorId, "probe_devices", { only: [id] });
 }
 
+function poolWhenChanged() {
+  const kind = $("pool-when").value;
+  $("pool-dow").hidden = kind !== "weekly";
+  $("pool-time").hidden = kind === "manual";
+}
+
+function readSchedule() {
+  const kind = $("pool-when").value;
+  if (kind === "manual") return { kind: "manual" };
+  const [h, m] = ($("pool-time").value || "03:00").split(":").map(Number);
+  return kind === "daily"
+    ? { kind: "daily", hour: h, minute: m }
+    : { kind: "weekly", dow: Number($("pool-dow").value), hour: h, minute: m };
+}
+
+function scheduleText(sch) {
+  if (!sch || sch.kind === "manual") return "manual";
+  const days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+  const at = `${String(sch.hour).padStart(2, "0")}:${String(sch.minute).padStart(2, "0")}`;
+  return sch.kind === "daily" ? `daily at ${at}` : `${days[sch.dow] || "?"} at ${at}`;
+}
+
+async function savePool() {
+  const st = $("pool-status");
+  const say = (t, c) => { st.innerHTML = `<span class="${c}">${esc(t)}</span>`; };
+  const name = $("pool-name").value.trim();
+  if (!name) return say("give it a name", "bad");
+  try {
+    await api("/api/pools", { method: "POST", body: JSON.stringify({
+      name,
+      scope: $("pool-scope").value,
+      reboot: $("pool-reboot").value,
+      schedule: readSchedule(),
+      concurrency: Number($("pool-conc").value) || 1,
+      exclude: [],
+    })});
+    $("pool-name").value = "";
+    say("created", "ok");
+    refresh();
+  } catch (e) {
+    say(e.message, "bad");
+  }
+}
+
+async function updatePool(name, field, value) {
+  const pools = await api("/api/pools");
+  const p = pools.find((x) => x.name === name);
+  if (!p) return;
+  const body = {
+    name, scope: p.scope, reboot: p.reboot, schedule: p.schedule,
+    concurrency: p.concurrency, exclude: p.exclude || [],
+  };
+  body[field] = value;
+  await api("/api/pools", { method: "POST", body: JSON.stringify(body) });
+  refresh();
+}
+
+async function deletePool(name) {
+  if (!confirm(`Delete the pool "${name}"?\n\nIts machines are not touched - they simply stop belonging to a pool.`)) return;
+  await api(`/api/pools/${encodeURIComponent(name)}`, { method: "DELETE" });
+  refresh();
+}
+
+async function runPool(name) {
+  if (!confirm(`Run "${name}" now?\n\nThis patches its machines according to the pool's policy, without waiting for the schedule.`)) return;
+  try {
+    const r = await api(`/api/pools/${encodeURIComponent(name)}/run`, { method: "POST" });
+    alert(`Dispatched to ${r.dispatched} machine(s). The rest follow as slots free up.`);
+    refresh();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function setMachinePool(id, pool) {
+  try {
+    await api(`/api/agents/${id}/pool`, { method: "POST", body: JSON.stringify({ pool }) });
+    refresh();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function loadBackups() {
+  const d = await api("/api/backups");
+  const s = d.summary;
+
+  $("backup-empty").hidden = d.guests.length > 0;
+  setHTML($("backup-tiles"),
+    tile(s.guests, "guests") +
+    tile(s.fresh, "backed up") +
+    tile(s.unprotected_running, "at risk", "bad") +
+    tile(s.stale, "stale") +
+    tile(s.never, "never") +
+    (s.exempt ? tile(s.exempt, "not tracked") : "") +
+    tile(s.jobs_running, "running") +
+    tile(s.jobs_stuck, "stuck", "bad") +
+    tile(s.jobs_failed, "recent failures", "bad"));
+
+  // The number that matters is running guests nobody is protecting.
+  const alerts = [];
+  if (s.unprotected_running) {
+    alerts.push(`<div class="card" style="border-color:var(--bad)"><div class="step">
+      <div class="note" style="border-color:var(--bad)">
+        <b>${s.unprotected_running} running guest(s) have no recent backup.</b>
+        They are doing work right now and there is nothing to restore them from. Machines that
+        are switched off are listed below too, but those are usually templates and matter less.
+      </div>
+    </div></div>`);
+  }
+  if (s.jobs_stuck) {
+    alerts.push(`<div class="card" style="border-color:var(--bad)"><div class="step">
+      <div class="note" style="border-color:var(--bad)">
+        <b>${s.jobs_stuck} backup job(s) have been running for over 12 hours.</b>
+        That is usually stuck rather than slow &mdash; worth looking at on the host itself.
+      </div>
+    </div></div>`);
+  }
+  setHTML($("backup-alerts"), alerts.join(""));
+
+  setHTML($("backup-guests"), d.guests.map((g) => {
+    const on = (g.state || "").toLowerCase().startsWith("running");
+    // A stopped guest with no backup is usually a template nobody intends to
+    // keep. Saying it in the same red as a running machine with nothing to
+    // restore from makes the red mean less.
+    // A non-default expectation is shown beside the age, not folded into it:
+    // "18 days" is fine for a guest wanted quarterly and a problem for one
+    // wanted weekly, and the row has to say which.
+    const cadence = g.cadence && g.status !== "exempt"
+      ? ` <span class="msg" title="You asked for a backup about every ${g.every_days} days.">${esc(g.cadence)}</span>`
+      : "";
+    const status = g.status === "snoozed"
+      ? `<span class="pill" title="You asked to be reminded on ${
+          new Date(g.snooze_until).toLocaleDateString()}. It is still a gap - just not one on the list until then.">
+          ${g.last_backup ? ago(g.last_backup) : "never"} &middot; back ${ago(g.snooze_until)}</span>`
+      : g.status === "exempt"
+      ? `<span class="pill" title="${esc(g.reason || "Deliberately not tracked.")}">not tracked</span>${
+          g.last_backup ? ` <span class="msg">last ${ago(g.last_backup)}</span>` : ""}`
+      : g.status === "fresh"
+        ? `<span class="pill ok">${ago(g.last_backup)}</span>${cadence}`
+        : g.status === "stale"
+          ? `<span class="pill ${on ? "warn" : ""}" title="Wanted about every ${g.every_days} days.">${ago(g.last_backup)}</span>${cadence}`
+          : `<span class="pill ${on ? "bad" : ""}" title="${on
+              ? "This guest is running and has nothing to restore from."
+              : "Never backed up, but it is not running - often a template."}">never</span>${cadence}`;
+    const quiet = g.status === "exempt" || g.status === "snoozed";
+    return `<tr${on && !quiet ? "" : ' style="opacity:.55"'}>
+      <td>${esc(g.name)}<div class="mono msg">${esc(g.id)}</div></td>
+      <td>${esc(g.host)}</td>
+      <td class="mono msg">${esc(g.kind)}</td>
+      <td>${esc(g.state) || "-"}</td>
+      <td>${g.managed ? '<span class="pill ok">yes</span>' : '<span class="msg">no</span>'}</td>
+      <td>${status}</td>
+      <td><select class="fld" style="font-size:11.5px;padding:3px 6px"
+          title="How often you want this one backed up. It stays counted either way - this only decides when a gap is a gap."
+          onchange="setBackupCadence(${jsq(g.host)}, ${jsq(g.id)}, ${jsq(g.name)}, this.value)">
+          ${[["", "on the usual schedule"], ["30", "about monthly"], ["90", "about quarterly"],
+             ["365", "about yearly"], ["0", "don't track it"]].map(([v, label]) => {
+            const current = g.status === "exempt" ? "0"
+              : !g.cadence ? ""
+              : String(g.every_days);
+            return `<option value="${v}"${v === current ? " selected" : ""}>${label}</option>`;
+          }).join("")}
+        </select>
+        ${g.status === "stale" || g.status === "never"
+          ? `<button class="act" style="padding:2px 8px;font-size:11.5px;margin-left:4px"
+               title="Take it off the list for a month. It comes back on its own, and the row says when."
+               onclick="snoozeBackup(${jsq(g.host)}, ${jsq(g.id)})">Remind me in a month</button>`
+          : g.status === "snoozed"
+            ? `<button class="act" style="padding:2px 8px;font-size:11.5px;margin-left:4px"
+                 title="Put it back on the list now."
+                 onclick="unsnoozeBackup(${jsq(g.host)}, ${jsq(g.id)})">Remind me now</button>`
+            : ""}
+        ${g.reason ? `<div class="msg">${esc(g.reason)}</div>` : ""}
+        <div class="msg">${g.last_backup ? new Date(g.last_backup).toLocaleString() : ""}</div></td>
+    </tr>`;
+  }).join(""));
+
+  setHTML($("backup-hosts"), d.hosts.map((h) => `<div class="card">
+    <h2>${esc(h.host)} <span class="msg">${esc(h.platform)}</span></h2>
+    ${backupState(h)}
+  </div>`).join(""));
+
+  const bad = s.unprotected_running;
+  const el = $("badge-backups");
+  if (el) {
+    el.hidden = false;
+    el.textContent = bad > 99 ? "99+" : String(bad);
+    el.className = "badge" + (bad === 0 ? " ok" : " bad");
+    el.title = bad
+      ? `${bad} running guest(s) with no recent backup`
+      : `${s.fresh} backed up; nothing running is unprotected`;
+  }
+}
+
+// Mark a guest as one nobody intends to back up.
+//
+// It stays on the page, greyed, with the reason: a decision that disappears is
+// one nobody can revisit, and "why is that not backed up" deserves an answer
+// six months later.
+// Only the strongest choice asks why. Saying "this one is fine quarterly" is
+// self-explanatory on the row afterwards; saying "never look at this again"
+// is not, and "why is that not backed up" is a question asked six months
+// later, when the reason is the only part anyone still needs.
+async function snoozeBackup(host, guest) {
+  try {
+    await api("/api/backups/snooze", {
+      method: "POST",
+      body: JSON.stringify({ host, guest, snooze_days: 30 }),
+    });
+    refresh();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+// Ending a snooze early is the same call as returning to the fleet default,
+// because a snooze is the only thing a bare rule with no cadence holds.
+async function unsnoozeBackup(host, guest) {
+  try {
+    await api("/api/backups/exempt", {
+      method: "DELETE",
+      body: JSON.stringify({ host, guest }),
+    });
+    refresh();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function setBackupCadence(host, guest, name, value) {
+  try {
+    if (value === "") {
+      await api("/api/backups/exempt", {
+        method: "DELETE",
+        body: JSON.stringify({ host, guest }),
+      });
+    } else if (value === "0") {
+      const reason = prompt(
+        `Stop tracking backups for ${name}?\n\n` +
+        "It stays in the list with your reason, and stops being counted as a gap.\n\n" +
+        "Why? (optional, but future-you will want it)"
+      );
+      if (reason === null) { refresh(); return; }
+      await api("/api/backups/exempt", {
+        method: "POST",
+        body: JSON.stringify({ host, guest, reason: reason.trim(), every_days: 0 }),
+      });
+    } else {
+      await api("/api/backups/exempt", {
+        method: "POST",
+        body: JSON.stringify({ host, guest, reason: "", every_days: Number(value) }),
+      });
+    }
+    refresh();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+// Every time a schedule fires between two dates.
+//
+// The portal only reports the next occurrence; a calendar needs all of them,
+// and the rule is simple enough to walk day by day rather than inventing a
+// second implementation of it on the server.
+function occurrences(schedule, from, days) {
+  if (!schedule || schedule.kind === "manual") return [];
+  const out = [];
+  for (let i = 0; i < days; i++) {
+    const d = new Date(from);
+    d.setDate(d.getDate() + i);
+    if (schedule.kind === "weekly") {
+      // dow 0 is Monday, as people say it; getDay() has Sunday at 0.
+      const mondayFirst = (d.getDay() + 6) % 7;
+      if (mondayFirst !== schedule.dow) continue;
+    }
+    d.setHours(schedule.hour, schedule.minute, 0, 0);
+    out.push(new Date(d));
+  }
+  return out;
+}
+
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const hhmm = (d) => String(d.getHours()).padStart(2, "0") + ":" +
+  String(d.getMinutes()).padStart(2, "0");
+
+// Three weeks back, the current week, two forward. The grid starts on a Monday
+// so a weekly schedule lands in one column and its rhythm is visible as a
+// shape rather than as a list of dates.
+function renderCalendar(pools, past) {
+  const BACK = 3, FORWARD = 2;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const start = new Date(today);
+  start.setDate(start.getDate() - ((start.getDay() + 6) % 7) - BACK * 7);
+  const DAYS = (BACK + 1 + FORWARD) * 7;
+
+  const byDay = new Map();
+  const push = (at, html) => {
+    const k = at.toDateString();
+    if (!byDay.has(k)) byDay.set(k, []);
+    byDay.get(k).push({ at, html });
+  };
+
+  // What happened, as the portal reconstructed it from the command log.
+  for (const e of past || []) {
+    const at = new Date(e.at);
+    if (at < start) continue;
+    push(at, `<div class="ev ${esc(e.outcome)}${
+      e.source === "manual" ? " manual" : e.source === "job" ? " job" : ""}"
+      title="${esc(e.label)} &mdash; ${esc(e.detail)}${
+        e.source === "manual" ? " (you started this)"
+        : e.source === "unknown" ? " (ran before the portal recorded who started a command)"
+        : ""}">
+      <span class="t">${hhmm(at)}</span> ${esc(e.label)}<span class="o">${esc(e.detail)}</span></div>`);
+  }
+
+  // What will happen. Only the first occurrence of each pool gets words; the
+  // rest are ticks, because the fifteenth identical cell says nothing the
+  // first one did not.
+  const now = new Date();
+  for (const p of pools) {
+    if (p.scope === "none") continue;
+    let spelled = false;
+    for (const at of occurrences(p.schedule, start, DAYS)) {
+      if (at <= now) continue;
+      if (!spelled) {
+        spelled = true;
+        const due = (p.plan || []).filter((x) => x.action === "patch").length;
+        push(at, `<div class="ev next"
+          title="${esc(p.name)} &mdash; ${p.members.length} machine(s), installs ${esc(p.scope)}${
+            p.reboot === "if-needed" ? ", may reboot" : ", no reboot"}">
+          <span class="t">${hhmm(at)}</span> ${esc(p.name)}<span class="o">${
+            due ? `${due} would patch` : "none due"}</span></div>`);
+      } else {
+        push(at, `<div class="tick" title="${esc(p.name)} &mdash; ${hhmm(at)}"></div>`);
+      }
+    }
+  }
+
+  const cells = [];
+  for (let i = 0; i < DAYS; i++) {
+    const day = new Date(start);
+    day.setDate(day.getDate() + i);
+    const evs = (byDay.get(day.toDateString()) || []).sort((a, b) => a.at - b.at);
+    const isToday = day.toDateString() === today.toDateString();
+    // A day with more than three things on it gets three and a count; the
+    // alternative is one cell as tall as the week it sits in.
+    const shown = evs.slice(0, 3).map((e) => e.html).join("");
+    const rest = evs.length > 3 ? `<div class="msg">+${evs.length - 3} more</div>` : "";
+    cells.push(`<div class="day${isToday ? " today" : ""}${
+      day.getMonth() !== today.getMonth() && !isToday ? " out" : ""}">
+      <div class="d"><b>${day.getDate()}</b>${
+        day.getDate() === 1 || i === 0 ? `<span>${MONTHS[day.getMonth()]}</span>` : ""}</div>
+      ${shown}${rest}</div>`);
+  }
+  setHTML($("pool-calendar"), cells.join(""));
+}
+
+// A job is only as good as the expectation attached to it: without
+// `every_hours` the portal will say it last ran and nothing more, because
+// inventing a schedule for someone else's script would produce a warning
+// nobody asked for and cannot answer.
+// Jobs group by the part of the name before the first slash, so everything
+// one watcher reports sits together under a heading. A name with no slash is
+// a job reporting for itself, which is its own group.
+function jobGroups(jobs) {
+  const groups = new Map();
+  for (const j of jobs) {
+    const cut = j.name.indexOf("/");
+    const key = cut > 0 ? j.name.slice(0, cut) : "";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(j);
+  }
+  // Named groups first and alphabetical; the ungrouped ones last, because a
+  // heading is a promise that what follows belongs together.
+  return [...groups.entries()].sort((a, b) =>
+    (a[0] ? 0 : 1) - (b[0] ? 0 : 1) || a[0].localeCompare(b[0]));
+}
+
+function splitMuted(jobs) {
+  return [jobs.filter((j) => !j.muted), jobs.filter((j) => j.muted)];
+}
+
+// One job, drawn the same whether it is live or ignored. `key` is the group
+// prefix, stripped from the displayed name because the heading already says it.
+function jobRow(j, key) {
+    const pill = j.muted
+      ? '<span class="pill" title="You asked not to be told about this one. It still runs and is still recorded.">ignored</span>'
+      : j.status === "suspect"
+        ? `<span class="pill warn" title="It reported success, but its own output reported problems. Open History to see them.">output disagrees</span>`
+      : j.status === "overdue"
+      ? `<span class="pill bad" title="Expected every ${j.every_hours}h; nothing has arrived.">stopped checking in</span>`
+      : j.status === "failed"
+        ? '<span class="pill bad">last run failed</span>'
+        : j.status === "quiet"
+          ? '<span class="pill">never reported</span>'
+          : j.every_hours
+            ? '<span class="pill ok">on time</span>'
+            : '<span class="pill" title="It has not said how often it runs, so it cannot be late.">no schedule given</span>';
+
+    const facts = Object.entries(j.facts || {}).map(([k, v]) => {
+      // When a reported value last moved is usually the interesting part -
+      // a public IP that changed this morning explains a lot of other things.
+      const moved = (j.history || []).find((h) => h.key === k);
+      return `<span class="msg">${esc(k.replace(/_/g, " "))}
+        <b>${esc(v)}</b>${moved ? ` <span title="${new Date(moved.at).toLocaleString()}">changed ${ago(moved.at)}</span>` : ""}</span>`;
+    }).join("");
+
+    return `<div class="job">
+      <div>
+        <div class="nm">${esc(key ? j.name.slice(key.length + 1) : j.name)} ${pill}</div>
+        ${j.last_detail ? `<div class="msg">${esc(j.last_detail)}</div>` : ""}
+        ${facts ? `<div class="facts">${facts}</div>` : ""}
+      </div>
+      <div class="when">
+        <div class="msg">${j.last_at ? `ran ${ago(j.last_at)}` : "never"}</div>
+        ${j.due_at ? `<div class="msg">due ${ago(j.due_at)}</div>` : ""}
+        <button class="act" style="padding:2px 8px;font-size:11.5px;margin-top:4px"
+          title="Every run this job has reported, with what it printed."
+          onclick="jobHistory(${jsq(j.name)})">History</button>
+        <button class="act" style="padding:2px 8px;font-size:11.5px;margin-top:4px"
+          title="${j.muted
+            ? "Start counting this job again."
+            : "Stop being told about this one. It keeps running and keeps its history; it just stops asking for attention."}"
+          onclick="muteJob(${jsq(j.name)}, ${j.muted ? "false" : "true"})">${
+            j.muted ? "Count it again" : "Ignore"}</button>
+        <button class="act" style="padding:2px 8px;font-size:11.5px;margin-top:4px"
+          title="Remove this job. It comes back if it checks in again."
+          onclick="forgetJob(${jsq(j.name)})">Forget</button>
+      </div>
+    </div>`;
+}
+
+// Keys that are counters rather than readings. They belong in the job row's
+// summary line, not on a board someone scans for an address or a filename.
+const TALLY_KEYS = new Set(["ok", "failed", "changed", "skipped", "errors",
+  "warnings", "success", "succeeded", "scripts_checked", "unfinished"]);
+
+// When each value last actually moved.
+//
+// The portal only records a fact when it changes, so the history is already a
+// list of moves rather than of check-ins - which is what makes "since" a real
+// answer rather than "whenever this last ran".
+function lastChanged(job, key) {
+  return (job.history || []).find((h) => h.key === key);
+}
+
+// A board of what the jobs know: the address at each site and when it arrived,
+// the last backup and what it is called. Built from whatever the jobs report,
+// so a new value appears here on its own.
+function renderJobStatus(jobs) {
+  const now = Date.now();
+  const panels = jobs
+    .filter((j) => !j.muted && Object.keys(j.facts || {}).length)
+    .map((j) => {
+      const readings = Object.entries(j.facts)
+        .filter(([k]) => !TALLY_KEYS.has(k))
+        .sort(([a], [b]) => a.localeCompare(b));
+      if (!readings.length) return "";
+
+      const rows = readings.map(([k, v]) => {
+        const moved = lastChanged(j, k);
+        const fresh = moved && now - new Date(moved.at).getTime() < 864e5;
+        return `<div class="reading${fresh ? " fresh" : ""}">
+          <span class="k">${esc(k.replace(/_/g, " "))}</span>
+          <span class="v" title="${esc(v)}">${esc(v)}</span>
+          <span class="since" title="${moved
+            ? "Last changed " + new Date(moved.at).toLocaleString()
+            : "Unchanged for as long as this has been recorded"}">${
+            moved ? ago(moved.at) : "&mdash;"}</span>
+        </div>`;
+      }).join("");
+
+      // The counters stay, but as one quiet line under the heading rather
+      // than as readings competing with the values people came for.
+      const tallies = Object.entries(j.facts)
+        .filter(([k]) => TALLY_KEYS.has(k))
+        .map(([k, v]) => `${esc(v)} ${esc(k.replace(/_/g, " "))}`)
+        .join(" &middot; ");
+
+      const name = j.name.includes("/") ? j.name.slice(j.name.indexOf("/") + 1) : j.name;
+      return `<div class="panel">
+        <h3>${esc(name)}
+          ${j.status === "failed" || j.status === "overdue"
+            ? '<span class="pill bad">needs you</span>'
+            : j.status === "suspect" ? '<span class="pill warn">output disagrees</span>' : ""}
+          <span class="when">${j.last_at ? "ran " + ago(j.last_at) : "never run"}</span></h3>
+        ${tallies ? `<div class="reading"><span class="k">this run</span>
+          <span class="v" style="font-family:inherit;color:var(--muted)">${tallies}</span>
+          <span class="since"></span></div>` : ""}
+        ${rows}
+      </div>`;
+    })
+    .filter(Boolean);
+
+  setHTML($("job-status"), panels.length ? `<div class="board">${panels.join("")}</div>` : "");
+}
+
+function renderJobs(jobs) {
+  renderJobStatus(jobs);
+  $("jobs-empty").hidden = jobs.length > 0;
+  const [live, muted] = splitMuted(jobs);
+  const groups = jobGroups(live);
+  setHTML($("job-rows"), groups.map(([key, list]) => {
+    const bad = list.filter((j) => j.status === "overdue" || j.status === "failed").length;
+    const head = key
+      ? `<div class="jobgroup"><b>${esc(key)}</b>
+           <span class="msg">${list.length} job(s)${bad ? ` &middot; ${bad} need you` : ""}</span></div>`
+      : (groups.length > 1
+          ? `<div class="jobgroup"><b>Other</b>
+               <span class="msg">${list.length} job(s)</span></div>`
+          : "");
+    return head + list.map((j) => jobRow(j, key)).join("");
+  }).join("") + (muted.length
+    ? `<div class="jobgroup"><b>Ignored</b>
+         <span class="msg">${muted.length} job(s) &middot; still running, still recorded,
+         not counted anywhere</span></div>` + muted.map((j) => jobRow(j, "")).join("")
+    : ""));
+}
+
+async function loadJobs() {
+  try {
+    renderJobs(await api("/api/jobs"));
+  } catch (e) {
+    /* an older portal has no jobs endpoint */
+  }
+}
+
+function showJobSetup() {
+  const box = $("job-setup");
+  box.hidden = !box.hidden;
+  if (box.hidden) return;
+  // Written for Unraid's User Scripts, which is where this usually lives.
+  //
+  // POSIX sh on purpose: those scripts are `#!/bin/sh`, and `trap ... ERR` -
+  // the obvious way to write this - is a bashism that sh accepts and silently
+  // never fires. An EXIT trap plus a flag works in both, and covers the case
+  // that matters most: the script exiting early, before the success line it
+  // would otherwise have reached.
+  box.innerHTML = `<div class="msg">Paste this at the top of the script. It keeps
+    its own copy of the helper current, and &mdash; more importantly &mdash; cannot
+    break the script if this portal is unreachable.</div>
+    <pre>PP_URL=http://${esc(location.host)}
+PP_LIB=/boot/config/pp-report.sh
+if curl -fsS -m 5 "$PP_URL/pp-report.sh" -o "$PP_LIB.new" 2&gt;/dev/null &amp;&amp;
+   grep -q "^pp_init()" "$PP_LIB.new"; then mv "$PP_LIB.new" "$PP_LIB"; fi
+rm -f "$PP_LIB.new"
+if [ -r "$PP_LIB" ]; then . "$PP_LIB"; else
+  pp_init() { :; }; pp_fact() { :; }; pp_ok() { :; }
+  pp_fail() { :; }; pp_finish() { :; }
+fi
+
+pp_init router-backup 24     # job name, and how many hours between runs
+
+# ... the work, calling pp_fact as it learns things ...
+pp_fact public_ip "$IP"
+
+pp_finish "$FAIL" "$OK ok, $CHANGED changed"</pre>
+    <div class="msg">Three fallbacks, in order: a fresh copy, the cached copy,
+      then stub functions that do nothing. Monitoring that can take down the
+      thing it monitors is worse than no monitoring, so an unreachable portal
+      leaves the job running and simply unreported. The <code>grep</code> stops a
+      login page or proxy error that arrived with a 200 from being cached and
+      then sourced.</div>
+    <div class="msg"><code>pp_init</code> goes <b>above</b> any early exit, including
+      missing-credential checks &mdash; those are usually a script's quietest failure,
+      because skipping the work also skips whatever it normally complains with.
+      It installs an exit trap, so a script that dies part-way still reports one.
+      The second argument is the load-bearing one: without it the portal can only
+      say when the job last ran, and a run that never happens is the failure
+      nothing else will ever mention.</div>
+    <div class="msg">Also available: <code>pp_ok "detail"</code> and
+      <code>pp_fail "detail"</code>. Set <code>PP_TOKEN</code> before sourcing if
+      this portal requires a token.</div>`;
+}
+
+// Every run, newest first, with what it printed.
+//
+// The list answers "is this working"; this answers "what happened that night",
+// which is the question you actually have at the point you open it.
+async function jobHistory(name) {
+  const box = $("job-history");
+  const runs = await api("/api/jobs/" + encodeURIComponent(name) + "/runs");
+  box.hidden = false;
+  setHTML(box, `<h2>${esc(name)} <span class="sub">${runs.length} recorded run(s)</span>
+      <button class="act" style="float:right;padding:2px 8px;font-size:11.5px"
+        onclick="$('job-history').hidden = true">Close</button></h2>
+    ${runs.length ? runs.map((r, i) => `<div class="step">
+      <div>
+        <span class="pill ${r.suspect ? "warn" : r.ok ? "ok" : "bad"}">${
+          r.suspect ? "output disagrees" : r.ok ? "ok" : "failed"}</span>
+        <span class="mono">${new Date(r.at).toLocaleString()}</span>
+        <span class="msg">${ago(r.at)}</span>
+      </div>
+      ${r.detail ? `<div class="msg">${esc(r.detail)}</div>` : ""}
+      ${r.log
+        ? `<details${i === 0 ? " open" : ""}><summary class="msg">what it printed</summary>
+             <pre>${esc(r.log)}</pre></details>`
+        : `<div class="msg">No output kept for this run${
+             i > 6 ? " - output older than 30 days is discarded" : ""}.</div>`}
+    </div>`).join("") : '<div class="empty">Nothing recorded yet.</div>'}`);
+  box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+// Not a delete. The job keeps running, keeps reporting and keeps its history;
+// it just stops appearing on Overview and in the badge. Hiding something
+// outright is how a dashboard starts lying, so it stays on the page, greyed,
+// under a heading that says what was decided.
+async function muteJob(name, muted) {
+  try {
+    await api("/api/jobs/" + encodeURIComponent(name) + "/mute", {
+      method: "POST",
+      body: JSON.stringify({ muted }),
+    });
+    refresh();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function forgetJob(name) {
+  if (!confirm("Forget " + name + "? Its history goes too. It reappears if it checks in again.")) return;
+  try {
+    await api("/api/jobs/" + encodeURIComponent(name), { method: "DELETE" });
+    refresh();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function loadPools() {
+  const pools = await api("/api/pools");
+  // The past is a separate question from the schedule, and a separate query.
+  let past = [];
+  try { past = await api("/api/schedule"); } catch (e) { past = []; }
+  renderCalendar(pools, past);
+
+  setHTML($("pool-list"), pools.map((p) => {
+    const willPatch = p.plan.filter((x) => x.action === "patch");
+    return `<div class="card">
+      <h2>${esc(p.name)}
+        ${p.scope === "none" ? '<span class="pill">patches nothing</span>'
+          : `<span class="pill ${p.scope === "all" ? "warn" : ""}">${esc(p.scope)}</span>`}
+        ${p.reboot === "if-needed" ? '<span class="pill warn">may reboot</span>' : ""}
+      </h2>
+      <div class="step">
+        ${kv([
+          ["Schedule", esc(scheduleText(p.schedule)) +
+            (p.next_run ? ` <span class="msg">&middot; next ${new Date(p.next_run).toLocaleString()}</span>` : "")],
+          ["Machines", `${p.members.length}`],
+          ["At once", `${p.concurrency}`],
+          ["Last run", p.last_run ? `${ago(p.last_run)}` : "never"],
+        ])}
+      </div>
+      <div class="step">
+        <h3>If it ran now</h3>
+        ${p.plan.length ? `<div class="scroll" style="max-height:220px;overflow:auto"><table>
+          <tbody>${p.plan.map((x) => `<tr>
+            <td>${esc(x.hostname)}</td>
+            <td>${x.action === "patch" ? '<span class="pill warn">patch</span>'
+              : x.action === "wait" ? '<span class="pill">wait</span>'
+              : x.action === "skip" ? '<span class="pill bad">skip</span>'
+              : '<span class="pill ok">nothing</span>'}</td>
+            <td class="msg">${esc(x.detail)}</td>
+          </tr>`).join("")}</tbody></table></div>`
+          : `<div class="msg">No machines in this pool yet.</div>`}
+        <div class="msg" style="margin-top:8px">${willPatch.length
+          ? `${willPatch.length} machine(s) would be patched, ${p.concurrency} at a time.`
+          : "Nothing to do right now."}</div>
+      </div>
+      <div class="bar">
+        <button class="act" ${p.scope === "none" ? "disabled" : ""}
+          onclick="runPool(${jsq(p.name)})">Run now</button>
+        <select class="fld" onchange="updatePool(${jsq(p.name)}, 'scope', this.value)">
+          ${["none", "security", "all"].map((v) =>
+            `<option value="${v}"${p.scope === v ? " selected" : ""}>${v === "none" ? "patch nothing" : v === "security" ? "security only" : "everything"}</option>`).join("")}
+        </select>
+        <select class="fld" onchange="updatePool(${jsq(p.name)}, 'reboot', this.value)">
+          <option value="never"${p.reboot === "never" ? " selected" : ""}>never reboot</option>
+          <option value="if-needed"${p.reboot === "if-needed" ? " selected" : ""}>reboot if needed</option>
+        </select>
+        <button class="act" onclick="deletePool(${jsq(p.name)})">Delete</button>
+      </div>
+    </div>`;
+  }).join("") || `<div class="card"><div class="empty">No pools yet.</div></div>`);
+
+  const inPool = {};
+  pools.forEach((p) => p.members.forEach((m) => { inPool[m] = p.name; }));
+
+  setHTML($("pool-members"), AGENTS.map((a) => `<tr>
+    <td><a href="#agent/${a.id}" style="color:inherit">${esc(a.hostname)}</a></td>
+    <td class="msg">${esc(a.os_version)}</td>
+    <td>${a.actionable_count || 0}${a.security_count ? ` <span class="pill bad">${a.security_count} sec</span>` : ""}</td>
+    <td>
+      <select class="fld" onchange="setMachinePool(${jsq(a.id)}, this.value)">
+        <option value=""${!inPool[a.id] ? " selected" : ""}>&mdash; none &mdash;</option>
+        ${pools.map((p) => `<option value="${esc(p.name)}"${inPool[a.id] === p.name ? " selected" : ""}>${esc(p.name)}</option>`).join("")}
+      </select>
+    </td>
+  </tr>`).join(""));
+}
+
+// Who is sending, and how much. The address is the identity: the hostname in
+// a syslog message is written by the sender, and the address is not.
+// Sweep again, from the card that shows what a sweep found.
+//
+// Read-only, so it needs no confirmation - but it takes a minute on a /24, and
+// a button that looks like it did nothing gets pressed repeatedly.
+// Which discovered host is expanded, if any.
+//
+// Held outside the render because the table redraws every few seconds; an open
+// row has to survive that, and re-fetching on each redraw would make it flicker.
+let OPEN_HOST = null;
+
+function toggleHost(ip) {
+  OPEN_HOST = OPEN_HOST === ip ? null : ip;
+  // Redraw from what is already in hand rather than asking the portal again:
+  // the detail is in the payload the table was built from, so opening a row
+  // needs no round trip and cannot show something different from its own row.
+  if (LAST_DEVICES) renderNetwork(LAST_DEVICES);
+}
+
+// Everything the sweep learned about one host, as a row beneath its own row.
+//
+// Inline rather than a panel at the foot of the page: the detail belongs where
+// the click was, and a card lower down means scrolling away from the thing you
+// were looking at and losing your place in a table of thirty.
+function hostDetail(h, columns) {
+  const id = h.identity || {};
+  const svc = new Map((h.services || []).map((x) => [x.port, x]));
+
+  const ports = (h.open_ports || []).map((port) => {
+    const s = svc.get(port);
+    const named = s && [s.name, s.product, s.version].filter((x) => x).join(" ");
+    return `<div class="reading">
+      <span class="k mono">${port}</span>
+      <span class="v">${named ? esc(named) : "&mdash;"}${
+        s && s.extra ? ` <span class="msg">${esc(s.extra)}</span>` : ""}</span>
+      <span class="since">${s
+        ? (s.product ? "identified" : "guessed from the port")
+        : "open, nothing identified"}</span>
+    </div>${s && (s.cpe || []).length ? s.cpe.map((c) => `<div class="reading">
+      <span class="k"></span>
+      <span class="v" style="color:var(--muted)">${esc(c)}</span>
+      <span class="since">what to search a CVE list for</span>
+    </div>`).join("") : ""}`;
+  }).join("");
+
+  // Every one of these is a guess except the vendor, so each says how it was
+  // arrived at. An OS fingerprint shown as a fact is the kind of thing somebody
+  // acts on and then spends an afternoon confused by.
+  const facts = [
+    h.known
+      ? ["Known as", `${esc(h.known.name)} <span class="msg">${h.known.role}</span>${
+          h.known.agent
+            ? ` &middot; <a href="#" onclick="openAgent(${jsq(h.known.agent)});return false">open its machine page</a>`
+            : ""}`]
+      : ["Known as", `<span class="pill warn">nothing accounts for this address</span>
+          <span class="msg">not a machine in this fleet and not a declared appliance</span>`],
+    id.mac_vendor
+      ? ["Vendor", `${esc(id.mac_vendor)} <span class="msg">from the hardware address, assigned not guessed</span>`]
+      : null,
+    id.mac ? ["Hardware address", `<span class="mono">${esc(id.mac)}</span>`] : null,
+    id.os
+      ? ["Operating system", `${esc(id.os)} <span class="msg">${id.os_accuracy}% confident${
+          (id.os_alternatives || []).length
+            ? ` &middot; also considered ${esc(id.os_alternatives.join(", "))}`
+            : ""}</span>`]
+      : null,
+    id.uptime_secs
+      ? ["Uptime", `${dur(id.uptime_secs)}
+          <span class="msg">inferred from TCP timestamps, approximate</span>`]
+      : null,
+    (id.os_cpe || []).length
+      ? ["Platform", `<span class="mono" style="color:var(--muted)">${esc(id.os_cpe.join(" "))}</span>
+          <span class="msg">what to search a CVE list for</span>`]
+      : null,
+    ["Scanner", h.scanner === "nmap"
+      ? 'nmap <span class="msg">service and OS detection on</span>'
+      : 'built-in TCP sweep <span class="msg">banner only; no services, vendor or OS</span>'],
+  ].filter(Boolean);
+
+  return `<tr class="detail"><td colspan="${columns}">
+    ${kv(facts)}
+    <div class="step" style="padding-left:0">
+      <div class="msg">Per port. A product name is evidence; a bare service name is
+        nmap reading the port number, which is a guess and labelled as one.</div>
+      ${ports || '<div class="msg">No open ports recorded.</div>'}
+    </div>
+    ${h.known ? "" : `<div class="msg">Not managed by PatchPanel. Add it as an appliance under
+      <a href="#setup" onclick="showTab('setup');return false">Setup</a> with target
+      <span class="mono">${esc(h.ip)}</span>, or install an agent on it.</div>`}
+  </td></tr>`;
+}
+
+async function scanNow(btn) {
+  const was = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Sweeping…";
+  try {
+    const r = await api("/api/commands/broadcast", {
+      method: "POST",
+      body: JSON.stringify({ command: { kind: "discover" } }),
+    });
+    btn.textContent = `Sent to ${r.dispatched_to}`;
+    // Only agents with a discovery range configured do anything, so zero is a
+    // real answer and worth saying out loud rather than looking like a failure.
+    if (!r.dispatched_to) {
+      alert("No connected agent has a discovery range. Add one to the manifest " +
+            "under \"discovery\" first.");
+    }
+  } catch (e) {
+    btn.textContent = "Failed";
+    alert(e.message);
+  }
+  setTimeout(() => { btn.disabled = false; btn.textContent = was; refresh(); }, 60000);
+}
+
+async function loadLogs() {
+  let d;
+  try {
+    d = await api("/api/logs");
+  } catch (e) {
+    return;
+  }
+  $("log-sub").textContent = d.receiving
+    ? `keeping ${d.retain_hours}h`
+    : "not switched on";
+  const empty = $("log-empty");
+  empty.hidden = (d.senders || []).length > 0;
+  if (!empty.hidden) {
+    empty.innerHTML = d.receiving
+      ? `Nothing has sent anything yet. Point a device's syslog at
+         <code>${esc(location.hostname)}:514</code>.`
+      : `The receiver is off. Start the portal with
+         <code>--syslog-bind 0.0.0.0:514</code> to accept device logs.`;
+  }
+  // What the badge is counting, said out loud. A red number with no visible
+  // cause is the thing this whole dashboard is supposed not to do.
+  setHTML($("log-silent"), (d.asked_but_silent || []).map((m) => `<div class="need t3">
+    <div class="rule"></div>
+    <div class="what">
+      <div><b class="mono">${esc(m.machine)}</b> was asked to forward
+        ${esc(m.min_severity)} and worse ${m.asked_at ? ago(m.asked_at) : ""}, and nothing
+        has arrived.</div>
+      <div class="tail">${m.online
+        ? `It is connected, so either it genuinely has nothing at ${esc(m.min_severity)}
+           level, or the forwarding is broken. A quiet host can hold ten such lines
+           a day &mdash; use <b>Estimate volume</b> on its page to see which.`
+        : "It is offline, so this will stay true until it comes back."}</div>
+    </div>
+    <span class="msg">asked, silent</span>
+  </div>`).join(""));
+
+  setHTML($("log-senders"), (d.senders || []).map((s) => {
+    // What is being kept, and who decided the level. Both belong on the row:
+    // "42 lines" means something different at `warning` than at `info`, and a
+    // retention nobody can see is a retention nobody trusts.
+    const level = s.set_here
+      ? `<b>${esc(s.min_severity)}</b> and worse, set here`
+      : `level set on the device`;
+    return `<div class="reading">
+      <span class="k">${esc(s.device || "unknown sender")}</span>
+      <span class="v">${esc(s.source)}</span>
+      <span class="since">${(s.lines || 0).toLocaleString()} lines &middot; ${size(s.bytes)} &middot; ${
+        s.last_line_at ? ago(s.last_line_at) : "quiet"}
+        <button class="act" style="padding:1px 8px;font-size:11.5px;margin-left:8px"
+          onclick="showLog(${jsq(s.source)})">Read</button></span>
+      <span class="k" style="grid-column:1/-1;font-size:11.5px">
+        ${s.set_here
+          // Changing the level is a command to that machine, so it is only
+          // offered where PatchPanel actually drives the sender. An appliance
+          // decides its own level, and a control that silently did nothing
+          // would be worse than no control.
+          ? `forwarding
+             <select class="fld" style="font-size:11px;padding:1px 4px"
+               title="What this machine sends. Changing it dispatches to the agent."
+               onchange="setLogLevel(${jsq(s.source)}, this.value)">
+               ${["err", "warning", "notice", "info"].map((v) =>
+                 `<option value="${v}"${v === s.min_severity ? " selected" : ""}>${
+                   v === "err" ? "errors" : v === "warning" ? "warnings"
+                   : v === "notice" ? "notices" : "everything"} and worse</option>`).join("")}
+             </select>`
+          : `<span title="This sender pushes syslog; the level lives in its own configuration.">level set on the device</span>`}
+        &middot; keep
+        <select class="fld" style="font-size:11px;padding:1px 4px"
+          title="How long these lines are kept before being discarded. Shortening it takes effect immediately."
+          onchange="setLogRetention(${jsq(s.source)}, this.value)">
+          ${[["6","6 hours"],["24","1 day"],["72","3 days"],["168","7 days"]].map(([v, t]) =>
+            `<option value="${v}"${Number(v) === (s.retain_hours || 24) ? " selected" : ""}>${t}</option>`).join("")}
+        </select>
+      </span>
+    </div>`;
+  }).join(""));
+}
+
+async function setLogLevel(source, min_severity) {
+  try {
+    await api("/api/logs/" + encodeURIComponent(source) + "/level", {
+      method: "POST",
+      body: JSON.stringify({ min_severity }),
+    });
+    refresh();
+  } catch (e) {
+    alert(e.message);
+    refresh();
+  }
+}
+
+// Shortening this throws lines away, so it says how many before doing it.
+async function setLogRetention(source, hours) {
+  const h = Number(hours);
+  try {
+    const before = await api("/api/logs/" + encodeURIComponent(source) + "?limit=1");
+    if (!confirm(`Keep ${h} hour(s) of ${source}?
+
+` +
+        `${(before.total || 0).toLocaleString()} line(s) are held now; anything older ` +
+        `than ${h} hour(s) is discarded immediately.`)) { refresh(); return; }
+    await api("/api/logs/" + encodeURIComponent(source) + "/retention", {
+      method: "POST",
+      body: JSON.stringify({ hours: h }),
+    });
+    refresh();
+  } catch (e) {
+    alert(e.message);
+    refresh();
+  }
+}
+
+async function showLog(source, contains) {
+  const box = $("log-view");
+  const q = contains === undefined ? ($("log-filter") ? $("log-filter").value : "") : contains;
+  const limit = $("log-limit") ? $("log-limit").value : "400";
+  const d = await api("/api/logs/" + encodeURIComponent(source) +
+    "?limit=" + encodeURIComponent(limit) + "&contains=" + encodeURIComponent(q || ""));
+  box.hidden = false;
+  // Say what this is a slice of. Showing the last 400 lines without mentioning
+  // that there are 12,000 invites the reader to believe they have seen the lot,
+  // which is how you conclude a thing never happened.
+  const shown = d.lines.length;
+  const total = d.total || shown;
+  const scope = q
+    ? `${shown} line(s) matching ${esc(q)}${shown >= Number(limit) ? ` (capped at ${esc(limit)})` : ""}`
+    : `last ${shown} of ${total} line(s) held`;
+  setHTML(box, `<h2>${esc(d.device || source)} <span class="sub">${esc(source)}</span>
+      <button class="act" style="float:right;padding:2px 8px;font-size:11.5px"
+        onclick="$('log-view').hidden = true">Close</button></h2>
+    <div class="step">
+      <div class="bar">
+        <input id="log-filter" placeholder="only lines containing&hellip;" spellcheck="false"
+          value="${esc(q || "")}"
+          onkeydown="if (event.key === 'Enter') showLog(${jsq(source)})"
+          style="flex:1;padding:7px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink);font-size:12.5px">
+        <select id="log-limit" class="fld" onchange="showLog(${jsq(source)})"
+          title="How many of the most recent lines to show.">
+          ${["200", "400", "2000", "5000"].map((v) =>
+            `<option value="${v}"${v === String(limit) ? " selected" : ""}>last ${v}</option>`).join("")}
+        </select>
+        <button class="act" onclick="exportLog(${jsq(source)})"
+          title="Download everything held for this sender, matching the filter if one is set.">Export</button>
+      </div>
+      <div class="msg" style="margin-top:6px">${scope}, newest last</div>
+      <pre style="max-height:420px">${
+        d.lines.map(esc).join("&#10;") || "(nothing)"}</pre>
+    </div>`);
+  box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+// Fetched rather than linked, so the bearer token goes with it: a plain href
+// would work only on a portal running without authentication.
+async function exportLog(source) {
+  const q = $("log-filter") ? $("log-filter").value : "";
+  const url = "/api/logs/" + encodeURIComponent(source) +
+    "/export?contains=" + encodeURIComponent(q || "");
+  try {
+    const r = await fetch(url, { headers: TOKEN ? { Authorization: "Bearer " + TOKEN } : {} });
+    if (!r.ok) throw new Error("the portal answered " + r.status);
+    const blob = await r.blob();
+    const name = (r.headers.get("content-disposition") || "")
+      .match(/filename="?([^"]+)"?/)?.[1] || source + ".log";
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Revoked on the next tick; doing it immediately cancels the download in
+    // some browsers.
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  } catch (e) {
+    alert("Could not export: " + e.message);
+  }
+}
+
 async function loadDevices() {
   const d = await api("/api/devices");
   const eol = d.devices.filter((x) => x.eol);
@@ -2242,60 +3964,173 @@ async function loadDevices() {
       including for anything found after today. The fix is a release upgrade, not a patch run.
       <ul style="margin:8px 0 0 18px">${eol.map((x) => `<li>
         <b>${esc(x.label || x.id)}</b> &mdash; ${esc(x.firmware || "unknown version")}${
-          x.eol_note ? `. ${esc(x.eol_note)}` : ""}</li>`).join("")}</ul>
+          x.eol_note ? `. ${esc(x.eol_note)}` : ""}${
+          x.stale ? " (not answering; this was true as of the last probe that worked)" : ""}</li>`
+        ).join("")}</ul>
     </div></div>`;
   }
 
   $("devices-empty").hidden = d.devices.length > 0;
   setHTML($("device-rows"), d.devices.map((x) => {
-    let status = '<span class="pill ok">ok</span>';
-    if (!x.probed) status = '<span class="pill">not probed yet</span>';
-    else if (!x.reachable) status = `<span class="pill bad">unreachable</span>`;
-    else if (x.eol) status = `<span class="pill bad" title="${esc(x.eol_note || "This release receives no further updates.")}">end of life</span>`;
-    else if (x.drift) status = `<span class="pill warn">drift</span>`;
-    return `<tr>
-      <td>
+    // One line that says what to do about it, rather than four columns that
+    // each say part of it.
+    const state = !x.probed
+      ? { cls: "", pill: '<span class="pill">not probed yet</span>' }
+      : !x.reachable
+        ? { cls: "bad", pill: '<span class="pill bad">unreachable</span>' +
+            (x.eol ? ' <span class="pill bad" title="Still true whether or not it answered this probe.">end of life</span>' : "") +
+            (x.updates_known && x.updates ? ` <span class="pill warn">${x.updates} update(s)</span>` : "") }
+        : x.eol
+          ? { cls: "bad", pill: `<span class="pill bad" title="${esc(x.eol_note || "No further updates will be released for it.")}">end of life</span>` }
+          : x.updates_known && x.updates
+            ? { cls: "warn", pill: `<span class="pill warn">${x.updates} update(s)</span>` }
+            : x.drift
+              ? { cls: "warn", pill: '<span class="pill warn">drift</span>' }
+              : x.updates_known
+                ? { cls: "", pill: '<span class="pill ok">up to date</span>' }
+                : { cls: "", pill: '<span class="pill">reachable</span>' };
+
+    return `<div class="dev ${state.cls}">
+      <h3>
         <input class="namefld" value="${esc(x.label)}" spellcheck="false"
           placeholder="${esc((x.id || "").split(".")[0])}"
-          title="Click to rename. The id below is what history is kept against and does not change."
+          title="Click to rename."
           onchange="renameDevice(${jsq(x.id)}, this.value)"
           onkeydown="if (event.key === 'Enter') this.blur()">
-        <div class="mono" style="color:var(--muted)">${esc(x.target)}</div>
-      </td>
-      <td class="mono">${esc(x.target)}</td>
-      <td>${esc(x.site) || "-"}</td>
-      <td>${status}${x.error ? `<div class="mono" style="color:var(--muted)">${esc(x.error)}</div>` : ""}</td>
-      <td class="mono">${esc(x.firmware || "-")}</td>
-      <td>${x.updates_known
-        ? (x.updates
-            ? `<span class="pill warn">${x.updates} update(s)</span>`
-            : (x.eol
-                ? '<span class="pill bad" title="Nothing is pending because nothing more will ever be released for it.">none coming</span>'
-                : '<span class="pill ok">current</span>'))
-        : '<span class="msg">-</span>'}${
-        x.reboot_required ? ' <span class="pill warn">reboot</span>' : ""}</td>
-      <td class="mono">${esc(x.expect_version || "-")}</td>
-      <td>${x.latency_ms != null ? x.latency_ms + "ms" : "-"}</td>
-      <td>
-        <button class="act" onclick="deviceHistory(${jsq(x.id)})">History</button>
-        <button class="act" onclick="probeDevice(${jsq(x.collector)}, ${jsq(x.id)})">Probe</button>
-        <button class="act" onclick="removeDevice(${jsq(x.id)})">Remove</button>
-      </td>
-      <td>${esc(x.collector_host)}${x.collectors > 1
-        ? ` <span class="pill warn" title="${x.collectors} machines are all probing this device because no collector is named for it in the manifest. Set a collector to stop the duplicate work.">+${x.collectors - 1} more</span>`
-        : ""}</td>
-      <td>${x.probed ? ago(x.checked_at) : "-"}</td>
-    </tr>`;
+        ${x.url ? `<a href="${esc(x.url)}" target="_blank" rel="noreferrer noopener"
+          class="act" style="padding:2px 8px;font-size:11.5px;text-decoration:none"
+          title="Open ${esc(x.url)}">Open</a>` : ""}
+      </h3>
+      <div class="mono msg">${esc(x.target)}</div>
+
+      <div class="ver${x.stale ? " stale" : ""}"
+        title="${x.stale ? "Last confirmed " + esc(x.last_good_at || "") : ""}">${
+        esc(x.firmware || "\u2014")}</div>
+      ${x.stale ? `<div class="msg">remembered from ${ago(x.last_good_at)} &mdash;
+        the last probe did not get an answer</div>` : ""}
+      <div>${state.pill}${x.reboot_required ? ' <span class="pill warn">reboot</span>' : ""}
+        ${x.expect_version ? `<span class="msg">expected ${esc(x.expect_version)}</span>` : ""}</div>
+      ${x.error ? `<div class="msg bad" style="margin-top:6px">${esc(x.error)}</div>` : ""}
+      ${x.detail ? `<details data-k="dev-${esc(x.id)}" style="margin-top:8px"><summary class="msg">what it said</summary>
+        <pre style="max-height:180px">${esc(x.detail)}</pre></details>` : ""}
+
+      <input class="namefld mono" value="${esc(x.url)}" spellcheck="false"
+        placeholder="management URL" style="font-size:11.5px;margin-top:8px"
+        title="Where to go to act on this device."
+        onchange="setDeviceUrl(${jsq(x.id)}, this.value)"
+        onkeydown="if (event.key === 'Enter') this.blur()">
+
+      ${x.auto_update !== undefined && x.auto_update !== null ? `<div style="margin-top:8px">
+        <label class="msg">PatchPanel installs</label>
+        <select class="fld" style="margin-left:6px;font-size:11.5px;padding:3px 6px"
+          onchange="setAutoUpdate(${jsq(x.id)}, this.value)">
+          <option value="off"${x.auto_update === "off" ? " selected" : ""}>nothing &mdash; report only</option>
+          <option value="software"${x.auto_update === "software" ? " selected" : ""}>its software and add-ons</option>
+          <option value="everything"${x.auto_update === "everything" ? " selected" : ""}>software and device firmware</option>
+        </select>
+      </div>` : ""}
+
+      <div class="foot">
+        <span class="msg" title="via ${esc(x.collector_host)}${x.latency_ms != null ? `, ${x.latency_ms}ms` : ""}">
+          ${x.probed ? `checked ${ago(x.checked_at)}` : "never checked"}</span>
+        ${x.collectors > 1 ? `<span class="pill warn" title="No collector is named for this device, so every agent in the site probes it.">+${x.collectors - 1} collectors</span>` : ""}
+        <span style="margin-left:auto"></span>
+        <button class="act" style="padding:2px 8px;font-size:11.5px"
+          onclick="deviceHistory(${jsq(x.id)})">History</button>
+        <button class="act" style="padding:2px 8px;font-size:11.5px"
+          onclick="probeDevice(${jsq(x.collector)}, ${jsq(x.id)})">Probe</button>
+        <button class="act" style="padding:2px 8px;font-size:11.5px"
+          onclick="removeDevice(${jsq(x.id)})">Remove</button>
+      </div>
+    </div>`;
   }).join(""));
 
-  $("unmanaged-empty").hidden = d.unmanaged.length > 0;
-  setHTML($("unmanaged-rows"), d.unmanaged.map((h) => `<tr>
+  renderNetwork(d);
+}
+
+// The last device payload, kept so expanding a discovered row can redraw the
+// table from what it was already built from instead of asking the portal again.
+let LAST_DEVICES = null;
+
+// Show only the hosts nothing accounts for.
+//
+// Off by default: the whole point of listing the fleet's own machines here is
+// that "what is on this network" is answerable in one place. The filter exists
+// because once the answer is forty rows, finding the four that are a mystery is
+// the common follow-up question.
+let ONLY_UNKNOWN = false;
+
+function onlyUnknown(on) {
+  ONLY_UNKNOWN = on;
+  if (LAST_DEVICES) renderNetwork(LAST_DEVICES);
+}
+
+function renderNetwork(d) {
+  LAST_DEVICES = d;
+  const all = d.network || [];
+  const unknown = all.filter((h) => !h.known);
+  const hosts = ONLY_UNKNOWN ? unknown : all;
+  $("network-empty").hidden = hosts.length > 0;
+  if (!hosts.length) {
+    setHTML($("network-empty"), all.length
+      ? `All ${all.length} host(s) that answered are accounted for &mdash; every one is a
+         machine in this fleet or a declared appliance. Nothing is unexplained.`
+      : `Nothing has answered a sweep yet. Add a <code>discovery</code> range to the
+         manifest, and the collector for its site will sweep it on its own schedule.`);
+  }
+
+  // How old the list is, said plainly. A page that shows hosts with no age on
+  // them invites the reader to assume it is live, and a sweep is the one thing
+  // here that is emphatically not - it runs twice an hour at most.
+  const sweeps = d.sweeps || [];
+  const every = d.sweep_every_secs ? `, automatically every ${dur(d.sweep_every_secs)}` : "";
+  const stale = sweeps.length > 1
+    ? ` <span class="msg">(${esc(sweeps[sweeps.length - 1].collector_host)} last swept
+        ${ago(sweeps[sweeps.length - 1].at)})</span>`
+    : "";
+  setHTML($("sweep-age"), `<div class="step">
+    <div class="msg">${sweeps.length
+      ? `Swept ${ago(sweeps[0].at)} by ${esc(sweeps[0].collector_host)}${every}.${stale}`
+      : `No sweep has finished yet${every ? every.replace(", a", "; a") : ""}. The list below
+         is whatever was found before this portal last restarted, if anything.`}</div>
+    <label class="msg" style="display:block;margin-top:6px;cursor:pointer">
+      <input type="checkbox" onchange="onlyUnknown(this.checked)"${ONLY_UNKNOWN ? " checked" : ""}>
+      Only the ${unknown.length} nothing accounts for
+      <span class="msg">(of ${all.length} answering)</span>
+    </label>
+  </div>`);
+
+  // A range asking for nmap on a collector that has none still finds the hosts,
+  // and would otherwise render as a network where nothing could be identified.
+  setHTML($("network-note"), (d.discovery_notes || []).map((n) => `<div class="step">
+      <div class="note" style="border-color:var(--warn)">${esc(n)}</div>
+    </div>`).join(""));
+
+  setHTML($("network-rows"), hosts.map((h) => {
+    const svc = h.services || [];
+    // One pill per row, and it is the row's verdict. A machine or a declared
+    // appliance gets no pill at all - it is simply named - because "this is
+    // accounted for" is the unremarkable case and marking it competes with the
+    // rows that are actually asking for attention. Amber, not red: an
+    // unexplained host is worth a look, not an alarm.
+    const what = h.known
+      ? `${esc(h.known.name)} <span class="msg">${h.known.role}</span>`
+      : `<span class="pill warn">unexplained</span>${
+          h.hint && !svc.length ? ` <span class="msg">${esc(h.hint)}</span>` : ""}`;
+    return `<tr class="clicky${OPEN_HOST === h.ip ? " open" : ""}"
+        onclick="toggleHost(${jsq(h.ip)})"
+        title="Everything the sweep learned about this host.">
       <td class="mono">${esc(h.ip)}</td>
+      <td class="what">${what}</td>
+      <td>${esc((h.identity || {}).mac_vendor) || '<span class="msg">-</span>'}</td>
       <td class="mono">${h.open_ports.join(", ")}</td>
-      <td class="mono">${esc(h.hint) || "-"}</td>
-      <td>${esc(h.site) || "-"}</td>
-      <td>${esc(h.collector_host)}</td>
-    </tr>`).join(""));
+      <td class="svc">${svc.length ? svc.map((s) => `<div class="msg"><span class="mono">${s.port}</span>
+        ${esc([s.name, s.product, s.version].filter((x) => x).join(" "))}</div>`).join("")
+        : `<span class="msg">-</span>`}</td>
+      <td>${esc(h.collector_host)}
+        <span class="msg">${h.scanner === "nmap" ? "nmap" : "tcp sweep"}</span></td>
+    </tr>${OPEN_HOST === h.ip ? hostDetail(h, 6) : ""}`;
+  }).join(""));
 }
 
 // The portal cannot know which address you reached it on (it may be bound to
@@ -2441,6 +4276,62 @@ async function restartAgent(id) {
   await cmd(id, "restart_agent");
 }
 
+// Per machine, never fleet-wide and never from the manifest. This writes to
+// /etc/rsyslog.d and reloads a service, and a change to a machine gets asked
+// for rather than applied because a document said so.
+// What this machine would actually send, before committing to a level.
+//
+// The spread between levels is enormous and invisible otherwise: one host here
+// holds ten warning-or-worse lines a day and 2,794 at info. Choosing blind is
+// how somebody ends up either shipping a firehose or shipping nothing.
+async function estimateVolume(id) {
+  const out = $("vol-out");
+  if (out) out.textContent = "Counting the last 24 hours…";
+  try {
+    const r = await api(`/api/agents/${id}/commands`, {
+      method: "POST",
+      body: JSON.stringify({ command: { kind: "journal_volume" } }),
+    });
+    // The count runs on the machine, so the answer arrives with the command
+    // result rather than from this call.
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 1500));
+      const log = await api(`/api/agents/${id}`);
+      const hit = (log.commands || []).find((c) => c.id === r.id);
+      if (hit && hit.ok !== null && hit.ok !== undefined) {
+        if (out) out.textContent = hit.summary || "no answer";
+        return;
+      }
+    }
+    if (out) out.textContent = "Still counting; check the machine's activity.";
+  } catch (e) {
+    if (out) out.textContent = e.message;
+  }
+}
+
+async function setForwarding(id, enable) {
+  const sev = $("fwd-sev") ? $("fwd-sev").value : "warning";
+  if (enable && !confirm(
+      "Forward this machine's journal (" + sev + " and worse) to this portal? " +
+      "Nothing is installed and nothing is written to the machine.")) return;
+  try {
+    await api(`/api/agents/${id}/commands`, {
+      method: "POST",
+      body: JSON.stringify({
+        command: { kind: "configure_syslog", enable, min_severity: sev },
+      }),
+    });
+    // The state shown comes from the machine's own next scan, not from this
+    // call succeeding - the file on disk is the truth, not the dispatch.
+    alert(enable
+      ? "Asked. It shows as forwarding once the machine next reports."
+      : "Asked. The rule is removed and kept beside itself as a backup.");
+    refresh();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
 async function installPrereqs(id) {
   const warn = "Install the missing update tooling on this machine?\n\n" +
     "On Linux this installs fwupd, so firmware is looked at at all. On Windows it "  +
@@ -2489,7 +4380,12 @@ async function cmd(id, kind, extra = {}) {
 }
 
 async function broadcast(kind) {
-  const msg = $("broadcast-msg");
+  // The two broadcast bars live on different tabs now, so the result has to
+  // land under the button that was actually pressed.
+  const msg = kind === "apply_manifest" ? $("broadcast-msg2") : $("broadcast-msg");
+  if (kind === "apply_manifest" &&
+      !confirm("Install, upgrade or remove applications on every connected machine so it " +
+               "matches the published manifest. This changes systems. Continue?")) return;
   try {
     const r = await api("/api/commands/broadcast", {
       method: "POST",
@@ -2503,17 +4399,88 @@ async function broadcast(kind) {
   }
 }
 
+// What needs a person, grouped by cause.
+//
+// The server decides what belongs here and how to word it; this only draws it.
+// That is deliberate - the badge, the list and the empty state all have to
+// agree, and they cannot if two of them count for themselves.
+function drawNeeds(d) {
+  const items = d.attention || [];
+  const g = d.gist || {};
+
+  setHTML($("needs"), items.map((n, i) => {
+    const who = n.who && n.who.length
+      ? `<div class="who" id="who-${i}" hidden>${n.who.map((w) =>
+          `<div><b>${w.link
+            ? `<a href="${esc(w.link)}" style="color:inherit">${esc(w.name)}</a>`
+            : esc(w.name)}</b><span>${esc(w.context)}</span><span>${esc(w.why)}</span></div>`
+        ).join("")}</div>`
+      : "";
+    // The names ship with the item, so opening them is free - grouping costs
+    // vertical space and nothing else.
+    const count = n.who && n.who.length
+      ? ` <button class="disc" data-who="${i}" data-n="${n.who.length}"
+          title="show which ones">${n.who.length} &#9662;</button>`
+      : "";
+    return `<div class="need t${n.tier}"><div class="rule"></div><div class="what">
+      <div>${esc(n.say)}${count}</div>
+      ${n.tail ? `<div class="tail">${esc(n.tail)}</div>` : ""}${who}</div>
+      <button class="btn" onclick="showTab('${esc(n.link.replace("#", ""))}')">${esc(n.action)} &rarr;</button></div>`;
+  }).join(""));
+
+  $("needs-sub").textContent = items.length
+    ? `${items.length} thing(s) - everything else is on a schedule`
+    : "";
+
+  // An empty state has to be a proof, not a reassurance. "All good" is exactly
+  // what a dashboard that has stopped checking would also say.
+  const none = $("needs-none");
+  none.hidden = items.length > 0;
+  if (!items.length) {
+    none.innerHTML = `<b>Nothing needs you.</b> ${g.reporting || 0} of ${g.machines || 0}
+      machines reporting, none with a scan problem, and
+      ${g.covered ? `${g.covered} pending update(s) belong to a pool that will take them` :
+        "nothing pending anywhere"}.`;
+  }
+
+  setHTML($("gist"), [
+    `<b>${g.machines || 0}</b> machines, <b>${g.reporting || 0}</b> reporting`,
+    `<b>${g.pending || 0}</b> updates to install, <b>${g.security || 0}</b> security`,
+    g.covered ? `<b>${g.covered}</b> of them belong to a pool` : "",
+    `<a href="#machines" onclick="showTab('machines');return false">all machines &rarr;</a>`,
+  ].filter(Boolean).map((t) => `<span>${t}</span>`).join(""));
+}
+
+// One delegated handler: the rows are redrawn every few seconds, so a listener
+// per button would be attached and dropped on every refresh.
+document.addEventListener("click", (e) => {
+  const d = e.target.closest(".disc");
+  if (!d) return;
+  const box = $("who-" + d.dataset.who);
+  if (!box) return;
+  box.hidden = !box.hidden;
+  d.innerHTML = d.dataset.n + (box.hidden ? " &#9662;" : " &#9652;");
+});
+
 async function refresh() {
+  // Assume nothing is paused; whichever render is blocked will say so.
+  showPaused(false);
   try {
     // The fleet call also populates the hostname lookup the activity tab uses.
     await loadFleet();
-    if (TAB === "devices") await loadDevices();
-    if (TAB === "add") {
+    if (TAB === "machines") await loadDevices();
+    if (TAB === "logs") await loadLogs();
+    // The unmanaged list arrives with the device list, so the same call fills it.
+    if (TAB === "discovered") await loadDevices();
+    if (TAB === "schedule") await loadPools();
+    if (TAB === "jobs") await loadJobs();
+    if (TAB === "backups") await loadBackups();
+    if (TAB === "setup") {
       if (!$("add-portal").value) $("add-portal").value = location.host;
       await loadAdd();
+      if (!$("manifest-doc").value) await loadManifest();
+      await loadActivity();
     }
-    if (TAB === "manifest" && !$("manifest-doc").value) await loadManifest();
-    if (TAB === "activity") await loadActivity();
     if (TAB === "agent") await loadAgent(ROUTE.id);
   } catch (e) {
     if (e.message !== "unauthorized") console.error(e);

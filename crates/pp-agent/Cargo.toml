@@ -16,6 +16,7 @@ hex = "0.4.3"
 ipnet = "2.12.2"
 os_info = "3.15.0"
 pp-proto.workspace = true
+quick-xml = "0.41.0"
 regex = "1.13.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "stream", "charset", "http2", "system-proxy"] }
 serde.workspace = true

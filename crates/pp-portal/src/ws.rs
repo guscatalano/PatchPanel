@@ -111,13 +111,42 @@ async fn serve(socket: WebSocket, state: Arc<AppState>) -> anyhow::Result<()> {
     // start that upgrade now rather than waiting for someone to notice.
     if let Some(cmd) = self_update_command(&state, &manifest, &system) {
         let id = Uuid::new_v4();
-        state.db.record_command(id, agent_id, &cmd)?;
+        // The portal's own doing, in response to a published manifest.
+        state.db.record_command(id, agent_id, &cmd, "manifest")?;
         send(
             &mut sink,
             ServerMsg::Command(pp_proto::CommandEnvelope { id, command: cmd }),
         )
         .await?;
         tracing::info!(%agent_id, "dispatched self-update on connect");
+    }
+
+    // Re-ask for log forwarding on every connection.
+    //
+    // The agent deliberately does not remember this: it tails the journal into
+    // an in-memory task, and a restart, a self-update or a reboot ends that
+    // task. If the switch lived on the agent it would quietly turn itself off,
+    // and the portal would go on believing it was receiving logs from a machine
+    // that had stopped sending them. Re-asking makes the portal's record the
+    // only record, which is the same rule that governs every other piece of
+    // derived state here.
+    match state.db.log_forward(agent_id) {
+        Ok(Some((min_severity, _asked_at))) => {
+            let cmd = Command::ConfigureSyslog {
+                enable: true,
+                min_severity,
+            };
+            let id = Uuid::new_v4();
+            state.db.record_command(id, agent_id, &cmd, "portal")?;
+            send(
+                &mut sink,
+                ServerMsg::Command(pp_proto::CommandEnvelope { id, command: cmd }),
+            )
+            .await?;
+            tracing::debug!(%agent_id, "re-asked for journal forwarding on connect");
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, %agent_id, "could not read the forwarding switch"),
     }
 
     // -- pump ---------------------------------------------------------------
@@ -300,6 +329,9 @@ async fn read_loop(
                     rows.into_iter().find(|a| a.id == agent_id)
                 }) {
                     for report in &inv.devices {
+                        if let Err(e) = state.db.record_last_good(report) {
+                            tracing::warn!(error = %e, "could not record last good probe");
+                        }
                         if let Err(e) = state.db.record_probe(&row.hostname, report) {
                             tracing::warn!(error = %e, device = %report.id, "recording probe failed");
                         }
@@ -310,6 +342,39 @@ async fn read_loop(
 
             ClientMsg::CommandProgress { id, line } => {
                 state.db.append_progress(id, &line)?;
+            }
+
+            ClientMsg::JournalLines { lines } => {
+                // Written to the same per-sender files the syslog receiver
+                // uses, so one viewer covers both: a machine with an agent and
+                // an appliance that can only push syslog end up in the same
+                // place, named the same way.
+                // The machine names its own log file, so it lines up with the
+                // fleet table rather than with an address that may change.
+                let Ok(Some(name)) = state
+                    .db
+                    .agents()
+                    .map(|rows| rows.into_iter().find(|a| a.id == agent_id).map(|a| a.hostname))
+                else {
+                    continue;
+                };
+                let converted: Vec<crate::syslog::LogLine> = lines
+                    .into_iter()
+                    .map(|l| crate::syslog::LogLine {
+                        at: l.at,
+                        source: name.clone(),
+                        host: name.clone(),
+                        facility: 1,
+                        severity: l.priority,
+                        tag: l.tag,
+                        msg: l.message,
+                    })
+                    .collect();
+                if let Err(e) =
+                    crate::syslog::append(&state.log_dir, &name, &converted, 0)
+                {
+                    tracing::warn!(error = %e, %agent_id, "could not write journal lines");
+                }
             }
 
             ClientMsg::CommandResult(result) => {
