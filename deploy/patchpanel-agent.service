@@ -1,8 +1,21 @@
 [Unit]
 Description=PatchPanel Agent
 Documentation=https://github.com/your-org/patchpanel
-After=network-online.target
-Wants=network-online.target
+After=network.target
+
+# Deliberately NOT Wants=network-online.target.
+#
+# That target is never reached on plenty of hosts - a Proxmox LXC usually has no
+# wait-online helper installed, and where one exists it times out - and a unit
+# that Wants an unreachable target is never started at all. systemd does not
+# fail it and does not retry it; the job simply never activates, so Restart has
+# nothing to act on. A fleet of containers reboots and comes back with no agent,
+# silently, forever.
+#
+# The agent does not need the network at start time. It dials out and retries
+# on its own schedule, so the correct behaviour when the network is not ready
+# yet is to start anyway and keep trying - which is exactly what waiting for
+# network-online prevented.
 
 [Service]
 Type=simple
@@ -16,6 +29,16 @@ User=root
 # would silently drop off the fleet after every agent upgrade.
 Restart=always
 RestartSec=5s
+
+# Make "always" mean always.
+#
+# systemd's default start limit gives up after a handful of restarts in a short
+# window and leaves the unit failed - permanently, with no further attempts. For
+# a fleet agent that is the worst possible behaviour: the machine goes quiet and
+# stays quiet, which is exactly the silence this product exists to notice. A
+# crash loop should keep looping and keep being visible, not resolve itself into
+# a machine nobody hears from again.
+StartLimitIntervalSec=0
 
 # Give a long apt transaction room to finish rather than killing it mid-dpkg,
 # which is how you get a machine stuck needing `dpkg --configure -a`.
