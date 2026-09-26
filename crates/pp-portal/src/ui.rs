@@ -251,6 +251,27 @@ const INDEX: &str = r##"<!doctype html>
      a version string on each is wider than every other column put together. */
   td.svc { max-width: 300px; }
   td.what { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+
+  .live-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    padding: 0 14px 10px; }
+  .live-controls input { flex: 1 1 200px; min-width: 140px; }
+  /* Fixed height, own scrollbar: the feed must not make the page grow without
+     bound as lines arrive, and following the tail means scrolling this and not
+     the document. */
+  .feed { height: 420px; overflow-y: auto; overflow-x: auto; margin: 0 14px 14px;
+    border: 1px solid var(--line); border-radius: 6px; background: var(--bg);
+    font-family: var(--mono); font-size: 12px; line-height: 1.5; }
+  .feed .row { display: flex; gap: 8px; padding: 1px 8px; white-space: pre;
+    border-bottom: 1px solid color-mix(in srgb, var(--line) 35%, transparent); }
+  .feed .row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  .feed .t { color: var(--muted); }
+  /* One column so machine names line up and the eye can run down them, which is
+     the whole point of a merged feed. */
+  .feed .w { color: var(--accent); min-width: 110px; }
+  .feed .g { color: var(--muted); min-width: 70px; }
+  .feed .m { color: var(--ink); white-space: pre-wrap; word-break: break-word; }
+  .feed .row.warn .m { color: var(--warn); }
+  .feed .row.err .m { color: var(--bad); }
   td.svc div { overflow: hidden; text-overflow: ellipsis; }
   /* Most machines have security updates, so a pill there discriminates
      nothing - the shape is identical down the column. Colour on the numeral
@@ -619,6 +640,35 @@ const INDEX: &str = r##"<!doctype html>
         <div class="empty" id="log-empty" hidden></div>
       </div>
 
+      <div class="card">
+        <h2>Live
+          <span class="sub" id="live-state"></span>
+          <button class="act" id="live-toggle" style="float:right;padding:2px 8px;font-size:11.5px"
+            onclick="toggleLive()">Start</button></h2>
+        <div class="step">
+          <div class="msg">Everything arriving from every sender at once, newest at the
+            bottom. Scroll up to hold it still; scroll back to the bottom to follow
+            again. This is a window on the last few thousand lines, not the archive
+            &mdash; the per-sender files above are the record.</div>
+        </div>
+        <div class="live-controls">
+          <input id="live-filter" placeholder="filter&hellip;" oninput="drawLive()"
+            title="Show only lines containing this text. Applies to what has already arrived as well as what comes next.">
+          <select id="live-who" onchange="drawLive()"
+            title="One machine, or all of them."></select>
+          <select id="live-sev" onchange="drawLive()" title="Severity, and worse.">
+            <option value="7">everything</option>
+            <option value="6">info and worse</option>
+            <option value="4">warnings and worse</option>
+            <option value="3">errors only</option>
+          </select>
+          <span class="msg" id="live-count"></span>
+        </div>
+        <div id="live-missed"></div>
+        <div class="feed" id="live-feed" onscroll="liveScrolled()"></div>
+        <div class="empty" id="live-empty">Not running. Press Start.</div>
+      </div>
+
       <div class="card" id="log-view" hidden></div>
 
     </section>
@@ -900,6 +950,11 @@ function showTab(tab, id, pane) {
   document.querySelectorAll("section").forEach((s) =>
     s.classList.toggle("active", shown.includes(s.id)));
   if (location.hash.slice(1) !== want) location.hash = want;
+  // Opening the Logs tab is the whole intent behind a live view, so it starts
+  // itself rather than asking. It is stopped by hand and never restarted
+  // automatically after that - having pressed Stop, being overruled by a tab
+  // change would be worse than the extra click.
+  if (tab === "logs" && !LIVE_ON && !LIVE_STOPPED) toggleLive();
   refresh();
 }
 
@@ -1356,6 +1411,21 @@ function dur(s) {
   if (d) return `${d}d ${h}h`;
   if (h) return `${h}h ${m}m`;
   return `${m}m`;
+}
+
+// Join the non-empty parts of a list for display, dropping repeats.
+//
+// The separator is markup and each part is content, so the parts are escaped and
+// the separator is not - doing it the other way round renders a literal
+// "&middot;" on the page, which is how this got noticed. Duplicates go because
+// nmap classes a machine as "general purpose / Linux / Linux" and three fields
+// agreeing is not three facts.
+function dotted(parts) {
+  const seen = [];
+  for (const p of parts) {
+    if (p && !seen.includes(p)) seen.push(p);
+  }
+  return seen.map(esc).join(" &middot; ");
 }
 
 function kv(rows) {
@@ -3732,8 +3802,7 @@ function hostDetail(h, columns) {
           set up &mdash; not checked against the host itself</span>`]
       : null,
     id.device_type
-      ? ["Kind of device", `${esc([id.device_type, id.vendor, id.os_family]
-          .filter((x) => x).join(" &middot; "))}
+      ? ["Kind of device", `${dotted([id.device_type, id.vendor, id.os_family])}
           <span class="msg">nmap's classification of the fingerprint, same confidence
           as the OS guess below</span>`]
       : null,
@@ -4161,12 +4230,9 @@ function renderNetwork(d) {
     // finding is worse than a blank - so it stays in the expansion, next to the
     // sentence explaining it is a guess of the same standing as the OS match.
     const named = svc.some((s) => s.product) ? "" : h.hint;
-    const said = h.known ? "" : [
-      (id.hostnames || [])[0],
-      // The hint falls back to the PTR name when it has nothing better, and
-      // printing the same string twice looks like two pieces of evidence.
-      named === (id.hostnames || [])[0] ? "" : named,
-    ].filter((x) => x).join(" &middot; ");
+    // `dotted` drops the repeat when the hint has fallen back to the PTR name,
+    // which it does whenever nothing better was established.
+    const said = h.known ? "" : dotted([(id.hostnames || [])[0], named]);
     const what = h.known
       ? `${esc(h.known.name)} <span class="msg">${h.known.role}${
           h.known.via === "reverse DNS" ? ", by name" : ""}</span>`
@@ -4567,6 +4633,165 @@ async function boot() {
 }
 boot();
 // Polling covers both entry paths, and skips itself while the gate is up.
+// ---------------------------------------------------------------------------
+// The live feed
+//
+// Held apart from the page's ordinary render loop, which replaces innerHTML
+// wholesale. Doing that to a feed would reset the scroll position on every poll
+// and make it impossible to read anything while lines are arriving - so this
+// keeps the lines it has been given, appends to them, and only ever re-renders
+// when a filter changes.
+// ---------------------------------------------------------------------------
+
+let LIVE_ON = false;
+let LIVE_CURSOR = 0;
+let LIVE_TIMER = null;
+let LIVE_LINES = [];
+let LIVE_MISSED = 0;
+let LIVE_WHO = [];
+// Set when the reader has scrolled up. Following is the default, but the moment
+// somebody scrolls back to look at something, moving the view under them is the
+// rudest thing this page could do.
+let LIVE_HELD = false;
+// Whether the reader has stopped it by hand, which the tab-change autostart
+// respects.
+let LIVE_STOPPED = false;
+
+// What this window keeps. Above this the oldest go, matching the portal's own
+// ring - it is a live view, and the files behind it are the archive.
+const LIVE_MAX = 3000;
+
+function toggleLive() {
+  LIVE_ON = !LIVE_ON;
+  if (!LIVE_ON) LIVE_STOPPED = true;
+  $("live-toggle").textContent = LIVE_ON ? "Stop" : "Start";
+  $("live-empty").hidden = LIVE_ON || LIVE_LINES.length > 0;
+  if (LIVE_ON) {
+    pollLive();
+    // Faster than the page's 5s, because a feed that updates every five seconds
+    // does not read as live. Only while the tab is open - see pollLive.
+    LIVE_TIMER = setInterval(pollLive, 1500);
+  } else {
+    clearInterval(LIVE_TIMER);
+    LIVE_TIMER = null;
+    $("live-state").textContent = "stopped";
+  }
+}
+
+async function pollLive() {
+  // The tab can change under a running timer, and polling a feed nobody is
+  // looking at is pure waste.
+  if (!LIVE_ON || TAB !== "logs" || $("app").hidden) return;
+  let r;
+  try {
+    r = await api(`/api/logs/live?after=${LIVE_CURSOR}`);
+  } catch (e) {
+    // A portal restart is the common case. Keep the lines already on screen and
+    // say so, rather than clearing to a blank pane.
+    $("live-state").textContent = "reconnecting";
+    return;
+  }
+  LIVE_CURSOR = r.next;
+  LIVE_MISSED += r.missed || 0;
+  $("live-state").textContent = r.receiver_on
+    ? (LIVE_HELD ? "held — scroll to the bottom to follow" : "following")
+    : "the syslog receiver is off; only forwarded journals will appear";
+
+  if (r.lines && r.lines.length) {
+    for (const l of r.lines) {
+      LIVE_LINES.push(l);
+      if (!LIVE_WHO.includes(l.who)) LIVE_WHO.push(l.who);
+    }
+    if (LIVE_LINES.length > LIVE_MAX) LIVE_LINES.splice(0, LIVE_LINES.length - LIVE_MAX);
+    whoOptions();
+    drawLive(r.lines);
+  } else {
+    drawLive();
+  }
+}
+
+// Keep the machine list in step without disturbing a choice already made.
+function whoOptions() {
+  const sel = $("live-who");
+  const want = ["", ...LIVE_WHO.slice().sort()];
+  if (sel.options.length === want.length) return;
+  const chosen = sel.value;
+  sel.innerHTML = want
+    .map((w) => `<option value="${esc(w)}">${w ? esc(w) : "every machine"}</option>`)
+    .join("");
+  sel.value = chosen;
+}
+
+function liveShown(l) {
+  const text = $("live-filter").value.trim().toLowerCase();
+  const who = $("live-who").value;
+  const sev = Number($("live-sev").value);
+  if (who && l.who !== who) return false;
+  if (l.severity > sev) return false;
+  if (text && !(`${l.who} ${l.tag} ${l.msg}`.toLowerCase().includes(text))) return false;
+  return true;
+}
+
+function liveRow(l) {
+  const cls = l.severity <= 3 ? " err" : l.severity <= 4 ? " warn" : "";
+  const t = new Date(l.at);
+  const hh = String(t.getHours()).padStart(2, "0");
+  const mm = String(t.getMinutes()).padStart(2, "0");
+  const ss = String(t.getSeconds()).padStart(2, "0");
+  return `<div class="row${cls}"><span class="t">${hh}:${mm}:${ss}</span>` +
+    `<span class="w" title="${esc(l.source)}">${esc(l.who)}</span>` +
+    `<span class="g">${esc(l.tag || "-")}</span>` +
+    `<span class="m">${esc(l.msg)}</span></div>`;
+}
+
+// `added` present: append only those, which is what keeps a long feed cheap.
+// Absent: a filter changed, so everything held is re-rendered.
+function drawLive(added) {
+  const feed = $("live-feed");
+  $("live-empty").hidden = LIVE_ON || LIVE_LINES.length > 0;
+
+  if (added) {
+    const html = added.filter(liveShown).map(liveRow).join("");
+    if (html) {
+      feed.insertAdjacentHTML("beforeend", html);
+      // Trim the DOM to what the page holds, or a day of logs becomes a
+      // hundred thousand nodes and the tab starts to crawl.
+      while (feed.childElementCount > LIVE_MAX) feed.removeChild(feed.firstElementChild);
+    }
+  } else {
+    feed.innerHTML = LIVE_LINES.filter(liveShown).map(liveRow).join("");
+  }
+
+  const shown = feed.childElementCount;
+  $("live-count").textContent = LIVE_LINES.length
+    ? `${shown} of ${LIVE_LINES.length} line(s)`
+    : "";
+  setHTML($("live-missed"), LIVE_MISSED
+    ? `<div class="step"><div class="note" style="border-color:var(--warn)">
+        ${LIVE_MISSED} line(s) arrived faster than this page collected them and are
+        no longer in the portal's window. They are still in the per-sender files
+        above; only this view lost them.</div></div>`
+    : "");
+
+  if (!LIVE_HELD) feed.scrollTop = feed.scrollHeight;
+}
+
+// Following is a position, not a mode: if the reader is at the bottom we follow,
+// and if they have scrolled away we do not. Deriving it from the scroll position
+// means there is no state to get out of step with what they can see.
+function liveScrolled() {
+  const feed = $("live-feed");
+  const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 24;
+  if (atBottom === LIVE_HELD) {
+    LIVE_HELD = !atBottom;
+    if (LIVE_ON) {
+      $("live-state").textContent = LIVE_HELD
+        ? "held — scroll to the bottom to follow"
+        : "following";
+    }
+  }
+}
+
 setInterval(() => { if (!$("app").hidden) refresh(); }, 5000);
 </script>
 </body>

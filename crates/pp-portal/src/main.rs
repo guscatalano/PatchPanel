@@ -123,6 +123,7 @@ async fn main() -> Result<()> {
 
     let require_admin_auth = !cli.no_admin_auth;
     let state = Arc::new(AppState {
+        live: Default::default(),
         db: Db::open(&cli.db).context("opening the portal database")?,
         hub: Hub::new(),
         enrollment_token: enrollment_token.clone(),

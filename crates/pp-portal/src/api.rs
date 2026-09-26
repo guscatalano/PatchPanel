@@ -53,6 +53,7 @@ pub fn routes(state: SharedState) -> Router {
         .route("/api/jobs/{name}", axum::routing::delete(forget_job))
         .route("/api/jobs/{name}/runs", get(job_runs))
         .route("/api/logs", get(log_senders))
+        .route("/api/logs/live", get(live_log))
         .route("/api/logs/{source}", get(device_log_tail))
         .route("/api/logs/{source}/export", get(device_log_export))
         .route("/api/logs/{source}/retention", post(set_retention))
@@ -2427,6 +2428,50 @@ async fn forget_job(
 ///
 /// The address is the identity, not the hostname in the message: one is
 /// observed and the other is whatever the sender chose to claim.
+#[derive(Deserialize)]
+struct LiveQuery {
+    /// Cursor from the previous response. Absent or 0 means "just arrived",
+    /// which returns the tail rather than the whole window.
+    #[serde(default)]
+    after: u64,
+}
+
+#[derive(Serialize)]
+struct LiveResponse {
+    lines: Vec<crate::syslog::LiveLine>,
+    /// Pass back as `after` next time.
+    next: u64,
+    /// Lines that were evicted before this reader collected them. Reported
+    /// rather than skipped: a feed with a silent hole in it is worse than one
+    /// that admits where it stopped being complete.
+    missed: u64,
+    /// Whether anything is listening at all, so an empty feed can distinguish
+    /// "quiet" from "off".
+    receiver_on: bool,
+}
+
+/// The log as it arrives, across every sender at once.
+///
+/// A cursor and a poll rather than a stream. The page already polls for
+/// everything else, a cursor survives a reload or a portal restart without a
+/// reconnect dance, and there is no long-lived connection to leak - the whole
+/// feature is a ring buffer and an integer.
+async fn live_log(
+    State(state): State<SharedState>,
+    Query(q): Query<LiveQuery>,
+) -> ApiResult<Json<LiveResponse>> {
+    // Enough that a burst between two polls arrives in one response, and little
+    // enough that one machine screaming cannot make the payload enormous.
+    const LIMIT: usize = 500;
+    let (lines, next, missed) = state.live.since(q.after, LIMIT);
+    Ok(Json(LiveResponse {
+        lines,
+        next,
+        missed,
+        receiver_on: state.syslog_on,
+    }))
+}
+
 async fn log_senders(State(state): State<SharedState>) -> ApiResult<Json<serde_json::Value>> {
     let retention = state.db.log_retention().unwrap_or_default();
     let senders: Vec<serde_json::Value> = crate::syslog::senders(&state.log_dir)

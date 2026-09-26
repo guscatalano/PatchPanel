@@ -32,6 +32,9 @@ pub struct AppState {
     /// Whether anything is listening for syslog at all, so the page can say
     /// "off" rather than "nothing has arrived".
     pub syslog_on: bool,
+    /// The last few thousand lines from every sender, merged, for the live view.
+    /// The files remain the record; this is a window on the same writes.
+    pub live: crate::syslog::Live,
 }
 
 pub type SharedState = Arc<AppState>;

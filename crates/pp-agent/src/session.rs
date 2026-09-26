@@ -101,6 +101,15 @@ struct Ctx {
     /// finds a pool that is entirely gone; only a real run finds the four
     /// files out of a hundred that are missing, so keep what it learned.
     unfetchable: Arc<RwLock<Vec<String>>>,
+    /// Set while a discovery sweep is running, so a second cannot start.
+    ///
+    /// The scheduled sweep and the Scan now button are separate tasks calling the
+    /// same function, and nothing stopped both scanning the same range at once -
+    /// two nmap runs over a /24 with version, OS and script detection is the
+    /// opposite of the throttling the rest of this is for. The button refuses
+    /// rather than queues: waiting twenty minutes to then re-scan is not what
+    /// anybody pressing it wanted.
+    sweeping: Arc<AtomicBool>,
     tx: mpsc::UnboundedSender<Message>,
     progress_tx: mpsc::UnboundedSender<(Uuid, String)>,
     /// Signals that a new binary is in place and this process should exit.
@@ -303,6 +312,7 @@ async fn session(
     let forward_severity: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
     let ctx = Ctx {
+        sweeping: Arc::new(AtomicBool::new(false)),
         forward_logs: forward_logs.clone(),
         forward_severity: forward_severity.clone(),
         cfg: cfg.clone(),
@@ -678,6 +688,15 @@ fn start_schedules(ctx: Ctx, schedules: &mut JoinSet<()>) {
     }
 }
 
+/// Clears the in-progress flag on the way out, whatever the path out is.
+struct Sweeping(Arc<AtomicBool>);
+
+impl Drop for Sweeping {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// The discovery ranges this agent is responsible for.
 ///
 /// Site-scoped, which is what keeps an automatic sweep from multiplying by the
@@ -694,6 +713,17 @@ async fn discovery_scans(ctx: &Ctx) -> Vec<pp_proto::DiscoveryScan> {
 /// sweep and a person pressing the button do exactly the same thing - including
 /// stamping `swept_at`, without which the page cannot say how old the list is.
 async fn sweep(ctx: &Ctx, scans: &[pp_proto::DiscoveryScan], p: &Progress) -> Result<String> {
+    if ctx
+        .sweeping
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        anyhow::bail!("a sweep is already running; this one was not started");
+    }
+    // Cleared however this returns, including on an error or a panic inside the
+    // scan - a flag left set would disable discovery until the agent restarted.
+    let _guard = Sweeping(ctx.sweeping.clone());
+
     let known = ctx.manifest.read().await.devices.clone();
     p.line(&format!("sweeping {} range(s)", scans.len()));
     let found = probe::discover(scans, &known).await;

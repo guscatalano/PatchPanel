@@ -24,13 +24,45 @@ use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
 use tokio::process::Command;
 
-/// Longest a version scan may run before we give up on it and sweep instead.
+/// Longest a scan may run before we give up on it and sweep instead.
 ///
-/// Minutes rather than seconds: `-Pn` means every address in the range is port
-/// scanned whether it answers a ping or not, and `-sV` then holds a
-/// conversation with each open port. A /24 of mostly dead addresses is the slow
-/// case, and it is also the case the operator most wants an answer for.
-const NMAP_TIMEOUT: Duration = Duration::from_secs(600);
+/// Generous, because the scan is deliberately throttled (see `POLITE`) and the
+/// thing being protected against is a scan that has hung, not one that is taking
+/// its time. `-Pn` means every address in the range is port scanned whether it
+/// answers a ping or not, `-sV` then holds a conversation with each open port,
+/// and a UDP scan waits out a timeout on every silent one.
+///
+/// Must stay below `manifest.discovery_secs` with room to spare, or a sweep that
+/// hits the limit is immediately followed by the next one and the throttling is
+/// undone by running continuously.
+const NMAP_TIMEOUT: Duration = Duration::from_secs(2700);
+
+/// Timing arguments that make the sweep a quiet background presence.
+///
+/// The default timing is tuned for a person waiting on the result, which is the
+/// wrong trade for something that now runs unattended every half hour on a
+/// network people are using. Two separate problems with being quick about it:
+/// the obvious one is the traffic, and the one that actually cost us accuracy is
+/// that probes under load time out and nmap records `tcpwrapped` - a Brother
+/// printer that had reported its exact model from an HTTP title came back as two
+/// anonymous open ports once UDP and scripts were added to the same scan.
+/// Slowing down gets that identification back, so this is not purely a courtesy.
+///
+///   - `-T2` is nmap's own "polite": it serialises probes and waits between
+///     them, and exists for exactly this - using less of somebody else's
+///     bandwidth and CPU. `-T1` and `-T0` are measured in hours per host.
+///   - `--max-retries` above the default-for-speed of 1, because a dropped probe
+///     is the normal case for UDP, and giving up after one try is what makes a
+///     UDP scan unreliable rather than merely slow.
+///   - `--host-timeout` so one unresponsive address cannot eat the whole window
+///     and cost every host after it in the range.
+///
+/// Notably absent is `--max-parallelism`, which would cap outstanding probes.
+/// `-T2` already serialises per host, and stacking the two over-constrains the
+/// scan into overrunning `NMAP_TIMEOUT` - at which point the range falls back to
+/// the built-in sweep and every identification is lost, which is a far worse
+/// outcome than a scan that was merely brisk.
+const POLITE: &[&str] = &["-T2", "--max-retries", "3", "--host-timeout", "300s"];
 /// Cap on the identification carried in `hint`. Longer than the sweep's banner
 /// allowance because a product name and version is worth more than the first
 /// 80 bytes of whatever a socket said.
@@ -109,6 +141,7 @@ pub async fn sweep(scan: &DiscoveryScan) -> Result<Vec<DiscoveredHost>> {
         // all, which reads as "nothing to see".
         "--osscan-guess",
     ];
+    args.extend_from_slice(POLITE);
 
     // Reverse DNS is left on. It used to be disabled with `-n` on the grounds
     // that 254 PTR lookups are the slowest part of a scan, which was a fair
@@ -128,8 +161,6 @@ pub async fn sweep(scan: &DiscoveryScan) -> Result<Vec<DiscoveredHost>> {
         // the same privilege `-O` above already relies on.
         args.push("-sS");
         args.push("-sU");
-        args.push("--max-retries");
-        args.push("1");
     }
 
     // A named set, not nmap's `-sC` category: these are the scripts that put a

@@ -216,6 +216,123 @@ fn format_line(l: &LogLine) -> String {
     )
 }
 
+/// A window on the log as it arrives, for watching rather than searching.
+///
+/// Every line is already being written to its sender's file, and the files are
+/// the record - this is a second, much shorter view of the same writes, kept in
+/// memory so a page can follow the whole fleet at once without reading thirteen
+/// files on every poll.
+///
+/// A ring rather than a growing list: a live view is about the present, and the
+/// past is on disk. When it wraps, readers are told how many lines they missed
+/// instead of being handed a feed with a silent hole in it - a log that loses
+/// lines without saying so is worse than one that stops.
+pub struct Live {
+    inner: std::sync::Mutex<LiveInner>,
+}
+
+struct LiveInner {
+    lines: std::collections::VecDeque<LiveLine>,
+    /// Monotonic, and never reset: it is the cursor readers hold, so reusing a
+    /// number would silently hand somebody the wrong lines.
+    next_seq: u64,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct LiveLine {
+    pub seq: u64,
+    pub at: DateTime<Utc>,
+    /// The machine or device this came from, resolved the same way the file
+    /// list resolves it, so one line reads the same in both places.
+    pub who: String,
+    pub source: String,
+    pub severity: i64,
+    pub tag: String,
+    pub msg: String,
+}
+
+/// How many lines the window holds. Roughly a screenful per machine on this
+/// fleet, which is what a person scrolling back through a burst wants; anything
+/// longer is a job for the files.
+const LIVE_LINES: usize = 3000;
+
+impl Default for Live {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(LiveInner {
+                lines: std::collections::VecDeque::with_capacity(LIVE_LINES),
+                next_seq: 1,
+            }),
+        }
+    }
+}
+
+impl Live {
+    /// Add lines, evicting the oldest once full.
+    pub fn push(&self, who: &str, lines: &[LogLine]) {
+        let mut g = match self.inner.lock() {
+            Ok(g) => g,
+            // A panic while formatting somebody else's log line must not take
+            // the receiver down with it; the files are the record either way.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for l in lines {
+            let seq = g.next_seq;
+            g.next_seq += 1;
+            g.lines.push_back(LiveLine {
+                seq,
+                at: l.at,
+                who: who.to_string(),
+                source: l.source.clone(),
+                severity: l.severity,
+                tag: l.tag.clone(),
+                msg: l.msg.clone(),
+            });
+            if g.lines.len() > LIVE_LINES {
+                g.lines.pop_front();
+            }
+        }
+    }
+
+    /// Lines after `cursor`, and how many were evicted before the reader got to
+    /// them.
+    ///
+    /// `cursor` of 0 means "I have just arrived": that returns the tail rather
+    /// than everything, because a page opening on a busy fleet wants the present
+    /// and not three thousand lines of history it did not ask for.
+    pub fn since(&self, cursor: u64, limit: usize) -> (Vec<LiveLine>, u64, u64) {
+        let g = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let newest = g.next_seq;
+        if cursor == 0 {
+            let out: Vec<LiveLine> = g.lines.iter().rev().take(limit).rev().cloned().collect();
+            return (out, newest, 0);
+        }
+        let oldest = g.lines.front().map(|l| l.seq).unwrap_or(newest);
+        // Everything from `cursor` up to the oldest line still held is gone.
+        let missed = oldest.saturating_sub(cursor);
+        let mut out: Vec<LiveLine> = g
+            .lines
+            .iter()
+            .filter(|l| l.seq >= cursor)
+            .take(limit)
+            .cloned()
+            .collect();
+        // A reader that is further behind than the window is long gets the tail
+        // and the count of what it lost.
+        if out.len() == limit {
+            if let Some(last) = out.last() {
+                let next = last.seq + 1;
+                return (out, next, missed);
+            }
+        }
+        out.truncate(limit);
+        (out, newest, missed)
+    }
+}
+
 pub fn append(dir: &Path, source: &str, lines: &[LogLine], dropped: usize) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = path_for(dir, source);
@@ -487,6 +604,14 @@ pub fn spawn(state: SharedState, bind: SocketAddr, dir: PathBuf) {
                 if let Err(e) = append(&dir, &source, &bucket.lines, bucket.dropped) {
                     tracing::warn!(error = %e, %source, "could not write syslog lines");
                 }
+                // Resolved here rather than on the page: the address is the only
+                // identity a sender cannot lie about, and turning it into a name
+                // is something only the portal can do.
+                let who = owner(&state, &source);
+                state.live.push(
+                    if who.is_empty() { &source } else { &who },
+                    &bucket.lines,
+                );
             }
         }
     });

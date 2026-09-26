@@ -210,6 +210,11 @@ async function checkDevices() {
     named === 0 || (net.match(/unexplained/g) || []).length === hosts.length - named,
     `${named} accounted, ${(net.match(/unexplained/g) || []).length} marked unexplained`);
   check("no undefined rendered", !net.includes("undefined"), "found 'undefined'");
+  // A separator escaped along with the text it separates renders as a literal
+  // "&middot;" in the cell, which is what happened here: the parts are content
+  // and the separator is markup, so only one of them goes through esc().
+  check("no double-escaped entities", !/&amp;(middot|mdash|nbsp);/.test(net),
+    "an entity was escaped as text");
 
   // Expanding a row is a code path that parsing a handler string cannot reach,
   // and it shipped broken: `hostDetail` had a helper declared below its first
@@ -224,6 +229,15 @@ async function checkDevices() {
       "the facts list did not render");
     check("the detail lists its ports",
       !hosts[0].open_ports.length || open.includes("Per port"), "no port section");
+    // The expansion is where this actually shipped: "Kind of device" joined
+    // three fields with an entity and then escaped the result, so the cell read
+    // "general purpose &middot; Linux". The collapsed table is checked above;
+    // the detail needs its own, because none of it is rendered until opened.
+    check("no double-escaped entities in the detail",
+      !/&amp;(middot|mdash|nbsp);/.test(open), "an entity was escaped as text");
+    check("the detail does not repeat one field three times",
+      !/(general purpose|Linux)(\s|&middot;|;)+(\s|&middot;|;)+/.test(open),
+      "the same value rendered three times");
     toggleHost(hosts[0].ip);
     check("closing a row removes it", !DOC["network-rows"].innerHTML.includes('class="detail"'),
       "the detail row survived being closed");

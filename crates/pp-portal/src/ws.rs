@@ -375,6 +375,9 @@ async fn read_loop(
                 {
                     tracing::warn!(error = %e, %agent_id, "could not write journal lines");
                 }
+                // A journal line arrives already attributed: it came up this
+                // machine's own WebSocket, so the name needs no resolving.
+                state.live.push(&name, &converted);
             }
 
             ClientMsg::CommandResult(result) => {

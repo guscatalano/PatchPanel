@@ -157,7 +157,7 @@ fn default_device_secs() -> u64 {
 }
 
 fn default_discovery_secs() -> u64 {
-    1800
+    3600
 }
 
 impl Default for Manifest {
