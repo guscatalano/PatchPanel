@@ -48,29 +48,53 @@ const MAX_HINT: usize = 120;
 /// An hour is chosen because a genuine sub-hour uptime is indistinguishable from
 /// the artifact, and the artifact is far more common.
 const MIN_UPTIME: i64 = 3600;
+/// Cap on one script's output, and on how many host-level scripts are kept.
+///
+/// `ssl-cert` alone prints a whole certificate and `upnp-info` a full device
+/// description. This is evidence for a person to read in a detail pane, not a
+/// log to archive, so it is trimmed to the part that identifies something.
+/// The identifying scripts asked for by `use_scripts`.
+///
+/// Every name checked against an installed nmap, because one it does not
+/// recognise aborts the whole scan rather than being skipped - the first attempt
+/// asked for `mdns-service-discovery`, which does not exist (it is
+/// `dns-service-discovery`) and took the entire sweep down with it. The failure
+/// is at least loud: the range falls back to the built-in sweep and the note on
+/// every row quotes what nmap said.
+///
+/// None of these probes for weaknesses or tries credentials, which is why the
+/// set is named rather than taken from nmap's `-sC` default category.
+const SCRIPTS: &str = "ssl-cert,http-title,snmp-info,snmp-sysdescr,smb-os-discovery,upnp-info,dns-service-discovery";
+
+const MAX_SCRIPT: usize = 400;
+const MAX_SCRIPTS: usize = 6;
 
 /// Scan `scan.cidr` with nmap and report what answered.
 ///
 /// The range is expected to have been size-checked by the caller: nmap will
 /// cheerfully accept a /8 and spend a week on it.
 pub async fn sweep(scan: &DiscoveryScan) -> Result<Vec<DiscoveredHost>> {
-    let ports = scan
-        .ports
-        .iter()
-        .map(u16::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
+    let list = |ps: &[u16]| {
+        ps.iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    // A bare list when only TCP is wanted, and the `T:`/`U:` form only when both
+    // are. The prefixed form obliges nmap to be told the TCP scan type
+    // explicitly - without one it refuses the whole scan - so the plain list is
+    // both simpler and one less thing to get wrong in the common case.
+    let ports = if scan.udp_ports.is_empty() {
+        list(&scan.ports)
+    } else {
+        format!("T:{},U:{}", list(&scan.ports), list(&scan.udp_ports))
+    };
 
     // `-Pn` because half the point of this is embedded hardware, and a device
     // that drops ICMP but answers on 502 is exactly the one nobody wrote down.
-    // `-n` because nothing here uses a name, and 254 PTR lookups against a
-    // field DNS server is the slowest part of the scan. No `-O`: OS
-    // fingerprinting needs raw sockets, and the agent should not need root to
-    // list its neighbours.
-    let args = [
+    let mut args: Vec<&str> = vec![
         "-oX", "-",
         "-Pn",
-        "-n",
         "--open",
         "-sV",
         "--version-light",
@@ -84,9 +108,42 @@ pub async fn sweep(scan: &DiscoveryScan) -> Result<Vec<DiscoveredHost>> {
         // whereas without this a host that is merely unusual gets nothing at
         // all, which reads as "nothing to see".
         "--osscan-guess",
-        "-p", &ports,
-        &scan.cidr,
     ];
+
+    // Reverse DNS is left on. It used to be disabled with `-n` on the grounds
+    // that 254 PTR lookups are the slowest part of a scan, which was a fair
+    // trade when nothing displayed a name - but a PTR record is somebody having
+    // already written down what a machine is, and that is the single cheapest
+    // identification on offer. nmap resolves only the hosts that answered, in
+    // parallel, so the cost is a fraction of what refusing it implied.
+
+    if !scan.udp_ports.is_empty() {
+        // A UDP scan has no handshake to be refused by, so a silent port is
+        // indistinguishable from a dropped packet and nmap waits out a timeout
+        // on each. One retry instead of the default keeps a sweep that now runs
+        // on a timer from overrunning its window; a missed UDP port is a row
+        // that says less, while an overrunning scan is no rows at all.
+        // `-sS` because the `T:`/`U:` port form requires the TCP scan type to be
+        // named rather than defaulted. A SYN scan needs raw sockets, which is
+        // the same privilege `-O` above already relies on.
+        args.push("-sS");
+        args.push("-sU");
+        args.push("--max-retries");
+        args.push("1");
+    }
+
+    // A named set, not nmap's `-sC` category: these are the scripts that put a
+    // name to hardware with no readable version banner, and none of them probes
+    // for weaknesses or tries credentials, which has no place in an inventory
+    // sweep that runs unattended twice an hour.
+    if scan.use_scripts {
+        args.push("--script");
+        args.push(SCRIPTS);
+    }
+
+    args.push("-p");
+    args.push(&ports);
+    args.push(&scan.cidr);
 
     let run = Command::new("nmap")
         .args(args)
@@ -233,12 +290,15 @@ fn parse(xml: &str) -> Result<Vec<DiscoveredHost>> {
                         attr(e, "seconds").parse().ok().filter(|s| *s >= MIN_UPTIME);
                 }
             }
-            // Nothing here scans UDP, but `open_ports` has no room for a
-            // protocol, so a udp port slipping in would be reported as a tcp
-            // one and send somebody to the wrong socket.
-            b"port" if attr(e, "protocol") == "tcp" => {
+            // Both protocols, each kept as itself. A udp port reported as a tcp
+            // one sends somebody to the wrong socket, so the distinction is
+            // carried rather than flattened - anything that is neither is
+            // dropped, since there is nowhere truthful to put it.
+            b"port" if matches!(attr(e, "protocol").as_str(), "tcp" | "udp") => {
+                let udp = attr(e, "protocol") == "udp";
                 port = attr(e, "portid").parse().ok().map(|number| Port {
                     number,
+                    udp,
                     open: false,
                     service: None,
                 });
@@ -255,7 +315,51 @@ fn parse(xml: &str) -> Result<Vec<DiscoveredHost>> {
             }
             b"service" => {
                 if let Some(p) = port.as_mut() {
-                    p.service = Some(service(e, p.number));
+                    let (n, udp) = (p.number, p.udp);
+                    p.service = Some(service(e, n, udp));
+                }
+            }
+            // `<osclass>` is the answer to "what is this", where `<osmatch>` is
+            // the answer to "what is it running". Only the first is kept: nmap
+            // emits them best-first, and a device that is 96% a printer and 94%
+            // a router is not usefully described as both.
+            b"osclass" => {
+                if let Some(h) = host.as_mut() {
+                    if h.identity.device_type.is_empty() {
+                        h.identity.device_type = attr(e, "type");
+                        h.identity.vendor = attr(e, "vendor");
+                        h.identity.os_family = attr(e, "osfamily");
+                    }
+                }
+            }
+            // A PTR record is somebody having already written down what this
+            // machine is, which makes it the most valuable field here and the
+            // one that was being thrown away by passing `-n`.
+            b"hostname" => {
+                if let Some(h) = host.as_mut() {
+                    let name = attr(e, "name");
+                    if !name.is_empty() && !h.identity.hostnames.contains(&name) {
+                        h.identity.hostnames.push(name);
+                    }
+                }
+            }
+            // Script output is an attribute, not element text, and belongs to
+            // whichever thing is open at the time: inside a `<port>` it is that
+            // port's, and inside `<hostscript>` it is the host's.
+            b"script" => {
+                let id = attr(e, "id");
+                let text = clip(&attr(e, "output"), MAX_SCRIPT);
+                if !id.is_empty() && !text.is_empty() {
+                    match port.as_mut().and_then(|p| p.service.as_mut()) {
+                        Some(s) => s.scripts.push((id, text)),
+                        None => {
+                            if let Some(h) = host.as_mut() {
+                                if h.identity.scripts.len() < MAX_SCRIPTS {
+                                    h.identity.scripts.push((id, text));
+                                }
+                            }
+                        }
+                    }
                 }
             }
             // nmap reports a scan it abandoned part-way with an exit status of
@@ -289,12 +393,14 @@ fn parse(xml: &str) -> Result<Vec<DiscoveredHost>> {
 struct Host {
     ip: String,
     open: Vec<u16>,
+    open_udp: Vec<u16>,
     services: Vec<DiscoveredService>,
     identity: pp_proto::HostIdentity,
 }
 
 struct Port {
     number: u16,
+    udp: bool,
     open: bool,
     service: Option<DiscoveredService>,
 }
@@ -307,7 +413,7 @@ struct Port {
 /// is already in `open_ports`, and presenting `nmap-services` back as a finding
 /// would turn "445 is open" into the claim that Windows file sharing is running
 /// there.
-fn service(e: &BytesStart, port: u16) -> DiscoveredService {
+fn service(e: &BytesStart, port: u16, udp: bool) -> DiscoveredService {
     let probed = attr(e, "method") == "probed";
     let name = match (probed, attr(e, "name")) {
         (true, n) if !n.is_empty() => {
@@ -331,7 +437,58 @@ fn service(e: &BytesStart, port: u16) -> DiscoveredService {
         // these in from evidence, and a table lookup has none to offer.
         extra: if probed { attr(e, "extrainfo") } else { String::new() },
         cpe: Vec::new(),
+        scripts: Vec::new(),
+        protocol: if udp { "udp".into() } else { "tcp".into() },
     }
+}
+
+/// Trim to `n` characters, collapsing the runs of whitespace that nmap's
+/// multi-line script output is mostly made of.
+fn clip(s: &str, n: usize) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(n) {
+        Some((at, _)) => format!("{}...", &flat[..at]),
+        None => flat,
+    }
+}
+
+/// A short identification taken from script output.
+///
+/// For the hosts that matter most here: a printer or a scanner serves a web page
+/// with its model number in the title and answers SNMP with its own description,
+/// while naming no product on any port - so before this it was a row of open
+/// ports and nothing else. A Brother ADS-2700W on this fleet went from
+/// unidentifiable to naming itself and its firmware revision.
+///
+/// Only two scripts are read, both of which lead with what the device calls
+/// itself. The rest is left for the detail pane, where a person can read it.
+fn from_scripts(services: &[DiscoveredService]) -> String {
+    for want in ["snmp-sysdescr", "http-title"] {
+        for (name, text) in services.iter().flat_map(|s| s.scripts.iter()) {
+            if name != want {
+                continue;
+            }
+            // nmap appends where it was redirected and, for SNMP, the uptime.
+            // Both are about the request rather than the device.
+            let head = text
+                .split(" Requested resource was")
+                .next()
+                .unwrap_or(text)
+                .split(" System uptime:")
+                .next()
+                .unwrap_or(text)
+                .trim();
+            // Its two ways of saying it found nothing, which are not findings.
+            if head.is_empty()
+                || head.starts_with("Site doesn't have a title")
+                || head.starts_with("Did not follow redirect")
+            {
+                continue;
+            }
+            return clip(head, MAX_HINT);
+        }
+    }
+    String::new()
 }
 
 fn close_port(host: &mut Option<Host>, port: Option<Port>) {
@@ -341,7 +498,11 @@ fn close_port(host: &mut Option<Host>, port: Option<Port>) {
     if !p.open {
         return;
     }
-    h.open.push(p.number);
+    if p.udp {
+        h.open_udp.push(p.number);
+    } else {
+        h.open.push(p.number);
+    }
     // A port with nothing established is carried by `open_ports` alone. Keeping
     // an empty row per port would make a host nmap could not identify look
     // identically detailed to one it could.
@@ -353,25 +514,30 @@ fn close_port(host: &mut Option<Host>, port: Option<Port>) {
 fn finish(hosts: &mut Vec<DiscoveredHost>, host: Option<Host>) {
     let Some(h) = host else { return };
     // `-Pn` makes every address in the range "up", so an open port is the only
-    // evidence that anything is there.
-    if h.ip.is_empty() || h.open.is_empty() {
+    // evidence that anything is there. Either protocol counts: a device whose
+    // only open port is 161/udp is precisely the kind of thing a UDP scan was
+    // turned on to find, and testing tcp alone would have discarded it.
+    if h.ip.is_empty() || (h.open.is_empty() && h.open_udp.is_empty()) {
         return;
     }
 
     hosts.push(DiscoveredHost {
         ip: h.ip,
         open_ports: h.open,
-        // A vendor from the OUI beats a guess from a banner: it is assigned
-        // rather than inferred, and it is often the only thing that names a
-        // silent device at all.
-        hint: {
-            let from_services = hint(&h.services);
-            if from_services.is_empty() && !h.identity.mac_vendor.is_empty() {
-                h.identity.mac_vendor.clone()
-            } else {
-                from_services
-            }
-        },
+        open_udp: h.open_udp,
+        // Best evidence first. Software nmap spoke to and named, then the
+        // reverse-DNS name - somebody already wrote that down, which beats
+        // anything inferred - then the OUI vendor, which is at least assigned
+        // rather than guessed and is often all a silent device offers.
+        hint: [
+            hint(&h.services),
+            from_scripts(&h.services),
+            h.identity.hostnames.first().cloned().unwrap_or_default(),
+            h.identity.mac_vendor.clone(),
+        ]
+        .into_iter()
+        .find(|c| !c.is_empty())
+        .unwrap_or_default(),
         identity: h.identity,
         // The portal decides this; the agent only knows the devices it was
         // told about.
@@ -587,18 +753,107 @@ mod tests {
         assert!(err.to_string().contains("Failed to resolve"), "{err}");
     }
 
-    /// `open_ports` carries no protocol, so a udp port reported alongside the
-    /// tcp ones becomes a tcp port that nothing is listening on. Nothing here
-    /// asks nmap for udp today; the day something does, this is the regression.
+    /// A bare port number cannot say which protocol it means, so 161/udp
+    /// reported among the tcp ports becomes a tcp port nothing is listening on.
+    /// The two lists are separate for that reason, and each service says which
+    /// it belongs to.
     #[test]
     fn never_reports_a_udp_port_as_tcp() {
         let xml = r#"<nmaprun><host><address addr="10.0.0.1" addrtype="ipv4"/><ports>
 <port protocol="udp" portid="161"><state state="open"/><service name="snmp" method="probed"/></port>
 <port protocol="tcp" portid="80"><state state="open"/><service name="http" method="probed"/></port>
+<port protocol="sctp" portid="9"><state state="open"/><service name="discard" method="probed"/></port>
 </ports></host><runstats><finished exit="success"/></runstats></nmaprun>"#;
         let hosts = parse(xml).expect("parses");
         assert_eq!(hosts[0].open_ports, vec![80]);
-        assert_eq!(hosts[0].services.len(), 1);
+        assert_eq!(hosts[0].open_udp, vec![161]);
+
+        let by_port = |n: u16| {
+            hosts[0]
+                .services
+                .iter()
+                .find(|s| s.port == n)
+                .map(|s| s.protocol.as_str())
+        };
+        assert_eq!(by_port(80), Some("tcp"));
+        assert_eq!(by_port(161), Some("udp"));
+        // Anything that is neither is dropped rather than filed under a
+        // protocol it does not belong to.
+        assert_eq!(hosts[0].services.len(), 2);
+    }
+
+    /// A printer names itself in an HTTP title and an SNMP description and
+    /// nowhere else, so without this it is a row of open ports. The two noise
+    /// replies nmap gives when it found nothing are not identifications.
+    #[test]
+    fn takes_an_identification_from_script_output() {
+        let svc = |scripts: Vec<(&str, &str)>| DiscoveredService {
+            port: 80,
+            name: "http".into(),
+            product: String::new(),
+            version: String::new(),
+            extra: String::new(),
+            cpe: Vec::new(),
+            protocol: "tcp".into(),
+            scripts: scripts
+                .into_iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect(),
+        };
+
+        assert_eq!(
+            from_scripts(&[svc(vec![(
+                "http-title",
+                "Brother ADS-2700W Requested resource was /general/status.html",
+            )])]),
+            "Brother ADS-2700W"
+        );
+        // SNMP is preferred over a title, and its uptime tail is dropped.
+        assert_eq!(
+            from_scripts(&[svc(vec![
+                ("http-title", "Login"),
+                (
+                    "snmp-sysdescr",
+                    "Brother NC-07w, Firmware Ver.E System uptime: 155d13h14m53.15s",
+                ),
+            ])]),
+            "Brother NC-07w, Firmware Ver.E"
+        );
+        assert_eq!(
+            from_scripts(&[svc(vec![
+                ("http-title", "Site doesn't have a title (text/html)."),
+                ("ssl-cert", "Subject: commonName=x"),
+            ])]),
+            ""
+        );
+    }
+
+    /// The four fields that answer "what is this" rather than "what is it
+    /// running", each of which was previously either thrown away or never
+    /// requested: a PTR name, a device class, and script output.
+    #[test]
+    fn reads_the_identifying_fields() {
+        let xml = r#"<nmaprun><host><address addr="10.0.0.5" addrtype="ipv4"/>
+<hostnames><hostname name="printer.lan" type="PTR"/></hostnames>
+<ports><port protocol="tcp" portid="443"><state state="open"/>
+<service name="http" product="nginx" method="probed"/>
+<script id="ssl-cert" output="Subject: commonName=nas.lan&#10;Issuer: self"/>
+</port></ports>
+<os><osmatch name="Linux 5.0" accuracy="96"><osclass type="printer" vendor="Brother" osfamily="embedded" accuracy="96"/></osmatch></os>
+<hostscript><script id="snmp-info" output="  enterprise: net-snmp&#10;  engineIDFormat: unknown"/></hostscript>
+</host><runstats><finished exit="success"/></runstats></nmaprun>"#;
+        let h = &parse(xml).expect("parses")[0];
+        assert_eq!(h.identity.hostnames, vec!["printer.lan"]);
+        assert_eq!(h.identity.device_type, "printer");
+        assert_eq!(h.identity.vendor, "Brother");
+        assert_eq!(h.identity.os_family, "embedded");
+        // Host-level script output stays with the host, port-level with the
+        // port that served it - a box with two web servers has two answers.
+        assert_eq!(h.identity.scripts[0].0, "snmp-info");
+        assert!(h.identity.scripts[0].1.starts_with("enterprise: net-snmp"));
+        let svc = &h.services[0];
+        assert_eq!(svc.scripts[0].0, "ssl-cert");
+        assert_eq!(svc.scripts[0].1, "Subject: commonName=nas.lan Issuer: self");
     }
 
     /// nmap escapes attribute values, and a product name really does contain an

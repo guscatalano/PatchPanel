@@ -383,12 +383,12 @@ async fn fleet(State(state): State<SharedState>) -> ApiResult<Json<FleetResponse
     // The same answer the Network tab shows, from the same function, so the
     // badge and the page cannot disagree about what counts as unexplained.
     {
-        let accounted = accounted_for(&all_devices, agents.iter().map(|a| &a.row));
+        let (by_ip, by_name) = accounted_for(&all_devices, agents.iter().map(|a| &a.row));
         let mut seen: std::collections::HashSet<String> = Default::default();
         for a in &agents {
             if let Ok(Some(inv)) = state.db.inventory(a.row.id) {
                 for host in inv.discovered.iter().filter(|h| h.unmanaged) {
-                    if !accounted.contains_key(&host.ip) {
+                    if identify(host, &by_ip, &by_name).is_none() {
                         seen.insert(host.ip.clone());
                     }
                 }
@@ -1543,6 +1543,11 @@ struct Known {
     /// Set for an agent, so the row can link to its machine page.
     #[serde(skip_serializing_if = "Option::is_none")]
     agent: Option<String>,
+    /// How this address was tied to that name: `address` for a direct match,
+    /// `reverse DNS` for one made through a PTR record. Shown because the two
+    /// are not equally strong - a PTR is a record somebody wrote, and a device
+    /// answering on a second interface is matched this way and no other.
+    via: &'static str,
 }
 
 /// Every address this portal can account for, and what accounts for it.
@@ -1557,11 +1562,14 @@ struct Known {
 /// the Overview badge - and a host one of them calls unexplained while the other
 /// calls it a machine is precisely the disagreement that makes a count
 /// worthless.
+type KnownBy = std::collections::HashMap<String, Known>;
+
 fn accounted_for<'a>(
     devices: &[DeviceView],
     rows: impl Iterator<Item = &'a crate::db::AgentRow>,
-) -> std::collections::HashMap<String, Known> {
-    let mut map: std::collections::HashMap<String, Known> = std::collections::HashMap::new();
+) -> (KnownBy, KnownBy) {
+    let mut map: KnownBy = std::collections::HashMap::new();
+    let mut by_name: KnownBy = std::collections::HashMap::new();
     for d in devices {
         let name = if d.label.is_empty() {
             d.report.id.clone()
@@ -1579,22 +1587,48 @@ fn accounted_for<'a>(
             .next()
             .unwrap_or(&d.report.target)
             .to_string();
-        for ip in [Some(declared), d.report.resolved_ip.clone()].into_iter().flatten() {
+        for ip in [Some(declared.clone()), d.report.resolved_ip.clone()]
+            .into_iter()
+            .flatten()
+        {
             map.insert(
                 ip,
                 Known {
                     role: "appliance",
                     name: name.clone(),
                     agent: None,
+                    via: "address",
                 },
             );
         }
+        // Also under the name it was declared as, for the reverse-DNS pass
+        // below. A firewall declared by its WAN name answers on its LAN
+        // address too, and that address reverse-resolves to the same name -
+        // which is the only evidence available that the two are one device.
+        by_name.insert(
+            declared.to_ascii_lowercase(),
+            Known {
+                role: "appliance",
+                name,
+                agent: None,
+                via: "reverse DNS",
+            },
+        );
     }
 
     // Agents last and unconditionally: a machine running an agent is more
     // completely known than the same address declared as an appliance, and if
     // something is both, the agent is the row a person wants to land on.
     for row in rows {
+        by_name.insert(
+            row.hostname.to_ascii_lowercase(),
+            Known {
+                role: "agent",
+                name: row.hostname.clone(),
+                agent: Some(row.id.to_string()),
+                via: "reverse DNS",
+            },
+        );
         if let Some(hw) = &row.hardware {
             for ip in &hw.ip_addresses {
                 map.insert(
@@ -1603,12 +1637,38 @@ fn accounted_for<'a>(
                         role: "agent",
                         name: row.hostname.clone(),
                         agent: Some(row.id.to_string()),
+                        via: "address",
                     },
                 );
             }
         }
     }
-    map
+    (map, by_name)
+}
+
+/// What a discovered host is, by address first and by reverse-DNS name second.
+///
+/// The address is the stronger match, so it wins. A PTR name is only consulted
+/// when nothing claims the address, which is how a device declared under one of
+/// its interfaces is recognised on another.
+fn identify(
+    host: &pp_proto::DiscoveredHost,
+    by_ip: &std::collections::HashMap<String, Known>,
+    by_name: &std::collections::HashMap<String, Known>,
+) -> Option<Known> {
+    if let Some(k) = by_ip.get(&host.ip) {
+        return Some(k.clone());
+    }
+    for ptr in &host.identity.hostnames {
+        let full = ptr.trim_end_matches('.').to_ascii_lowercase();
+        // Either the whole name or its first label: agents report a bare
+        // hostname while DNS answers with a fully qualified one.
+        let short = full.split('.').next().unwrap_or(&full);
+        if let Some(k) = by_name.get(&full).or_else(|| by_name.get(short)) {
+            return Some(k.clone());
+        }
+    }
+    None
 }
 
 #[derive(Serialize)]
@@ -1649,6 +1709,9 @@ struct NetworkHost {
     site: String,
     ip: String,
     open_ports: Vec<u16>,
+    /// Kept apart from `open_ports` all the way to the page: 161/udp and
+    /// 161/tcp are different sockets.
+    open_udp: Vec<u16>,
     hint: String,
     /// Per-port service detail, for the ports whichever scanner ran could
     /// actually name. Empty from the built-in sweep.
@@ -1665,7 +1728,7 @@ struct NetworkHost {
 async fn devices(State(state): State<SharedState>) -> ApiResult<Json<DevicesResponse>> {
     let devices = collect_devices(&state)?;
     let rows = state.db.agents()?;
-    let known = accounted_for(&devices, rows.iter());
+    let (by_ip, by_name) = accounted_for(&devices, rows.iter());
 
     let mut network = Vec::new();
     let mut discovery_notes: Vec<String> = Vec::new();
@@ -1695,9 +1758,10 @@ async fn devices(State(state): State<SharedState>) -> ApiResult<Json<DevicesResp
             network.push(NetworkHost {
                 collector_host: row.hostname.clone(),
                 site: row.site.clone(),
-                known: known.get(&host.ip).cloned(),
+                known: identify(&host, &by_ip, &by_name),
                 ip: host.ip,
                 open_ports: host.open_ports,
+                open_udp: host.open_udp,
                 hint: host.hint,
                 identity: host.identity,
                 services: host.services,

@@ -1154,6 +1154,9 @@ async fn scan_host(ip: IpAddr, ports: &[u16]) -> Option<DiscoveredHost> {
         identity: Default::default(),
         ip: ip.to_string(),
         open_ports: open,
+        // The built-in sweep connects, and there is no such thing as connecting
+        // to a UDP port.
+        open_udp: Vec::new(),
         hint,
         unmanaged: true,
         // A connect and a banner read establish nothing per port beyond "it

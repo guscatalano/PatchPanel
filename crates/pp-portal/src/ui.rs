@@ -3686,19 +3686,34 @@ function toggleHost(ip) {
 // were looking at and losing your place in a table of thirty.
 function hostDetail(h, columns) {
   const id = h.identity || {};
-  const svc = new Map((h.services || []).map((x) => [x.port, x]));
+  const svc = new Map((h.services || [])
+    .map((x) => [`${x.port}/${x.protocol || "tcp"}`, x]));
 
-  const ports = (h.open_ports || []).map((port) => {
-    const s = svc.get(port);
+  // Script output is raw text nmap printed, so it is shown as such rather than
+  // parsed into fields this page would then have to keep in step with nmap.
+  const scripts = (list) => (list || []).map(([script, text]) => `<div class="reading">
+      <span class="k mono">${esc(script)}</span>
+      <span class="v" style="white-space:normal">${esc(text)}</span>
+    </div>`).join("");
+
+  const rows = [
+    ...(h.open_ports || []).map((p) => [p, "tcp"]),
+    ...(h.open_udp || []).map((p) => [p, "udp"]),
+  ];
+  const ports = rows.map(([port, proto]) => {
+    // Matched on both, because 161/udp and 161/tcp are separate entries and
+    // keying on the number alone would show one port's findings under the
+    // other's.
+    const s = svc.get(`${port}/${proto}`);
     const named = s && [s.name, s.product, s.version].filter((x) => x).join(" ");
     return `<div class="reading">
-      <span class="k mono">${port}</span>
+      <span class="k mono">${port}${proto === "udp" ? "/udp" : ""}</span>
       <span class="v">${named ? esc(named) : "&mdash;"}${
         s && s.extra ? ` <span class="msg">${esc(s.extra)}</span>` : ""}</span>
       <span class="since">${s
         ? (s.product ? "identified" : "guessed from the port")
         : "open, nothing identified"}</span>
-    </div>${s && (s.cpe || []).length ? s.cpe.map((c) => `<div class="reading">
+    </div>${scripts(s && s.scripts)}${s && (s.cpe || []).length ? s.cpe.map((c) => `<div class="reading">
       <span class="k"></span>
       <span class="v" style="color:var(--muted)">${esc(c)}</span>
       <span class="since">what to search a CVE list for</span>
@@ -3708,9 +3723,23 @@ function hostDetail(h, columns) {
   // Every one of these is a guess except the vendor, so each says how it was
   // arrived at. An OS fingerprint shown as a fact is the kind of thing somebody
   // acts on and then spends an afternoon confused by.
+  // Reverse DNS is not a guess and not a fact either - it is a record somebody
+  // wrote and may never have revisited - so it is presented as exactly that.
   const facts = [
+    (id.hostnames || []).length
+      ? ["Reverse DNS", `${esc(id.hostnames.join(", "))}
+          <span class="msg">a PTR record, so whatever was written down when it was
+          set up &mdash; not checked against the host itself</span>`]
+      : null,
+    id.device_type
+      ? ["Kind of device", `${esc([id.device_type, id.vendor, id.os_family]
+          .filter((x) => x).join(" &middot; "))}
+          <span class="msg">nmap's classification of the fingerprint, same confidence
+          as the OS guess below</span>`]
+      : null,
     h.known
-      ? ["Known as", `${esc(h.known.name)} <span class="msg">${h.known.role}</span>${
+      ? ["Known as", `${esc(h.known.name)} <span class="msg">${h.known.role}, matched by ${
+          esc(h.known.via || "address")}</span>${
           h.known.agent
             ? ` &middot; <a href="#" onclick="openAgent(${jsq(h.known.agent)});return false">open its machine page</a>`
             : ""}`]
@@ -3739,6 +3768,7 @@ function hostDetail(h, columns) {
       : 'built-in TCP sweep <span class="msg">banner only; no services, vendor or OS</span>'],
   ].filter(Boolean);
 
+
   return `<tr class="detail"><td colspan="${columns}">
     ${kv(facts)}
     <div class="step" style="padding-left:0">
@@ -3746,6 +3776,10 @@ function hostDetail(h, columns) {
         nmap reading the port number, which is a guess and labelled as one.</div>
       ${ports || '<div class="msg">No open ports recorded.</div>'}
     </div>
+    ${(id.scripts || []).length ? `<div class="step" style="padding-left:0">
+      <div class="msg">What nmap's identifying scripts reported about the host.</div>
+      ${scripts(id.scripts)}
+    </div>` : ""}
     ${h.known ? "" : `<div class="msg">Not managed by PatchPanel. Add it as an appliance under
       <a href="#setup" onclick="showTab('setup');return false">Setup</a> with target
       <span class="mono">${esc(h.ip)}</span>, or install an agent on it.</div>`}
@@ -4113,17 +4147,43 @@ function renderNetwork(d) {
     // accounted for" is the unremarkable case and marking it competes with the
     // rows that are actually asking for attention. Amber, not red: an
     // unexplained host is worth a look, not an alarm.
+    // For an unexplained host, whatever the scan managed to establish about
+    // what it is: the reverse-DNS name first because somebody wrote that down,
+    // then nmap's device class, then the hint. "unexplained · printer ·
+    // brother.lan" is a row somebody can act on; "unexplained" alone is one
+    // they have to go and investigate.
+    const id = h.identity || {};
+    // The reverse-DNS name, and whatever the scan managed to name the thing.
+    //
+    // nmap's device class is deliberately NOT here, though it was: on this
+    // network it calls three MoCA adapters "printer" and an iMac "phone", both
+    // at 99% accuracy. In a table cell that reads as a finding, and a wrong
+    // finding is worse than a blank - so it stays in the expansion, next to the
+    // sentence explaining it is a guess of the same standing as the OS match.
+    const named = svc.some((s) => s.product) ? "" : h.hint;
+    const said = h.known ? "" : [
+      (id.hostnames || [])[0],
+      // The hint falls back to the PTR name when it has nothing better, and
+      // printing the same string twice looks like two pieces of evidence.
+      named === (id.hostnames || [])[0] ? "" : named,
+    ].filter((x) => x).join(" &middot; ");
     const what = h.known
-      ? `${esc(h.known.name)} <span class="msg">${h.known.role}</span>`
+      ? `${esc(h.known.name)} <span class="msg">${h.known.role}${
+          h.known.via === "reverse DNS" ? ", by name" : ""}</span>`
       : `<span class="pill warn">unexplained</span>${
-          h.hint && !svc.length ? ` <span class="msg">${esc(h.hint)}</span>` : ""}`;
+          said ? ` <span class="msg">${esc(said)}</span>` : ""}`;
     return `<tr class="clicky${OPEN_HOST === h.ip ? " open" : ""}"
         onclick="toggleHost(${jsq(h.ip)})"
         title="Everything the sweep learned about this host.">
       <td class="mono">${esc(h.ip)}</td>
       <td class="what">${what}</td>
       <td>${esc((h.identity || {}).mac_vendor) || '<span class="msg">-</span>'}</td>
-      <td class="mono">${h.open_ports.join(", ")}</td>
+      <td class="mono">${[
+        h.open_ports.join(", "),
+        (h.open_udp || []).length
+          ? `<span class="msg">${h.open_udp.join(", ")} udp</span>`
+          : "",
+      ].filter((x) => x).join(" ")}</td>
       <td class="svc">${svc.length ? svc.map((s) => `<div class="msg"><span class="mono">${s.port}</span>
         ${esc([s.name, s.product, s.version].filter((x) => x).join(" "))}</div>`).join("")
         : `<span class="msg">-</span>`}</td>

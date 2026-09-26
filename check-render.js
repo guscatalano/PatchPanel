@@ -211,6 +211,24 @@ async function checkDevices() {
     `${named} accounted, ${(net.match(/unexplained/g) || []).length} marked unexplained`);
   check("no undefined rendered", !net.includes("undefined"), "found 'undefined'");
 
+  // Expanding a row is a code path that parsing a handler string cannot reach,
+  // and it shipped broken: `hostDetail` had a helper declared below its first
+  // use, so every expansion threw on the temporal dead zone while the table
+  // around it rendered perfectly. Run it rather than read it.
+  if (hosts.length) {
+    toggleHost(hosts[0].ip);
+    const open = DOC["network-rows"].innerHTML;
+    check("expanding a row renders a detail row", open.includes('class="detail"'),
+      "no detail row after toggleHost");
+    check("the detail says what the host is", open.includes("Known as"),
+      "the facts list did not render");
+    check("the detail lists its ports",
+      !hosts[0].open_ports.length || open.includes("Per port"), "no port section");
+    toggleHost(hosts[0].ip);
+    check("closing a row removes it", !DOC["network-rows"].innerHTML.includes('class="detail"'),
+      "the detail row survived being closed");
+  }
+
   // An address is not typed by anyone, but it does come off the network, and it
   // goes straight into an inline handler.
   const hostile = JSON.parse(JSON.stringify(rows));

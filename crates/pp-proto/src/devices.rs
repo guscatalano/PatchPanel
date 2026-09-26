@@ -262,6 +262,35 @@ pub struct DiscoveryScan {
     /// Site whose collector performs the sweep.
     #[serde(default)]
     pub site: String,
+    /// UDP ports to scan as well, e.g. `[161, 5353, 1900]` for SNMP, mDNS and
+    /// SSDP.
+    ///
+    /// Separate from `ports`, which is TCP, because listing 161 there does
+    /// nothing at all - SNMP is UDP, and a TCP scan of it will never find a
+    /// single agent. It cost this fleet a while to notice, because "161 open:
+    /// no" and "161 never looked at" render identically.
+    ///
+    /// Opt-in and empty by default because a UDP scan is the slowest thing here
+    /// by a wide margin: there is no handshake to refuse, so nmap waits out a
+    /// timeout on every silent port and the target's ICMP rate limiting sets the
+    /// pace. Worth it for what it identifies - consumer hardware announces
+    /// itself over mDNS and SSDP and almost nowhere else - but not worth it
+    /// twice an hour unless somebody asked.
+    #[serde(default)]
+    pub udp_ports: Vec<u16>,
+    /// Run nmap's identifying scripts as well: certificate subjects, HTTP
+    /// titles, SNMP system info, SMB host names, UPnP device descriptions.
+    ///
+    /// These are what name a device that has no version banner worth reading -
+    /// a TLS certificate usually carries the box's own hostname, and an SSDP
+    /// description says "Sonos" outright. Opt-in because each one is another
+    /// conversation with the host and the set grows the scan noticeably.
+    ///
+    /// A named set rather than nmap's `-sC` default category, which includes
+    /// brute-force and probing scripts that have no place in an inventory sweep
+    /// that runs on a timer.
+    #[serde(default)]
+    pub use_scripts: bool,
     /// Hand this range to `nmap` instead of the built-in connect sweep.
     ///
     /// Opt-in because it is a second binary that may not be installed, and
@@ -275,6 +304,10 @@ pub struct DiscoveryScan {
     pub use_nmap: bool,
 }
 
+fn default_proto() -> String {
+    "tcp".into()
+}
+
 fn default_probe_ports() -> Vec<u16> {
     // http, https, telnet, ssh, modbus, ewon/webui, mqtt
     vec![80, 443, 23, 22, 502, 8080, 1883]
@@ -283,7 +316,16 @@ fn default_probe_ports() -> Vec<u16> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredHost {
     pub ip: String,
+    /// Open **TCP** ports. Kept protocol-free deliberately - see `open_udp`.
     pub open_ports: Vec<u16>,
+    /// Open UDP ports, kept apart rather than merged into `open_ports`.
+    ///
+    /// 161/udp and 161/tcp are different sockets, and a list of bare numbers
+    /// cannot say which it means. Merging them would send somebody to the wrong
+    /// one, so the split is in the wire format rather than left to whoever
+    /// renders it.
+    #[serde(default)]
+    pub open_udp: Vec<u16>,
     /// Best-effort identification: a banner line from the built-in sweep, or
     /// the software nmap named, e.g. "Dropbear sshd 2022.82".
     #[serde(default)]
@@ -324,6 +366,32 @@ pub struct DiscoveredHost {
 /// kind of thing somebody acts on and then spends an afternoon confused by.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HostIdentity {
+    /// What kind of thing nmap thinks this is - `router`, `printer`, `WAP`,
+    /// `general purpose` - with the vendor and OS family it classed it under.
+    ///
+    /// From `<osclass>` rather than `<osmatch>`, and worth having separately: a
+    /// fingerprint of "Linux 2.6.32 - 3.13" says almost nothing a person can
+    /// act on, while `printer` / `Brother` answers the actual question. The
+    /// fields are nmap's own vocabulary, so they stay strings rather than being
+    /// mapped onto an enum this side would have to keep in step.
+    #[serde(default)]
+    pub device_type: String,
+    #[serde(default)]
+    pub vendor: String,
+    #[serde(default)]
+    pub os_family: String,
+    /// Reverse-DNS names for this address, best first.
+    ///
+    /// The cheapest identification available and for a long time thrown away:
+    /// the sweep passed `-n`, which switches rDNS off entirely. A PTR record is
+    /// somebody having already written down what a machine is.
+    #[serde(default)]
+    pub hostnames: Vec<String>,
+    /// Output from nmap's identifying scripts, as `(script, text)`, when the
+    /// range asked for them. Trimmed and capped - this is evidence to read, not
+    /// data to compute on.
+    #[serde(default)]
+    pub scripts: Vec<(String, String)>,
     /// Best OS match, and how sure nmap is of it, 0-100.
     #[serde(default)]
     pub os: String,
@@ -355,6 +423,16 @@ pub struct HostIdentity {
 /// One open port, as far as the scanner could tell.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredService {
+    /// Per-port script output, as `(script, text)`. A certificate subject or an
+    /// HTTP title is attached to the port that served it rather than to the
+    /// host, because a box with two web servers on it has two answers.
+    #[serde(default)]
+    pub scripts: Vec<(String, String)>,
+    /// `tcp` or `udp`. Present because a UDP port and a TCP port of the same
+    /// number are different things, and sending somebody to the wrong one is
+    /// worse than not telling them.
+    #[serde(default = "default_proto")]
+    pub protocol: String,
     pub port: u16,
     /// The protocol the scanner spoke, in nmap's vocabulary: "ssh", "http",
     /// "ssl/http". Never filled in from the port number alone - that is a
