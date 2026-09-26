@@ -185,3 +185,224 @@ pub fn gist(fleet: &Value) -> String {
         }
     )
 }
+
+/// Percent-encode one path segment or query value.
+///
+/// Hand-written rather than a dependency: the only things that go through it are
+/// a sender name, a job name and a device id, all of which come from the portal
+/// itself. What they do contain is spaces and dots - "winetown router",
+/// "unraid/backup_routers" - and a raw space in a request line is a 400.
+pub fn enc(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// One discovered host, as a single line.
+///
+/// A managed machine is named and nothing more; the unexplained ones get whatever
+/// the scan established, because those are the rows somebody is reading this to
+/// find. nmap's device class is deliberately left out of the line and kept for
+/// the detail: on a real network it calls MoCA adapters printers and iMacs
+/// phones, at high confidence, and in a one-line summary that reads as a fact.
+pub fn host_line(h: &Value) -> String {
+    let ip = s(h, "ip");
+    let id = h.get("identity").cloned().unwrap_or(Value::Null);
+    let ports = arr(h, "open_ports")
+        .iter()
+        .filter_map(|p| p.as_i64())
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let udp = arr(h, "open_udp")
+        .iter()
+        .filter_map(|p| p.as_i64())
+        .map(|p| format!("{p}/udp"))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let what = match h.get("known") {
+        Some(k) => format!(
+            "{} ({}{})",
+            s(k, "name"),
+            s(k, "role"),
+            if s(k, "via") == "reverse DNS" {
+                ", matched by name"
+            } else {
+                ""
+            }
+        ),
+        None => {
+            let ptr = arr(&id, "hostnames")
+                .first()
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let hint = s(h, "hint");
+            let mut bits: Vec<String> = Vec::new();
+            if !ptr.is_empty() {
+                bits.push(ptr.clone());
+            }
+            if !hint.is_empty() && hint != ptr {
+                bits.push(hint);
+            }
+            if bits.is_empty() {
+                "UNEXPLAINED".to_string()
+            } else {
+                format!("UNEXPLAINED - {}", bits.join(" / "))
+            }
+        }
+    };
+
+    format!(
+        "{ip:<16} {what:<52} {}{}{}",
+        ports,
+        if udp.is_empty() { "" } else { " " },
+        udp
+    )
+}
+
+/// Everything one sweep established about one host, with how it was arrived at.
+///
+/// Each line says where it came from, because only the hardware vendor is
+/// assigned rather than inferred - an OS fingerprint reported as a fact is the
+/// kind of thing somebody acts on and then spends an afternoon confused by.
+pub fn host_detail(h: &Value) -> String {
+    let id = h.get("identity").cloned().unwrap_or(Value::Null);
+    let mut out = vec![format!("{}  {}", s(h, "ip"), match h.get("known") {
+        Some(k) => format!(
+            "{} - {}, matched by {}",
+            s(k, "name"),
+            s(k, "role"),
+            s(k, "via")
+        ),
+        None => "nothing accounts for this address".to_string(),
+    })];
+
+    let ptr = arr(&id, "hostnames");
+    if !ptr.is_empty() {
+        let names: Vec<String> = ptr
+            .iter()
+            .map(|x| x.as_str().unwrap_or_default().to_string())
+            .collect();
+        out.push(format!(
+            "  reverse DNS   {}  (a PTR record, so whatever was written down when it was set up)",
+            names.join(", ")
+        ));
+    }
+    if !s(&id, "mac_vendor").is_empty() {
+        out.push(format!(
+            "  vendor        {}  (from the hardware address, assigned not guessed)",
+            s(&id, "mac_vendor")
+        ));
+    }
+    if !s(&id, "mac").is_empty() {
+        out.push(format!("  hardware      {}", s(&id, "mac")));
+    }
+    if !s(&id, "os").is_empty() {
+        let alts = arr(&id, "os_alternatives")
+            .iter()
+            .map(|x| x.as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(format!(
+            "  OS guess      {} at {}% confidence{}",
+            s(&id, "os"),
+            n(&id, "os_accuracy"),
+            if alts.is_empty() {
+                String::new()
+            } else {
+                format!("; also considered {alts}")
+            }
+        ));
+    }
+    if !s(&id, "device_type").is_empty() {
+        out.push(format!(
+            "  classed as    {} / {} / {}  (a guess of the same standing as the OS match, and \
+             wrong often enough to be worth saying so)",
+            s(&id, "device_type"),
+            s(&id, "vendor"),
+            s(&id, "os_family")
+        ));
+    }
+    if let Some(up) = id.get("uptime_secs").and_then(|v| v.as_i64()) {
+        out.push(format!(
+            "  uptime        about {} day(s)  (inferred from TCP timestamps, approximate)",
+            up / 86_400
+        ));
+    }
+    let cpe = arr(&id, "os_cpe");
+    if !cpe.is_empty() {
+        let list: Vec<String> = cpe
+            .iter()
+            .map(|x| x.as_str().unwrap_or_default().to_string())
+            .collect();
+        out.push(format!("  platform      {}", list.join(" ")));
+    }
+
+    out.push(String::new());
+    out.push(format!(
+        "  ports, found by {}:",
+        if s(h, "scanner") == "nmap" {
+            "nmap"
+        } else {
+            "the built-in TCP sweep, which cannot name a service"
+        }
+    ));
+    let svcs = arr(h, "services");
+    for p in arr(h, "open_ports").iter().chain(arr(h, "open_udp").iter()) {
+        let port = p.as_i64().unwrap_or(0);
+        let svc = svcs.iter().find(|x| n(x, "port") == port);
+        let named = svc
+            .map(|x| {
+                [s(x, "name"), s(x, "product"), s(x, "version")]
+                    .iter()
+                    .filter(|f| !f.is_empty())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        let proto = svc.map(|x| s(x, "protocol")).unwrap_or_default();
+        out.push(format!(
+            "    {port}{:<5} {}{}",
+            if proto == "udp" { "/udp" } else { "" },
+            if named.is_empty() {
+                "open, nothing identified".to_string()
+            } else {
+                named
+            },
+            svc.map(|x| {
+                let extra = s(x, "extra");
+                if extra.is_empty() {
+                    String::new()
+                } else {
+                    format!("  [{extra}]")
+                }
+            })
+            .unwrap_or_default()
+        ));
+        if let Some(x) = svc {
+            for (k, v) in arr(x, "scripts").iter().filter_map(|p| {
+                let pair = p.as_array()?;
+                Some((pair.first()?.as_str()?, pair.get(1)?.as_str()?))
+            }) {
+                out.push(format!("      {k}: {v}"));
+            }
+        }
+    }
+    for (k, v) in arr(&id, "scripts").iter().filter_map(|p| {
+        let pair = p.as_array()?;
+        Some((pair.first()?.as_str()?, pair.get(1)?.as_str()?))
+    }) {
+        out.push(format!("  {k}: {v}"));
+    }
+    out.join("\n")
+}

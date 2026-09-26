@@ -4657,9 +4657,20 @@ let LIVE_HELD = false;
 // respects.
 let LIVE_STOPPED = false;
 
-// What this window keeps. Above this the oldest go, matching the portal's own
-// ring - it is a live view, and the files behind it are the archive.
-const LIVE_MAX = 3000;
+// What this window keeps.
+//
+// Far smaller than the portal's ring on purpose. Every line is five elements
+// once rendered, so three thousand of them is fifteen thousand nodes, and a
+// fleet with a chatty firewall in it fills that in about two minutes - at which
+// point the whole tab is slow, not just this card. What is scrolled off here is
+// still in the per-sender files, so the cost of keeping less is nearly nothing
+// and the cost of keeping more is the page.
+const LIVE_MAX = 800;
+// Most lines one poll will render. A burst larger than this is trimmed to its
+// tail as it arrives rather than being rendered and immediately scrolled off -
+// laying out seven hundred rows in order to throw away six hundred of them is
+// the expensive way to display nothing.
+const LIVE_BATCH = 200;
 
 function toggleLive() {
   LIVE_ON = !LIVE_ON;
@@ -4670,7 +4681,7 @@ function toggleLive() {
     pollLive();
     // Faster than the page's 5s, because a feed that updates every five seconds
     // does not read as live. Only while the tab is open - see pollLive.
-    LIVE_TIMER = setInterval(pollLive, 1500);
+    LIVE_TIMER = setInterval(pollLive, 2000);
   } else {
     clearInterval(LIVE_TIMER);
     LIVE_TIMER = null;
@@ -4697,17 +4708,21 @@ async function pollLive() {
     ? (LIVE_HELD ? "held — scroll to the bottom to follow" : "following")
     : "the syslog receiver is off; only forwarded journals will appear";
 
-  if (r.lines && r.lines.length) {
-    for (const l of r.lines) {
-      LIVE_LINES.push(l);
-      if (!LIVE_WHO.includes(l.who)) LIVE_WHO.push(l.who);
-    }
-    if (LIVE_LINES.length > LIVE_MAX) LIVE_LINES.splice(0, LIVE_LINES.length - LIVE_MAX);
-    whoOptions();
-    drawLive(r.lines);
-  } else {
-    drawLive();
+  // A poll with nothing new must not redraw. It used to call drawLive() with no
+  // argument, which is the full re-render path, so a quiet fleet rebuilt every
+  // row from scratch every 1.5 seconds - which is what made the whole page lag.
+  if (!r.lines || !r.lines.length) {
+    liveCount();
+    return;
   }
+
+  for (const l of r.lines) {
+    LIVE_LINES.push(l);
+    if (!LIVE_WHO.includes(l.who)) LIVE_WHO.push(l.who);
+  }
+  if (LIVE_LINES.length > LIVE_MAX) LIVE_LINES.splice(0, LIVE_LINES.length - LIVE_MAX);
+  whoOptions();
+  drawLive(r.lines);
 }
 
 // Keep the machine list in step without disturbing a choice already made.
@@ -4722,14 +4737,21 @@ function whoOptions() {
   sel.value = chosen;
 }
 
-function liveShown(l) {
+// Read the three controls once and return a predicate.
+//
+// Reading them inside the filter meant three DOM lookups per line, five hundred
+// lines a poll - work proportional to the traffic, for values that cannot change
+// while a batch is being rendered.
+function liveFilter() {
   const text = $("live-filter").value.trim().toLowerCase();
   const who = $("live-who").value;
   const sev = Number($("live-sev").value);
-  if (who && l.who !== who) return false;
-  if (l.severity > sev) return false;
-  if (text && !(`${l.who} ${l.tag} ${l.msg}`.toLowerCase().includes(text))) return false;
-  return true;
+  return (l) => {
+    if (who && l.who !== who) return false;
+    if (l.severity > sev) return false;
+    if (text && !(`${l.who} ${l.tag} ${l.msg}`.toLowerCase().includes(text))) return false;
+    return true;
+  };
 }
 
 function liveRow(l) {
@@ -4749,22 +4771,40 @@ function liveRow(l) {
 function drawLive(added) {
   const feed = $("live-feed");
   $("live-empty").hidden = LIVE_ON || LIVE_LINES.length > 0;
+  let appended = false;
 
+  const shown = liveFilter();
   if (added) {
-    const html = added.filter(liveShown).map(liveRow).join("");
-    if (html) {
-      feed.insertAdjacentHTML("beforeend", html);
-      // Trim the DOM to what the page holds, or a day of logs becomes a
-      // hundred thousand nodes and the tab starts to crawl.
-      while (feed.childElementCount > LIVE_MAX) feed.removeChild(feed.firstElementChild);
+    // Trim before rendering, not after.
+    let batch = added.filter(shown);
+    if (batch.length > LIVE_BATCH) batch = batch.slice(-LIVE_BATCH);
+    if (batch.length) {
+      feed.insertAdjacentHTML("beforeend", batch.map(liveRow).join(""));
+      appended = true;
+      // One splice rather than a removeChild per line: at three hundred lines a
+      // second the loop itself became the cost.
+      const over = feed.childElementCount - LIVE_MAX;
+      if (over > 0) {
+        const doomed = Array.prototype.slice.call(feed.children, 0, over);
+        for (const el of doomed) el.remove();
+      }
     }
   } else {
-    feed.innerHTML = LIVE_LINES.filter(liveShown).map(liveRow).join("");
+    feed.innerHTML = LIVE_LINES.filter(shown).slice(-LIVE_MAX).map(liveRow).join("");
+    appended = true;
   }
 
-  const shown = feed.childElementCount;
+  liveCount();
+  // Only when something moved. Reading scrollHeight forces layout, and doing it
+  // on every poll of an idle feed is a measurable cost for no effect.
+  if (appended && !LIVE_HELD) feed.scrollTop = feed.scrollHeight;
+}
+
+// The cheap part of a redraw, safe to call on a poll that changed nothing.
+function liveCount() {
+  const feed = $("live-feed");
   $("live-count").textContent = LIVE_LINES.length
-    ? `${shown} of ${LIVE_LINES.length} line(s)`
+    ? `${feed.childElementCount} shown, ${LIVE_LINES.length} held`
     : "";
   setHTML($("live-missed"), LIVE_MISSED
     ? `<div class="step"><div class="note" style="border-color:var(--warn)">
@@ -4772,8 +4812,6 @@ function drawLive(added) {
         no longer in the portal's window. They are still in the per-sender files
         above; only this view lost them.</div></div>`
     : "");
-
-  if (!LIVE_HELD) feed.scrollTop = feed.scrollHeight;
 }
 
 // Following is a position, not a mode: if the reader is at the bottom we follow,

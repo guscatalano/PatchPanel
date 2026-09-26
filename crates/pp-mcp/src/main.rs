@@ -59,16 +59,35 @@ impl Portal {
     }
 
     pub async fn post(&self, path: &str, body: Value) -> Result<Value> {
-        let mut req = self.client.post(format!("{}{path}", self.base)).json(&body);
+        self.send(reqwest::Method::POST, path, Some(body)).await
+    }
+
+    pub async fn put(&self, path: &str, body: Value) -> Result<Value> {
+        self.send(reqwest::Method::PUT, path, Some(body)).await
+    }
+
+    /// DELETE, which a few of the portal's routes use to mean "undo this" -
+    /// clearing a backup exemption, dropping a pool, forgetting a machine.
+    pub async fn delete(&self, path: &str, body: Option<Value>) -> Result<Value> {
+        self.send(reqwest::Method::DELETE, path, body).await
+    }
+
+    async fn send(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value> {
+        let mut req = self.client.request(method, format!("{}{path}", self.base));
+        if let Some(b) = body {
+            req = req.json(&b);
+        }
         if let Some(t) = &self.token {
             req = req.bearer_auth(t);
         }
-        let resp = req.send().await.context("posting to the portal")?;
+        let resp = req.send().await.context("calling the portal")?;
         let code = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !code.is_success() {
             anyhow::bail!("the portal answered {code}: {}", text.trim());
         }
+        // Several of these routes answer with an empty body, which is a success
+        // and not a parse failure.
         Ok(serde_json::from_str(&text).unwrap_or(json!({ "ok": true })))
     }
 }

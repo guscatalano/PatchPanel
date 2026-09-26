@@ -40,29 +40,40 @@ const NMAP_TIMEOUT: Duration = Duration::from_secs(2700);
 /// Timing arguments that make the sweep a quiet background presence.
 ///
 /// The default timing is tuned for a person waiting on the result, which is the
-/// wrong trade for something that now runs unattended every half hour on a
-/// network people are using. Two separate problems with being quick about it:
-/// the obvious one is the traffic, and the one that actually cost us accuracy is
-/// that probes under load time out and nmap records `tcpwrapped` - a Brother
-/// printer that had reported its exact model from an HTTP title came back as two
-/// anonymous open ports once UDP and scripts were added to the same scan.
-/// Slowing down gets that identification back, so this is not purely a courtesy.
+/// wrong trade for something that runs unattended on a network people are using.
+/// Two separate problems with being quick about it: the obvious one is the
+/// traffic, and the one that actually cost accuracy is that probes under load
+/// time out and nmap records `tcpwrapped` - a Brother printer that had reported
+/// its exact model from an HTTP title came back as two anonymous open ports once
+/// UDP and scripts were added to the same scan. Slowing down gets that back, so
+/// this is not purely a courtesy.
 ///
-///   - `-T2` is nmap's own "polite": it serialises probes and waits between
-///     them, and exists for exactly this - using less of somebody else's
-///     bandwidth and CPU. `-T1` and `-T0` are measured in hours per host.
+///   - `--max-rate` is the throttle. It caps packets per second outright, which
+///     is both the thing a switch or a small router actually notices and the one
+///     knob here whose cost can be predicted rather than discovered: the work is
+///     bounded by packets, so halving the rate roughly doubles the wall clock.
 ///   - `--max-retries` above the default-for-speed of 1, because a dropped probe
 ///     is the normal case for UDP, and giving up after one try is what makes a
 ///     UDP scan unreliable rather than merely slow.
-///   - `--host-timeout` so one unresponsive address cannot eat the whole window
-///     and cost every host after it in the range.
+/// Explicitly *not* `-T2`, nmap's own "polite", which was tried first and is the
+/// wrong tool at this scope: it pins parallelism to one probe at a time, and a
+/// /24 with version, OS, UDP and script detection had not finished after
+/// thirty-four minutes.
 ///
-/// Notably absent is `--max-parallelism`, which would cap outstanding probes.
-/// `-T2` already serialises per host, and stacking the two over-constrains the
-/// scan into overrunning `NMAP_TIMEOUT` - at which point the range falls back to
-/// the built-in sweep and every identification is lost, which is a far worse
-/// outcome than a scan that was merely brisk.
-const POLITE: &[&str] = &["-T2", "--max-retries", "3", "--host-timeout", "300s"];
+/// And explicitly *not* `--host-timeout`, which was the more instructive
+/// mistake. Combined with a throttle it is actively destructive: a host's elapsed
+/// time includes waiting its turn under the rate limit, so a per-host budget
+/// expires on perfectly healthy hosts - and nmap's response to a host that
+/// exceeds it is to discard everything it learned and report nothing for that
+/// address. `-T2` with a 300s budget returned a /24 as **one** host, which the
+/// portal then stored over the forty-four it had, because a list of one is not an
+/// empty list and nothing about the result said it was truncated.
+///
+/// That is the failure mode to design against here: not a scan that is slow, but
+/// one that looks successful while reporting almost nothing. `NMAP_TIMEOUT` is
+/// the single bound, and exceeding it falls back to the built-in sweep with a
+/// note on every row saying so - loudly wrong instead of quietly wrong.
+const POLITE: &[&str] = &["--max-rate", "100", "--max-retries", "3"];
 /// Cap on the identification carried in `hint`. Longer than the sweep's banner
 /// allowance because a product name and version is worth more than the first
 /// 80 bytes of whatever a socket said.

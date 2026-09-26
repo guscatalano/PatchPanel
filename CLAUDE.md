@@ -208,6 +208,27 @@ mangle the backslashes and have corrupted it repeatedly. Use the Edit tool, or a
 Python script written to the scratchpad and run by path — not `python - <<'EOF'`
 with escapes in it.
 
+### `pp-mcp` — the portal over MCP
+
+JSON-RPC on stdio. It is a *view*, not a second implementation: every tool asks
+the portal the same question the dashboard asks and passes the portal's own
+judgement through, so a caller cannot get a different answer here than the page
+gives. Whenever a tool would need to decide what a number means, that decision
+belongs in `api.rs` where both readers get it.
+
+Read-only unless started with `--allow-actions`, and that is enforced in
+`tools::call` as well as by leaving the actions out of `tools/list`. The catalogue
+is only a hint — a client that listed the tools while actions were enabled, or
+that guesses a name, can still ask — so read-only has to mean the server refuses,
+not that it declines to advertise. `tools::is_action` is the list.
+
+Actions are grouped by the thing they change rather than mapped one-per-route:
+`patchpanel_command` covers the whole agent-command family with the kind as an
+enum, `patchpanel_backup_policy` covers exempt/snooze/undo. Thirteen tools instead
+of thirty, each still discoverable and validated. `patchpanel_edit_manifest`
+refuses a document with no apps, appliances or discovery ranges in it, because the
+usual way to destroy a manifest through an API is to send a fragment of one.
+
 ## Agent notes
 
 `platform/{linux,windows}.rs` hold the package-manager work. Parse machine-

@@ -754,7 +754,9 @@ async fn sweep(ctx: &Ctx, scans: &[pp_proto::DiscoveryScan], p: &Progress) -> Re
     }
 
     Ok(format!(
-        "found {} responsive host(s), {unmanaged} not in the manifest{}",
+        "found {} responsive host(s), {unmanaged} not in the manifest this agent was handed{}. \
+         Which of them are actually unaccounted for is the portal's answer, not this one - it \
+         is the only side that knows the whole fleet.",
         found.len(),
         if identified > 0 {
             format!("; {identified} service-identified by nmap")
