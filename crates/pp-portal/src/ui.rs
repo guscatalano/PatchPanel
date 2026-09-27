@@ -665,7 +665,9 @@ const INDEX: &str = r##"<!doctype html>
           <span class="msg" id="live-count"></span>
         </div>
         <div id="live-missed"></div>
-        <div class="feed" id="live-feed" onscroll="liveScrolled()"></div>
+        <div class="feed" id="live-feed" onscroll="liveScrolled()"
+          onwheel="liveGesture()" ontouchmove="liveGesture()" onmousedown="liveGesture()"
+          onkeydown="liveGesture()" tabindex="0"></div>
         <div class="empty" id="live-empty">Not running. Press Start.</div>
       </div>
 
@@ -4685,7 +4687,7 @@ function toggleLive() {
   } else {
     clearInterval(LIVE_TIMER);
     LIVE_TIMER = null;
-    $("live-state").textContent = "stopped";
+    liveState();
   }
 }
 
@@ -4699,14 +4701,16 @@ async function pollLive() {
   } catch (e) {
     // A portal restart is the common case. Keep the lines already on screen and
     // say so, rather than clearing to a blank pane.
-    $("live-state").textContent = "reconnecting";
+    liveState("reconnecting");
     return;
   }
   LIVE_CURSOR = r.next;
   LIVE_MISSED += r.missed || 0;
-  $("live-state").textContent = r.receiver_on
-    ? (LIVE_HELD ? "held — scroll to the bottom to follow" : "following")
-    : "the syslog receiver is off; only forwarded journals will appear";
+  if (r.receiver_on) {
+    liveState();
+  } else {
+    liveState("the syslog receiver is off; only forwarded journals will appear");
+  }
 
   // A poll with nothing new must not redraw. It used to call drawLive() with no
   // argument, which is the full re-render path, so a quiet fleet rebuilt every
@@ -4814,19 +4818,60 @@ function liveCount() {
     : "");
 }
 
+// When the reader last actually touched the feed.
+//
+// Needed because a scroll event does not say who caused it, and this element gets
+// scrolled by the page as well as by the reader: once when new lines are appended,
+// and again when old ones are trimmed off the top, which shrinks the content and
+// makes the browser clamp scrollTop. That is reported as a scroll, and for one
+// frame it measures as "not at the bottom" - so treating it as "the reader has
+// scrolled away" latched following off permanently the first time the feed reached
+// its line limit, which on a fleet with a chatty firewall is a minute or two in.
+// A scroll therefore only counts when a gesture went with it.
+let LIVE_GESTURE = 0;
+
+function liveGesture() {
+  LIVE_GESTURE = Date.now();
+}
+
 // Following is a position, not a mode: if the reader is at the bottom we follow,
-// and if they have scrolled away we do not. Deriving it from the scroll position
-// means there is no state to get out of step with what they can see.
+// and if they have scrolled away we do not. Deriving it from where the feed
+// actually is means there is no separate state to get out of step with what they
+// can see.
 function liveScrolled() {
+  if (Date.now() - LIVE_GESTURE > 1500) return;
   const feed = $("live-feed");
   const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 24;
   if (atBottom === LIVE_HELD) {
     LIVE_HELD = !atBottom;
-    if (LIVE_ON) {
-      $("live-state").textContent = LIVE_HELD
-        ? "held — scroll to the bottom to follow"
-        : "following";
-    }
+    liveState();
+  }
+}
+
+// Back to following, for a reader who would rather press something than scroll
+// several hundred lines.
+function followLive() {
+  LIVE_HELD = false;
+  const feed = $("live-feed");
+  feed.scrollTop = feed.scrollHeight;
+  liveState();
+}
+
+// What the feed is doing, and when it is holding, how to set it going again.
+// Offered as a control rather than an instruction, because "scroll to the bottom"
+// is a thing to do and not a thing to read.
+function liveState(text) {
+  const el = $("live-state");
+  if (text) {
+    el.textContent = text;
+    return;
+  }
+  if (!LIVE_ON) {
+    el.textContent = "stopped";
+  } else if (LIVE_HELD) {
+    setHTML(el, `held &mdash; <a href="#" onclick="followLive();return false">follow again</a>`);
+  } else {
+    el.textContent = "following";
   }
 }
 
