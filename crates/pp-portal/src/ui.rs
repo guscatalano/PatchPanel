@@ -688,7 +688,10 @@ const INDEX: &str = r##"<!doctype html>
           machine on from its own page.</div>
       </div>
       <div class="card">
-        <h2>Device logs <span class="sub" id="log-sub"></span></h2>
+        <h2>Device logs <span class="sub" id="log-sub"></span>
+          <button class="act" style="float:right;padding:2px 8px;font-size:11.5px"
+            title="One zip with every sender's log in it, one file each, named the way this list names them."
+            onclick="exportAll(this)">Export all</button></h2>
         <div class="step">
           <div class="msg">Syslog from things that cannot host an agent. A rolling
             day, in one plain file per sender &mdash; this is not an archive, it is
@@ -3990,7 +3993,10 @@ async function loadLogs() {
       <span class="since">${(s.lines || 0).toLocaleString()} lines &middot; ${size(s.bytes)} &middot; ${
         s.last_line_at ? ago(s.last_line_at) : "quiet"}
         <button class="act" style="padding:1px 8px;font-size:11.5px;margin-left:8px"
-          onclick="showLog(${jsq(s.source)})">Read</button></span>
+          onclick="showLog(${jsq(s.source)})">Read</button>
+        <button class="act" style="padding:1px 8px;font-size:11.5px;margin-left:4px"
+          title="Download this sender's whole log, without opening it first."
+          onclick="exportLog(${jsq(s.source)}, this)">Export</button></span>
       <span class="k" style="grid-column:1/-1;font-size:11.5px">
         ${s.set_here
           // Changing the level is a command to that machine, so it is only
@@ -4082,7 +4088,7 @@ async function showLog(source, contains) {
           ${["200", "400", "2000", "5000"].map((v) =>
             `<option value="${v}"${v === String(limit) ? " selected" : ""}>last ${v}</option>`).join("")}
         </select>
-        <button class="act" onclick="exportLog(${jsq(source)})"
+        <button class="act" onclick="exportLog(${jsq(source)}, this)"
           title="Download everything held for this sender, matching the filter if one is set.">Export</button>
       </div>
       <div class="msg" style="margin-top:6px">${scope}, newest last</div>
@@ -4094,27 +4100,56 @@ async function showLog(source, contains) {
 
 // Fetched rather than linked, so the bearer token goes with it: a plain href
 // would work only on a portal running without authentication.
-async function exportLog(source) {
+// One sender's log. From the list row it takes the whole file; from inside the
+// reader it also honours the filter box, so "export what I am looking at" and
+// "export it all" are the same button doing the expected thing in each place.
+async function exportLog(source, btn) {
   const q = $("log-filter") ? $("log-filter").value : "";
-  const url = "/api/logs/" + encodeURIComponent(source) +
-    "/export?contains=" + encodeURIComponent(q || "");
+  await download(
+    "/api/logs/" + encodeURIComponent(source) + "/export?contains=" + encodeURIComponent(q || ""),
+    source + ".log",
+    btn,
+  );
+}
+
+// Every sender, one zip. No filter: this is the "give me everything" button, and
+// a filter applied silently to an archive is a missing-lines bug waiting to be
+// reported.
+async function exportAll(btn) {
+  await download("/api/logs/export", "patchpanel-logs.zip", btn);
+}
+
+// Fetch with the token and hand the result to the browser as a file.
+//
+// Through fetch rather than a plain link, because the portal wants the bearer
+// token and an <a href> cannot carry one. The button shows what is happening,
+// since a zip of a day's logs can take a moment and a button that does nothing for
+// three seconds gets pressed again.
+async function download(url, fallback, btn) {
+  const was = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "Preparing\u2026"; }
   try {
     const r = await fetch(url, { headers: TOKEN ? { Authorization: "Bearer " + TOKEN } : {} });
-    if (!r.ok) throw new Error("the portal answered " + r.status);
+    if (!r.ok) {
+      let why = "the portal answered " + r.status;
+      try { why = (await r.json()).error || why; } catch (e) { /* not JSON */ }
+      throw new Error(why);
+    }
     const blob = await r.blob();
     const name = (r.headers.get("content-disposition") || "")
-      .match(/filename="?([^"]+)"?/)?.[1] || source + ".log";
+      .match(/filename="?([^"]+)"?/)?.[1] || fallback;
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = name;
     document.body.appendChild(a);
     a.click();
     a.remove();
-    // Revoked on the next tick; doing it immediately cancels the download in
-    // some browsers.
+    // Revoked later; doing it immediately cancels the download in some browsers.
     setTimeout(() => URL.revokeObjectURL(a.href), 10000);
   } catch (e) {
     alert("Could not export: " + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = was; }
   }
 }
 

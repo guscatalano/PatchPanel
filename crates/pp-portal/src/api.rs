@@ -54,6 +54,7 @@ pub fn routes(state: SharedState) -> Router {
         .route("/api/jobs/{name}/runs", get(job_runs))
         .route("/api/logs", get(log_senders))
         .route("/api/logs/live", get(live_log))
+        .route("/api/logs/export", get(export_all_logs))
         .route("/api/logs/{source}", get(device_log_tail))
         .route("/api/logs/{source}/export", get(device_log_export))
         .route("/api/logs/{source}/retention", post(set_retention))
@@ -2688,6 +2689,82 @@ async fn device_log_export(
         body,
     )
         .into_response())
+}
+
+/// Every sender's log in one download, one file per sender.
+///
+/// A zip rather than one concatenated text file, because the files are the unit
+/// somebody wants: "give me the router's log" is a file, and a bundle that has to
+/// be split with a text editor is not much of an export. Named by the machine or
+/// device where the portal knows it, else by the address the lines came from -
+/// the same rule the list on the page uses, so the archive reads the way the page
+/// does.
+async fn export_all_logs(
+    State(state): State<SharedState>,
+    axum::extract::Query(q): axum::extract::Query<TailQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse;
+    use std::io::Write;
+
+    let contains = q.contains.unwrap_or_default();
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let mut names: std::collections::HashSet<String> = Default::default();
+    let mut files = 0usize;
+    {
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for s in crate::syslog::senders(&state.log_dir) {
+            let owner = crate::syslog::owner(&state, &s.source);
+            let base = if owner.is_empty() { s.source.clone() } else { owner };
+            let mut name = safe_name(&base);
+            // Two senders can resolve to one name - a machine's forwarded journal
+            // and its own syslog push - and an archive that silently kept one of
+            // them would be an export with a file missing.
+            if !names.insert(name.clone()) {
+                name = format!("{name}-{}", safe_name(&s.source));
+                names.insert(name.clone());
+            }
+            // A sender whose file cannot be read is skipped rather than failing
+            // the whole download: the other twelve are still worth having.
+            let Ok(body) = crate::syslog::whole(&state.log_dir, &s.source, &contains) else {
+                continue;
+            };
+            zip.start_file(format!("{name}.log"), opts)
+                .map_err(|e| ApiError::bad_request(format!("building the archive: {e}")))?;
+            zip.write_all(body.as_bytes())
+                .map_err(|e| ApiError::bad_request(format!("writing {name}: {e}")))?;
+            files += 1;
+        }
+        zip.finish()
+            .map_err(|e| ApiError::bad_request(format!("finishing the archive: {e}")))?;
+    }
+    if files == 0 {
+        return Err(ApiError::not_found("nothing has been logged by any sender yet"));
+    }
+
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M");
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "application/zip".to_string()),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"patchpanel-logs-{stamp}.zip\""),
+            ),
+        ],
+        buf.into_inner(),
+    )
+        .into_response())
+}
+
+/// A sender name as a filename: letters, digits, dot and dash; everything else
+/// becomes an underscore. "winetown router" -> "winetown_router".
+fn safe_name(raw: &str) -> String {
+    let s: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect();
+    if s.is_empty() { "sender".into() } else { s }
 }
 
 /// What actually happened, day by day.
