@@ -252,6 +252,20 @@ const INDEX: &str = r##"<!doctype html>
   td.svc { max-width: 300px; }
   td.what { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
 
+  /* One row of senders, above the controls rather than inside them: it is the
+     thing most often changed and it grows with the fleet, so it gets its own line
+     instead of pushing the filter box around as machines come and go. */
+  .live-picks { display: flex; gap: 6px 14px; align-items: center; flex-wrap: wrap;
+    padding: 0 14px 8px; font-size: 12.5px; }
+  .live-picks label { display: inline-flex; gap: 5px; align-items: center;
+    cursor: pointer; color: var(--muted); white-space: nowrap; }
+  /* A selected sender is named in full colour; an unselected one recedes, so the
+     row reads as "these ones" at a glance rather than needing the boxes checked. */
+  .live-picks label.on { color: var(--ink); }
+  .live-picks .sep { color: var(--line); }
+  .live-picks a { color: var(--accent); text-decoration: none; }
+  .live-picks a:hover { text-decoration: underline; }
+
   .live-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
     padding: 0 14px 10px; }
   .live-controls input { flex: 1 1 200px; min-width: 140px; }
@@ -748,11 +762,10 @@ const INDEX: &str = r##"<!doctype html>
             again. This is a window on the last few thousand lines, not the archive
             &mdash; the per-sender files above are the record.</div>
         </div>
+        <div class="live-picks" id="live-picks"></div>
         <div class="live-controls">
           <input id="live-filter" placeholder="filter&hellip;" oninput="drawLive()"
             title="Show only lines containing this text. Applies to what has already arrived as well as what comes next.">
-          <select id="live-who" onchange="drawLive()"
-            title="One machine, or all of them."></select>
           <select id="live-sev" onchange="drawLive()" title="Severity, and worse.">
             <option value="7">everything</option>
             <option value="6">info and worse</option>
@@ -4854,6 +4867,12 @@ let LIVE_QUEUE = [];
 let LIVE_RAF = null;
 let LIVE_MISSED = 0;
 let LIVE_WHO = [];
+// Which senders to show. A name is added the first time it is seen, so a machine
+// that starts logging appears rather than being silently excluded by a list drawn
+// before it existed - the opposite would make the feed quietly incomplete, which is
+// the one thing it must not be. Unchecking everything shows nothing and says so,
+// because a checkbox has to mean what it looks like.
+let LIVE_PICK = new Set();
 // Set when the reader has scrolled up. Following is the default, but the moment
 // somebody scrolls back to look at something, moving the view under them is the
 // rudest thing this page could do.
@@ -4960,8 +4979,15 @@ async function pollLive() {
   const shown = liveFilter();
   for (const l of r.lines) {
     LIVE_LINES.push(l);
+    // Selected on first sight, before the filter is applied to it - a sender seen
+    // for the first time has to get into the picker and into the feed, or the first
+    // lines from a machine that has just started talking are lost to a list that
+    // did not know about it.
+    if (!LIVE_WHO.includes(l.who)) {
+      LIVE_WHO.push(l.who);
+      LIVE_PICK.add(l.who);
+    }
     if (shown(l)) LIVE_QUEUE.push(l);
-    if (!LIVE_WHO.includes(l.who)) LIVE_WHO.push(l.who);
   }
   if (LIVE_LINES.length > LIVE_MAX) LIVE_LINES.splice(0, LIVE_LINES.length - LIVE_MAX);
   // Falling behind. Drop the oldest of what has not been shown yet, not the
@@ -4970,7 +4996,7 @@ async function pollLive() {
     LIVE_SKIPPED += LIVE_QUEUE.length - LIVE_QUEUE_MAX;
     LIVE_QUEUE.splice(0, LIVE_QUEUE.length - LIVE_QUEUE_MAX);
   }
-  whoOptions();
+  whoBoxes();
   // Spread whatever just arrived across the interval it arrived over. Anything
   // still queued from last time is included, so a feed that has fallen behind
   // catches up rather than stretching the backlog out forever.
@@ -5095,16 +5121,52 @@ function pinLive(feed) {
 
 // ---------------------------------------------------------------------------
 
-// Keep the machine list in step without disturbing a choice already made.
-function whoOptions() {
-  const sel = $("live-who");
-  const want = ["", ...LIVE_WHO.slice().sort()];
-  if (sel.options.length === want.length) return;
-  const chosen = sel.value;
-  sel.innerHTML = want
-    .map((w) => `<option value="${esc(w)}">${w ? esc(w) : "every machine"}</option>`)
-    .join("");
-  sel.value = chosen;
+// Keep the sender row in step without disturbing a choice already made.
+//
+// Rebuilt only when the set of senders changes, not on every poll: this sits above
+// a feed that must hold still, and replacing it four times a second would both
+// flicker and steal focus from a box being clicked.
+let LIVE_PICKS_DRAWN = "";
+
+function whoBoxes() {
+  const names = LIVE_WHO.slice().sort();
+  const key = names.join("\u0000");
+  if (key === LIVE_PICKS_DRAWN) return;
+
+  const wrote = setHTML($("live-picks"), names.length
+    ? names.map((w) => `<label class="${LIVE_PICK.has(w) ? "on" : ""}">
+        <input type="checkbox" ${LIVE_PICK.has(w) ? "checked" : ""}
+          onchange="pickLive(this, ${jsq(w)})"> ${esc(w)}</label>`).join("")
+      + `<span class="sep">|</span>
+         <a href="#" onclick="pickAll(true);return false">all</a>
+         <a href="#" onclick="pickAll(false);return false">none</a>`
+    : "");
+  // Only remember it as drawn if it actually was. setHTML declines while somebody
+  // is typing into this card, and recording the key regardless would mean a sender
+  // that first appeared during that moment never got a box at all.
+  if (wrote) LIVE_PICKS_DRAWN = key;
+}
+
+// The element is passed in so the row does not have to be rebuilt to restyle one
+// label. Rebuilding would also move focus, which makes the row unusable from the
+// keyboard - tab to a box, press space, and the box you were on is gone.
+function pickLive(box, who) {
+  if (box.checked) {
+    LIVE_PICK.add(who);
+  } else {
+    LIVE_PICK.delete(who);
+  }
+  const label = box.closest("label");
+  if (label) label.classList.toggle("on", box.checked);
+  drawLive();
+}
+
+function pickAll(on) {
+  LIVE_PICK = on ? new Set(LIVE_WHO) : new Set();
+  // Every box changes, so this one is a genuine rebuild.
+  LIVE_PICKS_DRAWN = "";
+  whoBoxes();
+  drawLive();
 }
 
 // Read the three controls once and return a predicate.
@@ -5113,10 +5175,9 @@ function whoOptions() {
 // that cannot change while a batch is being rendered.
 function liveFilter() {
   const text = $("live-filter").value.trim().toLowerCase();
-  const who = $("live-who").value;
   const sev = Number($("live-sev").value);
   return (l) => {
-    if (who && l.who !== who) return false;
+    if (!LIVE_PICK.has(l.who)) return false;
     if (l.severity > sev) return false;
     if (text && !(`${l.who} ${l.tag} ${l.msg}`.toLowerCase().includes(text))) return false;
     return true;
@@ -5187,6 +5248,13 @@ function liveCount() {
   if (!LIVE_LINES.length) {
     el.textContent = "";
     el.title = "";
+    return;
+  }
+  // Nothing ticked is a choice, not a fault, and it should read as one rather than
+  // as a feed that has stopped working.
+  if (LIVE_WHO.length && !LIVE_PICK.size) {
+    el.textContent = "no sender selected";
+    el.title = "Tick a machine above, or press `all`.";
     return;
   }
   const bits = [`${$("live-feed").childElementCount} shown`, `${LIVE_LINES.length} held`];
