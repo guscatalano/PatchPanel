@@ -287,17 +287,17 @@ const INDEX: &str = r##"<!doctype html>
   .feed .row.warn .m { color: var(--warn); }
   .feed .row.err .m { color: var(--bad); }
 
-/* A new line fades up as it arrives. Only a fade: the scroll itself now carries
-     the movement (glideToBottom), and a row lifting while the viewport slides the
-     other way is two motions competing to describe one event. Applied only to the
-     lines that actually just arrived - see drawLive, which also declines to
-     animate a burst, because two hundred rows at once is a flicker rather than
-     motion and costs a layout pass per frame to produce it. */
+/* A line materialises as it lands. Only opacity, and deliberately brief.
+     The movement belongs to the feed growing a row at a time underneath the
+     viewport (see dripLive) - this just stops each row appearing as a hard edge.
+     Opacity and transform are the two things that animate without forcing layout,
+     which matters here because the drip keeps a few dozen of these in flight at
+     once; animating height instead would be a layout pass per row per frame. */
   @keyframes live-in {
     from { opacity: 0; }
     to   { opacity: 1; }
   }
-  .feed .row.fresh { animation: live-in 260ms ease-out both; }
+  .feed .row.fresh { animation: live-in 150ms ease-out both; }
   /* Somebody who has asked for less movement is reading a log, of all things,
      precisely to find something - so this one is not decoration to insist on. */
   @media (prefers-reduced-motion: reduce) {
@@ -4689,49 +4689,71 @@ boot();
 // ---------------------------------------------------------------------------
 // The live feed
 //
-// Held apart from the page's ordinary render loop, which replaces innerHTML
-// wholesale. Doing that to a feed would reset the scroll position on every poll
-// and make it impossible to read anything while lines are arriving - so this
-// keeps the lines it has been given, appends to them, and only ever re-renders
-// when a filter changes.
+// Lines arrive from the portal in lumps: one poll every two seconds, carrying
+// whatever happened in between - on this fleet a single firewall can make that two
+// hundred lines. Putting a lump into the DOM and then animating the scrollbar
+// across it was the wrong shape, and no amount of easing fixed it, because the
+// jump was the arrival and not the scrolling.
+//
+// So the lump is never shown as a lump. Received lines go into a queue, and a
+// frame loop takes a few off the front at a time, which means the feed grows by a
+// row or two per frame while sitting at the bottom. Nothing has to travel: the
+// scroll stays where it already is, and the content coming up from underneath is
+// the movement. A row fades as it lands, and that is the only animation left.
 // ---------------------------------------------------------------------------
 
 let LIVE_ON = false;
 let LIVE_CURSOR = 0;
 let LIVE_TIMER = null;
+// Everything the page is holding, rendered or not. The filter re-renders from
+// this, so it has to include what is still queued.
 let LIVE_LINES = [];
+// Received but not yet in the DOM. Drained by dripLive, a few per frame.
+let LIVE_QUEUE = [];
+let LIVE_RAF = null;
 let LIVE_MISSED = 0;
 let LIVE_WHO = [];
 // Set when the reader has scrolled up. Following is the default, but the moment
 // somebody scrolls back to look at something, moving the view under them is the
 // rudest thing this page could do.
 let LIVE_HELD = false;
-// Whether the reader has stopped it by hand, which the tab-change autostart
-// respects.
+// Whether they stopped it by hand, which the tab-change autostart respects.
 let LIVE_STOPPED = false;
+// When they last actually touched the feed, and the scroll offset this code last
+// wrote. Between them these separate the reader's scrolling from our own: every
+// frame that pins the feed to the bottom emits a scroll event that is, at the
+// event, indistinguishable from a drag of the scrollbar.
+let LIVE_GESTURE = 0;
+let LIVE_SET_TO = -1;
 
 // Whether the reader has asked for less movement. Read once: it is consulted on
-// every batch, and a media query lookup per poll is work for an answer that
+// every frame, and a media query lookup per frame is work for an answer that
 // almost never changes.
 const REDUCED_MOTION = typeof matchMedia === "function"
   && matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 // What this window keeps.
 //
-// Far smaller than the portal's ring on purpose. Every line is five elements
-// once rendered, so three thousand of them is fifteen thousand nodes, and a
-// fleet with a chatty firewall in it fills that in about two minutes - at which
-// point the whole tab is slow, not just this card. What is scrolled off here is
-// still in the per-sender files, so the cost of keeping less is nearly nothing
-// and the cost of keeping more is the page.
+// Far smaller than the portal's ring on purpose. Every line is five elements once
+// rendered, so three thousand of them is fifteen thousand nodes, and a fleet with
+// a chatty firewall fills that in about two minutes - at which point the whole tab
+// is slow, not just this card. What scrolls off here is still in the per-sender
+// files, so keeping less costs nearly nothing and keeping more costs the page.
 const LIVE_MAX = 800;
-// Most lines one poll will render. A burst larger than this is trimmed to its
-// tail as it arrives rather than being rendered and immediately scrolled off -
-// laying out seven hundred rows in order to throw away six hundred of them is
-// the expensive way to display nothing.
-const LIVE_BATCH = 200;
-// Above this many new lines in one poll, they simply appear. See drawLive.
-const LIVE_ANIMATE = 40;
+
+// Rows added per frame, and the queue length above which the feed stops trying to
+// show every line.
+//
+// At sixty frames a second, four per frame is two hundred and forty lines a
+// second, which is comfortably more than this fleet produces - so in practice the
+// queue drains as fast as it fills and the delay between a line arriving and being
+// seen stays under a second. The ceiling is for the pathological case: if
+// something starts emitting thousands of lines a second, dripping them all would
+// put the feed minutes behind the truth, which is worse than admitting it skipped
+// some. LIVE_SKIPPED says so on screen.
+const LIVE_PER_FRAME = 4;
+const LIVE_QUEUE_MAX = 1200;
+let LIVE_SKIPPED = 0;
 
 function toggleLive() {
   LIVE_ON = !LIVE_ON;
@@ -4746,6 +4768,9 @@ function toggleLive() {
   } else {
     clearInterval(LIVE_TIMER);
     LIVE_TIMER = null;
+    // Show what is already in hand rather than stopping mid-queue with lines the
+    // reader can see the count of but not the text of.
+    flushLive();
     liveState();
   }
 }
@@ -4771,9 +4796,6 @@ async function pollLive() {
     liveState("the syslog receiver is off; only forwarded journals will appear");
   }
 
-  // A poll with nothing new must not redraw. It used to call drawLive() with no
-  // argument, which is the full re-render path, so a quiet fleet rebuilt every
-  // row from scratch every 1.5 seconds - which is what made the whole page lag.
   if (!r.lines || !r.lines.length) {
     liveCount();
     return;
@@ -4781,12 +4803,94 @@ async function pollLive() {
 
   for (const l of r.lines) {
     LIVE_LINES.push(l);
+    LIVE_QUEUE.push(l);
     if (!LIVE_WHO.includes(l.who)) LIVE_WHO.push(l.who);
   }
   if (LIVE_LINES.length > LIVE_MAX) LIVE_LINES.splice(0, LIVE_LINES.length - LIVE_MAX);
+  // Falling behind. Drop the oldest of what has not been shown yet, not the
+  // newest: a live view that is behind is worth less than one that is current.
+  if (LIVE_QUEUE.length > LIVE_QUEUE_MAX) {
+    LIVE_SKIPPED += LIVE_QUEUE.length - LIVE_QUEUE_MAX;
+    LIVE_QUEUE.splice(0, LIVE_QUEUE.length - LIVE_QUEUE_MAX);
+  }
   whoOptions();
-  drawLive(r.lines);
+  startDrip();
 }
+
+// ---------------------------------------------------------------------------
+// Dripping the queue into the DOM
+
+function startDrip() {
+  if (LIVE_RAF !== null) return;
+  // Somebody who asked for less movement gets the lines, just not the pacing.
+  if (REDUCED_MOTION) {
+    flushLive();
+    return;
+  }
+  LIVE_RAF = requestAnimationFrame(dripLive);
+}
+
+/// Move a few queued lines into the feed, then ask for the next frame.
+///
+/// The whole smoothness of this comes from how little each frame does. Appending
+/// four rows to a container already scrolled to its bottom moves the visible
+/// content up by four rows, once, at the refresh rate - which is what continuous
+/// motion is. There is no scroll animation here at all, and there was never a need
+/// for one.
+function dripLive() {
+  LIVE_RAF = null;
+  if (!LIVE_ON || TAB !== "logs" || $("app").hidden) {
+    // Nobody is watching; keep the lines and stop burning frames.
+    return;
+  }
+
+  const feed = $("live-feed");
+  const shown = liveFilter();
+  const take = LIVE_QUEUE.splice(0, LIVE_PER_FRAME).filter(shown);
+  if (take.length) {
+    feed.insertAdjacentHTML("beforeend", take.map((l) => liveRow(l, true)).join(""));
+    trimFeed(feed);
+    pinLive(feed);
+  }
+  liveCount();
+
+  if (LIVE_QUEUE.length) {
+    LIVE_RAF = requestAnimationFrame(dripLive);
+  }
+}
+
+/// Show everything queued at once, for the cases where pacing is wrong: the
+/// reader pressed Stop, a filter changed, or they have asked for less movement.
+function flushLive() {
+  if (LIVE_RAF !== null) {
+    cancelAnimationFrame(LIVE_RAF);
+    LIVE_RAF = null;
+  }
+  if (!LIVE_QUEUE.length) return;
+  const feed = $("live-feed");
+  const shown = liveFilter();
+  const take = LIVE_QUEUE.filter(shown);
+  LIVE_QUEUE = [];
+  if (take.length) {
+    feed.insertAdjacentHTML("beforeend", take.map((l) => liveRow(l, false)).join(""));
+    trimFeed(feed);
+    pinLive(feed);
+  }
+  liveCount();
+}
+
+/// Hold the feed at its bottom, remembering where we put it.
+///
+/// The offset is recorded so the scroll handler can tell this apart from the
+/// reader moving the bar. Every frame of a drip writes scrollTop, and every one of
+/// those arrives at the handler as an ordinary scroll event.
+function pinLive(feed) {
+  if (LIVE_HELD) return;
+  LIVE_SET_TO = feed.scrollHeight - feed.clientHeight;
+  feed.scrollTop = LIVE_SET_TO;
+}
+
+// ---------------------------------------------------------------------------
 
 // Keep the machine list in step without disturbing a choice already made.
 function whoOptions() {
@@ -4802,9 +4906,8 @@ function whoOptions() {
 
 // Read the three controls once and return a predicate.
 //
-// Reading them inside the filter meant three DOM lookups per line, five hundred
-// lines a poll - work proportional to the traffic, for values that cannot change
-// while a batch is being rendered.
+// Reading them inside the filter meant three DOM lookups per line - for values
+// that cannot change while a batch is being rendered.
 function liveFilter() {
   const text = $("live-filter").value.trim().toLowerCase();
   const who = $("live-who").value;
@@ -4830,51 +4933,31 @@ function liveRow(l, fresh) {
     `<span class="m">${esc(l.msg)}</span></div>`;
 }
 
-// `added` present: append only those, which is what keeps a long feed cheap.
-// Absent: a filter changed, so everything held is re-rendered.
-function drawLive(added) {
+/// Re-render everything held, for a filter change.
+///
+/// The queue is flushed into it rather than left pending, because the lines in it
+/// are already in LIVE_LINES and would otherwise be rendered twice.
+function drawLive() {
   const feed = $("live-feed");
-  $("live-empty").hidden = LIVE_ON || LIVE_LINES.length > 0;
-  let appended = false;
-
-  const shown = liveFilter();
-  if (added) {
-    // Trim before rendering, not after.
-    let batch = added.filter(shown);
-    if (batch.length > LIVE_BATCH) batch = batch.slice(-LIVE_BATCH);
-    if (batch.length) {
-      // Animate a handful of new lines; do not animate a flood. A burst of two
-      // hundred all sliding at once reads as a flicker, and paying for the
-      // layout of every one of them is what made this card slow before.
-      const fresh = batch.length <= LIVE_ANIMATE;
-      feed.insertAdjacentHTML("beforeend", batch.map((l) => liveRow(l, fresh)).join(""));
-      appended = true;
-      trimFeed(feed);
-    }
-  } else {
-    feed.innerHTML = LIVE_LINES.filter(shown).slice(-LIVE_MAX).map(liveRow).join("");
-    appended = true;
+  LIVE_QUEUE = [];
+  if (LIVE_RAF !== null) {
+    cancelAnimationFrame(LIVE_RAF);
+    LIVE_RAF = null;
   }
-
+  $("live-empty").hidden = LIVE_ON || LIVE_LINES.length > 0;
+  feed.innerHTML = LIVE_LINES.filter(liveFilter()).slice(-LIVE_MAX)
+    .map((l) => liveRow(l, false)).join("");
+  pinLive(feed);
   liveCount();
-  // Only when something moved. Reading scrollHeight forces layout, and doing it
-  // on every poll of an idle feed is a measurable cost for no effect.
-  if (appended && !LIVE_HELD) glideToBottom();
 }
 
 // Drop the oldest rows, without moving the ones still on screen.
 //
-// This was the jump, and it survived two attempts at smoothing the scroll because
-// it is not the scroll. Rows are removed from the *top*, and at that moment
-// scrollTop is deliberately not at its maximum - the glide needs the old position
-// to travel from. Shortening the content above the viewport while scrollTop stays
-// where it is slides every visible line up by exactly the height removed, and in
-// the steady state the amount removed equals the amount just added, so the jump
-// was the same size as the glide that then followed it.
-//
-// Taking that height back out of scrollTop leaves the visible lines exactly where
-// they were. It matters just as much when the reader is holding the feed still:
-// they are parked reading something, and without this every trim yanks it upward.
+// Rows are removed from the top, so shortening the content above the viewport
+// while scrollTop stays put slides every visible line up by exactly the height
+// removed. Taking that height back out of scrollTop leaves them still. It matters
+// as much when the reader is holding the feed: they are parked reading something,
+// and without this every trim yanks it upward.
 function trimFeed(feed) {
   const over = feed.childElementCount - LIVE_MAX;
   if (over <= 0) return;
@@ -4887,122 +4970,33 @@ function trimFeed(feed) {
   feed.scrollTop -= before - feed.scrollHeight;
 }
 
-// The cheap part of a redraw, safe to call on a poll that changed nothing.
+// The counters and the notes, cheap enough to call on every frame.
 function liveCount() {
   const feed = $("live-feed");
+  const behind = LIVE_QUEUE.length ? `, ${LIVE_QUEUE.length} arriving` : "";
   $("live-count").textContent = LIVE_LINES.length
-    ? `${feed.childElementCount} shown, ${LIVE_LINES.length} held`
+    ? `${feed.childElementCount} shown, ${LIVE_LINES.length} held${behind}`
     : "";
-  setHTML($("live-missed"), LIVE_MISSED
-    ? `<div class="step"><div class="note" style="border-color:var(--warn)">
-        ${LIVE_MISSED} line(s) arrived faster than this page collected them and are
-        no longer in the portal's window. They are still in the per-sender files
-        above; only this view lost them.</div></div>`
-    : "");
+  const notes = [];
+  if (LIVE_MISSED) {
+    notes.push(`${LIVE_MISSED} line(s) arrived faster than this page collected them and are no
+      longer in the portal's window. They are still in the per-sender files above; only this
+      view lost them.`);
+  }
+  if (LIVE_SKIPPED) {
+    notes.push(`${LIVE_SKIPPED} line(s) were skipped to keep this view current rather than
+      letting it fall minutes behind. They are in the files above.`);
+  }
+  setHTML($("live-missed"), notes.map((t) => `<div class="step">
+      <div class="note" style="border-color:var(--warn)">${t}</div>
+    </div>`).join(""));
 }
 
-// When the reader last actually touched the feed.
-//
-// Needed because a scroll event does not say who caused it, and this element gets
-// scrolled by the page as well as by the reader: once when new lines are appended,
-// and again when old ones are trimmed off the top, which shrinks the content and
-// makes the browser clamp scrollTop. That is reported as a scroll, and for one
-// frame it measures as "not at the bottom" - so treating it as "the reader has
-// scrolled away" latched following off permanently the first time the feed reached
-// its line limit, which on a fleet with a chatty firewall is a minute or two in.
-// A scroll therefore only counts when a gesture went with it.
-let LIVE_GESTURE = 0;
-
-// Generation counter, and whether a glide is running.
-//
-// A glide sets scrollTop many times, and each of those is reported as a scroll -
-// indistinguishable, at the event, from the reader dragging the bar. So scrolls
-// are ignored while one is in flight, and anything that moves the feed on purpose
-// cancels the glide first, so the reader's own scrolling is never what gets
-// ignored. Declared above their first use rather than below it, which is a
-// mistake this file has already shipped once.
-let LIVE_GLIDE = 0;
-let LIVE_GLIDING = false;
-
-// Abandon a glide in flight. The generation bump is what stops the pending frame:
-// it checks whether it is still the current one before touching anything.
-function cancelGlide() {
-  LIVE_GLIDE += 1;
-  LIVE_GLIDING = false;
-}
+// ---------------------------------------------------------------------------
+// Who is moving the feed
 
 function liveGesture() {
   LIVE_GESTURE = Date.now();
-  // The reader has taken hold of it, so stop moving it under them.
-  cancelGlide();
-}
-
-// Longest a glide may take, in milliseconds.
-//
-// A cap on *time*, not on distance. The first attempt capped the distance and
-// jumped past it, which on this fleet meant the glide never ran at all: one
-// firewall delivers a couple of hundred lines per poll, and two hundred rows is
-// nearly four thousand pixels, far outside any sane distance limit. So every
-// batch took the jump path and the smoothing was invisible.
-//
-// Bounding the duration instead lets a large batch move quickly rather than
-// instantly, which is exactly what a busy `tail -f` looks like and reads as flow.
-// Below the poll interval, so a glide finishes before the next batch lands - and if
-// one does land early, it simply retargets from wherever this had got to.
-const LIVE_GLIDE_MS = 1700;
-
-/// Ease the feed down to the bottom instead of snapping to it.
-///
-/// The jump this replaces was not the rows appearing - they already faded in - but
-/// the viewport moving the whole way in a single frame the moment they were
-/// appended. Holding the old position and then covering the distance over a few
-/// frames is what makes existing lines rise and new ones come up from below,
-/// which is what reading a tail is supposed to look like.
-function glideToBottom() {
-  const feed = $("live-feed");
-  const to = feed.scrollHeight - feed.clientHeight;
-  const from = feed.scrollTop;
-  const dist = to - from;
-
-  const settle = () => {
-    feed.scrollTop = to;
-    LIVE_GLIDING = false;
-  };
-  // Nothing to do, or movement was declined.
-  if (dist <= 1 || REDUCED_MOTION) {
-    settle();
-    return;
-  }
-
-  // Proportional to the distance, so one new line is not as slow as thirty, and
-  // clamped at both ends: long enough to register as movement, and never past the
-  // ceiling above however far it has to go.
-  const ms = Math.max(140, Math.min(LIVE_GLIDE_MS, dist * 1.6));
-  const mine = ++LIVE_GLIDE;
-  const started = performance.now();
-  LIVE_GLIDING = true;
-
-  const step = (now) => {
-    // A newer glide, or a gesture, has taken over.
-    if (mine !== LIVE_GLIDE) return;
-    const t = Math.min(1, (now - started) / ms);
-    // Constant speed for a stream, eased for a trickle.
-    //
-    // Easing out decelerates hard at the end of every batch, and when batches
-    // arrive back to back that is a pulse - fast, slow, fast, slow - which is
-    // the opposite of flow. A long distance means lines are pouring in, and the
-    // natural way to read that is at a steady rate. A short one means a handful
-    // arrived on a quiet fleet, where settling into place looks considered
-    // rather than mechanical.
-    const eased = dist > 600 ? t : 1 - Math.pow(1 - t, 3);
-    feed.scrollTop = from + dist * eased;
-    if (t < 1) {
-      requestAnimationFrame(step);
-    } else {
-      settle();
-    }
-  };
-  requestAnimationFrame(step);
 }
 
 // Following is a position, not a mode: if the reader is at the bottom we follow,
@@ -5010,10 +5004,11 @@ function glideToBottom() {
 // actually is means there is no separate state to get out of step with what they
 // can see.
 function liveScrolled() {
-  // Our own movement, not theirs.
-  if (LIVE_GLIDING) return;
-  if (Date.now() - LIVE_GESTURE > 1500) return;
   const feed = $("live-feed");
+  // Our own pin, arriving as an ordinary scroll event. Without this the drip
+  // would repeatedly be mistaken for the reader scrolling.
+  if (Math.abs(feed.scrollTop - LIVE_SET_TO) < 2) return;
+  if (Date.now() - LIVE_GESTURE > 1500) return;
   const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 24;
   if (atBottom === LIVE_HELD) {
     LIVE_HELD = !atBottom;
@@ -5021,51 +5016,11 @@ function liveScrolled() {
   }
 }
 
-// Fill the screen with the feed, and come back out.
-//
-// The native Fullscreen API rather than a fixed-position class, so Escape works,
-// the browser's own chrome goes away, and nothing here has to guess at a z-index
-// that beats everything else on the page. Where it is unavailable or refused -
-// some browsers only grant it inside a user gesture, and an iframe may not have
-// the permission at all - the card stays where it is and says so, which is better
-// than half-applying a layout nobody can get out of.
-async function fullLive() {
-  const card = $("live-card");
-  try {
-    if (document.fullscreenElement) {
-      await document.exitFullscreen();
-    } else {
-      await card.requestFullscreen();
-    }
-  } catch (e) {
-    liveState("this browser would not give the feed the whole screen");
-  }
-}
-
-// Escape leaves full screen without going through the button, so the label and
-// the scroll position are corrected from the event rather than from the click.
-document.addEventListener("fullscreenchange", () => {
-  const on = document.fullscreenElement === $("live-card");
-  $("live-full").textContent = on ? "Leave full screen" : "Full screen";
-  // The visible height just changed, so the bottom is somewhere else now, and any
-  // glide still in flight is heading for the old one.
-  cancelGlide();
-  const feed = $("live-feed");
-  if (!LIVE_HELD) feed.scrollTop = feed.scrollHeight;
-  // Focused on the way in, so PageUp and the arrow keys work against the feed
-  // without having to click it first - there is nothing else on screen to click.
-  if (on) feed.focus();
-});
-
 // Back to following, for a reader who would rather press something than scroll
 // several hundred lines.
 function followLive() {
   LIVE_HELD = false;
-  // Asked for explicitly, so it goes there now rather than easing - from several
-  // hundred lines up, a glide would be a long wait for something already decided.
-  cancelGlide();
-  const feed = $("live-feed");
-  feed.scrollTop = feed.scrollHeight;
+  pinLive($("live-feed"));
   liveState();
 }
 
@@ -5086,6 +5041,40 @@ function liveState(text) {
     el.textContent = "following";
   }
 }
+
+// Fill the screen with the feed, and come back out.
+//
+// The native Fullscreen API rather than a fixed-position class, so Escape works,
+// the browser's own chrome goes away, and nothing here has to guess at a z-index
+// that beats everything else on the page. Where it is unavailable or refused - some
+// browsers only grant it inside a user gesture, and an iframe may not have the
+// permission at all - the card stays where it is and says so, which is better than
+// half-applying a layout nobody can get out of.
+async function fullLive() {
+  const card = $("live-card");
+  try {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen();
+    } else {
+      await card.requestFullscreen();
+    }
+  } catch (e) {
+    liveState("this browser would not give the feed the whole screen");
+  }
+}
+
+// Escape leaves full screen without going through the button, so the label and the
+// scroll position are corrected from the event rather than from the click.
+document.addEventListener("fullscreenchange", () => {
+  const on = document.fullscreenElement === $("live-card");
+  $("live-full").textContent = on ? "Leave full screen" : "Full screen";
+  // The visible height just changed, so the bottom is somewhere else now.
+  const feed = $("live-feed");
+  pinLive(feed);
+  // Focused on the way in, so PageUp and the arrow keys work against the feed
+  // without having to click it first - there is nothing else on screen to click.
+  if (on) feed.focus();
+});
 
 setInterval(() => { if (!$("app").hidden) refresh(); }, 5000);
 </script>
