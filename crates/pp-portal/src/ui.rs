@@ -299,10 +299,16 @@ const INDEX: &str = r##"<!doctype html>
      which matters here because the drip keeps a few dozen of these in flight at
      once; animating height instead would be a layout pass per row per frame. */
   @keyframes live-in {
-    from { opacity: 0; }
-    to   { opacity: 1; }
+    from { opacity: 0; transform: translateX(-12px); }
+    to   { opacity: 1; transform: none; }
   }
-  .feed .row.fresh { animation: live-in 150ms ease-out both; }
+  /* Long enough to actually see. At 150ms it was technically a fade and visually
+     nothing. Sideways rather than upward: the feed is already moving vertically as
+     rows arrive, and a row rising into a rising column is two motions describing
+     one event - going in from the left is unambiguous about which is which.
+     Opacity and transform are the only two properties that animate without forcing
+     layout, which is what makes it affordable a couple of dozen times over. */
+  .feed .row.fresh { animation: live-in 400ms cubic-bezier(.16,.84,.26,1) both; }
   /* Somebody who has asked for less movement is reading a log, of all things,
      precisely to find something - so this one is not decoration to insist on. */
   @media (prefers-reduced-motion: reduce) {
