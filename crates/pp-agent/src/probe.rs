@@ -15,7 +15,8 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use ipnet::IpNet;
 use pp_proto::{
-    DeviceReport, DeviceSpec, DiscoveredHost, DiscoveryScan, Probe, Scanner, OID_SYS_DESCR,
+    DeviceReport, DeviceSpec, DiscoveredHost, DiscoveryScan, Probe, Scanner, SnmpVersion,
+    OID_SYS_DESCR,
 };
 use regex::Regex;
 use tokio::io::AsyncReadExt;
@@ -884,47 +885,83 @@ async fn run_probe(spec: &DeviceSpec) -> Result<(Option<String>, String, Extra)>
             community,
             oid,
             version_regex,
+            version,
+            user,
+            auth_password,
+            auth_protocol,
+            privacy_password,
+            privacy_cipher,
         } => {
             let oid_str = oid.as_deref().unwrap_or(OID_SYS_DESCR);
             let addr = resolve(&spec.target, 161).await?;
 
-            let client = csnmp::Snmp2cClient::new(
-                addr,
-                community.as_bytes().to_vec(),
-                None,
-                Some(PROBE_TIMEOUT),
-                1,
-            )
-            .await
-            .context("creating SNMP client")?;
+            let attempts = snmp_attempts(*version, user.is_some());
 
-            let oid = csnmp::ObjectIdentifier::from_str(oid_str)
-                .map_err(|e| anyhow::anyhow!("bad OID `{oid_str}`: {e:?}"))?;
-            let value = client
-                .get(oid)
-                .await
-                .map_err(|e| anyhow::anyhow!("SNMP get failed: {e}"))?;
-
-            let text = match value {
-                csnmp::ObjectValue::String(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                csnmp::ObjectValue::ObjectId(o) => o.to_string(),
-                csnmp::ObjectValue::Integer(i) => i.to_string(),
-                csnmp::ObjectValue::Counter32(n) | csnmp::ObjectValue::Unsigned32(n) => {
-                    n.to_string()
+            let mut last_err = None;
+            let mut spoke = SnmpVersion::V2c;
+            let mut text = None;
+            for attempt in &attempts {
+                let got = match attempt {
+                    SnmpVersion::V3 => {
+                        snmp_v3(
+                            addr,
+                            oid_str,
+                            user.as_deref().unwrap_or_default(),
+                            auth_password.as_deref().unwrap_or_default(),
+                            *auth_protocol,
+                            privacy_password.as_deref(),
+                            *privacy_cipher,
+                        )
+                        .await
+                    }
+                    _ => snmp_community(addr, oid_str, community).await,
+                };
+                match got {
+                    Ok(v) => {
+                        spoke = *attempt;
+                        text = Some(v);
+                        break;
+                    }
+                    // Kept rather than returned, so a failed v3 attempt does not
+                    // hide what v2c went on to say - or vice versa.
+                    Err(e) => last_err = Some((*attempt, e)),
                 }
-                csnmp::ObjectValue::TimeTicks(n) => n.to_string(),
-                csnmp::ObjectValue::Counter64(n) => n.to_string(),
-                csnmp::ObjectValue::IpAddress(a) => a.to_string(),
-                csnmp::ObjectValue::Opaque(b) => hex::encode(b),
+            }
+
+            let text = match text {
+                Some(t) => t,
+                None => {
+                    let (which, e) = last_err.expect("at least one attempt");
+                    return Err(e.context(format!("SNMP {} failed", snmp_label(which))));
+                }
             };
 
-            let version = match version_regex {
+            let version_found = match version_regex {
                 Some(re) => capture(re, &text)?,
                 // Without a pattern, sysDescr itself is the best evidence we
                 // have; the operator can add a regex to sharpen it.
                 None => Some(text.clone()),
             };
-            Ok((version, text, Extra::default()))
+            // Which version answered belongs in the evidence, not just in a log
+            // line: it is the difference between v3 being enforced and v3 being
+            // configured while the device happily answers a community string.
+            //
+            // And when something better was tried first and failed, why it failed
+            // goes here too. Reporting the fallback without the reason leaves the
+            // operator knowing v3 did not work and with no way to tell a wrong
+            // password from a device that never had v3 enabled - which is the only
+            // question they actually want answered at that point.
+            let mut detail = format!("via SNMP {}: {text}", snmp_label(spoke));
+            if let Some((tried, why)) = last_err {
+                if tried != spoke {
+                    detail.push_str(&format!(
+                        " ({} was tried first and failed: {})",
+                        snmp_label(tried),
+                        format!("{why:#}").replace('\n', " ")
+                    ));
+                }
+            }
+            Ok((version_found, detail, Extra::default()))
         }
 
         Probe::Tcp {
@@ -988,6 +1025,157 @@ async fn resolve(target: &str, default_port: u16) -> Result<SocketAddr> {
     addrs
         .next()
         .with_context(|| format!("`{host}` resolved to no addresses"))
+}
+
+/// Which SNMP versions to try, in order.
+///
+/// `auto` prefers v3 and falls back to v2c, but only when there is a user to
+/// authenticate as - without one, v3 cannot be attempted at all, and going through
+/// the motions would turn a clear "no credentials configured" into a UDP timeout.
+///
+/// A pinned version is tried alone and never falls back. That is the whole point of
+/// pinning: once v1/v2c is switched off on the device, an operator wants a device
+/// that has quietly gone back to answering a community string to read as
+/// unreachable, not as working.
+fn snmp_attempts(version: SnmpVersion, has_user: bool) -> Vec<SnmpVersion> {
+    match version {
+        SnmpVersion::Auto if has_user => vec![SnmpVersion::V3, SnmpVersion::V2c],
+        SnmpVersion::Auto => vec![SnmpVersion::V2c],
+        pinned => vec![pinned],
+    }
+}
+
+fn snmp_label(v: SnmpVersion) -> &'static str {
+    match v {
+        SnmpVersion::V3 => "v3",
+        SnmpVersion::V2c | SnmpVersion::Auto => "v2c",
+        SnmpVersion::V1 => "v1",
+    }
+}
+
+/// Read one OID with a community string, the v1/v2c way.
+async fn snmp_community(
+    addr: std::net::SocketAddr,
+    oid: &str,
+    community: &str,
+) -> Result<String> {
+    let client = csnmp::Snmp2cClient::new(
+        addr,
+        community.as_bytes().to_vec(),
+        None,
+        Some(PROBE_TIMEOUT),
+        1,
+    )
+    .await
+    .context("creating SNMP client")?;
+
+    let parsed = csnmp::ObjectIdentifier::from_str(oid)
+        .map_err(|e| anyhow::anyhow!("bad OID `{oid}`: {e:?}"))?;
+    let value = client
+        .get(parsed)
+        .await
+        .map_err(|e| anyhow::anyhow!("SNMP get failed: {e}"))?;
+
+    Ok(match value {
+        csnmp::ObjectValue::String(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        csnmp::ObjectValue::ObjectId(o) => o.to_string(),
+        csnmp::ObjectValue::Integer(i) => i.to_string(),
+        csnmp::ObjectValue::Counter32(n) | csnmp::ObjectValue::Unsigned32(n) => n.to_string(),
+        csnmp::ObjectValue::TimeTicks(n) => n.to_string(),
+        csnmp::ObjectValue::Counter64(n) => n.to_string(),
+        csnmp::ObjectValue::IpAddress(a) => a.to_string(),
+        csnmp::ObjectValue::Opaque(b) => hex::encode(b),
+    })
+}
+
+/// Read one OID as a v3 user.
+///
+/// Two things here are not optional and are easy to leave out. `init` performs
+/// engine discovery - a v3 request cannot be signed without the device's engine id,
+/// boots and time - and every step is wrapped in the same timeout as the rest of
+/// the probes, because an unreachable device on a UDP protocol otherwise waits on
+/// the library's own patience rather than ours.
+async fn snmp_v3(
+    addr: std::net::SocketAddr,
+    oid: &str,
+    user: &str,
+    auth_password: &str,
+    auth: pp_proto::SnmpAuth,
+    privacy_password: Option<&str>,
+    cipher: pp_proto::SnmpCipher,
+) -> Result<String> {
+    use snmp2::{v3, AsyncSession, Oid};
+
+    if user.is_empty() {
+        anyhow::bail!("no v3 user configured");
+    }
+
+    let mut security = v3::Security::new(user.as_bytes(), auth_password.as_bytes())
+        .with_auth_protocol(match auth {
+            pp_proto::SnmpAuth::Md5 => v3::AuthProtocol::Md5,
+            pp_proto::SnmpAuth::Sha1 => v3::AuthProtocol::Sha1,
+            pp_proto::SnmpAuth::Sha224 => v3::AuthProtocol::Sha224,
+            pp_proto::SnmpAuth::Sha256 => v3::AuthProtocol::Sha256,
+            pp_proto::SnmpAuth::Sha384 => v3::AuthProtocol::Sha384,
+            pp_proto::SnmpAuth::Sha512 => v3::AuthProtocol::Sha512,
+        });
+    // A privacy password is what separates authPriv from authNoPriv. Without one
+    // the request is still signed, which is the part that replaces the community
+    // string; the reply simply is not encrypted.
+    security = match privacy_password {
+        Some(p) if !p.is_empty() => security.with_auth(v3::Auth::AuthPriv {
+            cipher: match cipher {
+                pp_proto::SnmpCipher::Des => v3::Cipher::Des,
+                pp_proto::SnmpCipher::Aes128 => v3::Cipher::Aes128,
+                pp_proto::SnmpCipher::Aes192 => v3::Cipher::Aes192,
+                pp_proto::SnmpCipher::Aes256 => v3::Cipher::Aes256,
+            },
+            privacy_password: p.as_bytes().to_vec(),
+        }),
+        _ => security.with_auth(v3::Auth::AuthNoPriv),
+    };
+
+    let parsed = Oid::from(
+        &oid.split('.')
+            .map(|p| p.parse::<u64>().map_err(|e| anyhow::anyhow!("bad OID `{oid}`: {e}")))
+            .collect::<Result<Vec<u64>>>()?,
+    )
+    .map_err(|e| anyhow::anyhow!("bad OID `{oid}`: {e:?}"))?
+    .to_owned();
+
+    let mut session = tokio::time::timeout(PROBE_TIMEOUT, AsyncSession::new_v3(addr, 1, security))
+        .await
+        .map_err(|_| anyhow::anyhow!("connecting to {addr} for SNMPv3 timed out"))?
+        .with_context(|| format!("opening an SNMPv3 session to {addr}"))?;
+
+    tokio::time::timeout(PROBE_TIMEOUT, session.init())
+        .await
+        .map_err(|_| anyhow::anyhow!("SNMPv3 engine discovery timed out"))?
+        .map_err(|e| anyhow::anyhow!("SNMPv3 engine discovery failed: {e:?}"))?;
+
+    let pdu = tokio::time::timeout(PROBE_TIMEOUT, session.get(&parsed))
+        .await
+        .map_err(|_| anyhow::anyhow!("SNMPv3 get timed out"))?
+        .map_err(|e| anyhow::anyhow!("SNMPv3 get failed: {e:?}"))?;
+
+    for (_, value) in pdu.varbinds {
+        return Ok(match value {
+            snmp2::Value::OctetString(b) => String::from_utf8_lossy(b).into_owned(),
+            snmp2::Value::ObjectIdentifier(o) => format!("{o:?}"),
+            snmp2::Value::Integer(i) => i.to_string(),
+            snmp2::Value::Counter32(n) | snmp2::Value::Unsigned32(n) | snmp2::Value::Timeticks(n) => {
+                n.to_string()
+            }
+            snmp2::Value::Counter64(n) => n.to_string(),
+            snmp2::Value::IpAddress(a) => {
+                format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3])
+            }
+            // A v3 device that authenticated but does not have the OID is a
+            // configuration answer, not a transport failure.
+            other => anyhow::bail!("SNMPv3 returned {other:?} for {oid}"),
+        });
+    }
+    anyhow::bail!("SNMPv3 response for {oid} had no values in it")
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -1178,6 +1366,28 @@ async fn scan_host(ip: IpAddr, ports: &[u16]) -> Option<DiscoveredHost> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The order matters more than the set, and pinning must not fall back.
+    #[test]
+    fn snmp_version_order() {
+        use pp_proto::SnmpVersion::*;
+
+        // The useful default: v3 where it is possible, v2c where it is not.
+        assert_eq!(snmp_attempts(Auto, true), vec![V3, V2c]);
+        assert_eq!(snmp_attempts(Auto, false), vec![V2c]);
+
+        // Pinned means pinned. A device that has had v1/v2c turned off and starts
+        // answering a community string again should read as unreachable rather
+        // than quietly working, which is the entire reason to pin.
+        assert_eq!(snmp_attempts(V3, true), vec![V3]);
+        assert_eq!(snmp_attempts(V2c, true), vec![V2c]);
+        assert_eq!(snmp_attempts(V1, true), vec![V1]);
+
+        // Pinning v3 without a user is a configuration error rather than a
+        // fallback: it is attempted and fails saying so, instead of silently
+        // becoming v2c.
+        assert_eq!(snmp_attempts(V3, false), vec![V3]);
+    }
 
     /// A NAS one point release behind should say so, and one that is current
     /// should not - including across a two-digit minor, where a string

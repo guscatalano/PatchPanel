@@ -490,10 +490,20 @@ async fn probe_once(target: String, kind: String, arg: Option<String>) -> Result
     use pp_proto::{DeviceSpec, Probe};
 
     let probe = match kind.as_str() {
+        // The one-shot check stays v2c: it exists so a typo in an address shows up
+        // here rather than as a red row in the portal, and a v3 credential set
+        // belongs in the manifest rather than on a command line where it lands in
+        // shell history.
         "snmp" => Probe::Snmp {
             community: arg.unwrap_or_else(|| "public".into()),
             oid: None,
             version_regex: None,
+            version: Default::default(),
+            user: None,
+            auth_password: None,
+            auth_protocol: Default::default(),
+            privacy_password: None,
+            privacy_cipher: Default::default(),
         },
         "http" => Probe::Http {
             url: if target.starts_with("http") {

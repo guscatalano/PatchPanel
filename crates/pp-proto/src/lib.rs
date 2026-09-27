@@ -11,7 +11,10 @@ use uuid::Uuid;
 pub mod devices;
 pub mod manifest;
 
-pub use devices::{DeviceReport, DeviceSpec, DiscoveredHost, DiscoveredService, DiscoveryScan, HaAutoUpdate, HostIdentity, OID_SYS_DESCR, Probe, Scanner};
+pub use devices::{DeviceReport, DeviceSpec, DiscoveredHost, DiscoveredService, DiscoveryScan, HaAutoUpdate, HostIdentity, OID_SYS_DESCR, Probe, Scanner,
+    SnmpAuth,
+    SnmpCipher,
+    SnmpVersion};
 pub use manifest::{
     AppSource, AppSpec, Ensure, Manifest, PatchPolicy, SourcePolicy, VersionCheck,
 };

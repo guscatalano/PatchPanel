@@ -82,12 +82,42 @@ pub enum Probe {
     },
     /// SNMP v2c GET. Defaults to sysDescr, which nearly every device answers.
     Snmp {
+        /// Community string for v1 and v2c. Ignored by v3, which authenticates a
+        /// user instead.
         #[serde(default = "default_community")]
         community: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         oid: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         version_regex: Option<String>,
+        /// Which version to speak, and in what order.
+        ///
+        /// `auto` is the default and the useful one: it tries v3 when a `user` is
+        /// configured and falls back to v2c, then reports which answered. The
+        /// fallback is ordered rather than a race, because a device quietly
+        /// answering v2c while the operator believes v3 is in force is exactly the
+        /// thing that should be visible - `detail` says which version replied.
+        #[serde(default)]
+        version: SnmpVersion,
+        /// v3 user. Its presence is what makes v3 possible at all; without it
+        /// `auto` goes straight to v2c.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user: Option<String>,
+        /// v3 authentication password, and the digest to derive its key with.
+        ///
+        /// Together these give authNoPriv: the request is signed, so the device
+        /// knows who asked, but the answer crosses the network in the clear.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_password: Option<String>,
+        #[serde(default)]
+        auth_protocol: SnmpAuth,
+        /// v3 privacy password and cipher, which add encryption on top of
+        /// authentication - authPriv. Omitting these leaves authNoPriv, which is
+        /// still a real improvement on a shared community string.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        privacy_password: Option<String>,
+        #[serde(default)]
+        privacy_cipher: SnmpCipher,
     },
     /// Ask an OPNsense firewall what its firmware status is.
     ///
@@ -188,6 +218,49 @@ pub enum HaAutoUpdate {
 
 fn default_check_hours() -> u32 {
     12
+}
+
+/// Which SNMP version a device is asked in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnmpVersion {
+    /// v3 first when a user is configured, then v2c. What almost everything
+    /// should use: it works against gear that has not been migrated yet, and says
+    /// which version actually answered.
+    #[default]
+    Auto,
+    /// Only v3. Use once v1/v2c has been turned off on the device, so that a
+    /// device silently falling back to a community string is reported as
+    /// unreachable rather than quietly working.
+    V3,
+    V2c,
+    V1,
+}
+
+/// The digest a v3 authentication key is derived with. Must match the device.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnmpAuth {
+    /// The default because it is what almost all current gear is configured with,
+    /// MD5 being long deprecated for this.
+    #[default]
+    Sha1,
+    Md5,
+    Sha224,
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+/// The cipher for v3 privacy. Must match the device.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnmpCipher {
+    #[default]
+    Aes128,
+    Aes192,
+    Aes256,
+    Des,
 }
 
 fn default_community() -> String {
