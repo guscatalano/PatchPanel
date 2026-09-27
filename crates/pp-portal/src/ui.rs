@@ -272,6 +272,38 @@ const INDEX: &str = r##"<!doctype html>
   .feed .m { color: var(--ink); white-space: pre-wrap; word-break: break-word; }
   .feed .row.warn .m { color: var(--warn); }
   .feed .row.err .m { color: var(--bad); }
+
+  /* A new line rises into place instead of appearing. Short, and only on the
+     lines that actually just arrived - see drawLive, which also declines to
+     animate a burst, because two hundred rows sliding at once is noise rather
+     than motion and costs a layout pass per frame to produce it. */
+  @keyframes live-in {
+    from { opacity: 0; transform: translateY(7px); }
+    to   { opacity: 1; transform: none; }
+  }
+  .feed .row.fresh { animation: live-in 220ms cubic-bezier(.2,.7,.3,1) both; }
+  /* Somebody who has asked for less movement is reading a log, of all things,
+     precisely to find something - so this one is not decoration to insist on. */
+  @media (prefers-reduced-motion: reduce) {
+    .feed .row.fresh { animation: none; }
+  }
+
+  /* Full screen. The feed takes whatever is left after the heading and controls,
+     rather than keeping its fixed height and leaving the rest of the screen
+     empty, which is the whole reason to ask for full screen. */
+  #live-card:fullscreen {
+    display: flex; flex-direction: column;
+    background: var(--panel); border-radius: 0; margin: 0;
+    max-height: 100vh; overflow: hidden;
+  }
+  #live-card:fullscreen #live-blurb { display: none; }
+  #live-card:fullscreen .feed {
+    flex: 1 1 auto; height: auto; min-height: 0;
+    border-radius: 0; border-left: 0; border-right: 0; margin: 0;
+  }
+  /* A hair larger, since the point of filling the screen is to read it from
+     further away than a card in a page. */
+  #live-card:fullscreen .feed .row { font-size: 12.5px; padding: 2px 12px; }
   td.svc div { overflow: hidden; text-overflow: ellipsis; }
   /* Most machines have security updates, so a pill there discriminates
      nothing - the shape is identical down the column. Colour on the numeral
@@ -640,12 +672,15 @@ const INDEX: &str = r##"<!doctype html>
         <div class="empty" id="log-empty" hidden></div>
       </div>
 
-      <div class="card">
+      <div class="card" id="live-card">
         <h2>Live
           <span class="sub" id="live-state"></span>
-          <button class="act" id="live-toggle" style="float:right;padding:2px 8px;font-size:11.5px"
+          <button class="act" id="live-full" style="float:right;padding:2px 8px;font-size:11.5px"
+            onclick="fullLive()"
+            title="Fill the screen with the feed. Escape comes back.">Full screen</button>
+          <button class="act" id="live-toggle" style="float:right;padding:2px 8px;font-size:11.5px;margin-right:6px"
             onclick="toggleLive()">Start</button></h2>
-        <div class="step">
+        <div class="step" id="live-blurb">
           <div class="msg">Everything arriving from every sender at once, newest at the
             bottom. Scroll up to hold it still; scroll back to the bottom to follow
             again. This is a window on the last few thousand lines, not the archive
@@ -4673,6 +4708,8 @@ const LIVE_MAX = 800;
 // laying out seven hundred rows in order to throw away six hundred of them is
 // the expensive way to display nothing.
 const LIVE_BATCH = 200;
+// Above this many new lines in one poll, they simply appear. See drawLive.
+const LIVE_ANIMATE = 40;
 
 function toggleLive() {
   LIVE_ON = !LIVE_ON;
@@ -4758,8 +4795,9 @@ function liveFilter() {
   };
 }
 
-function liveRow(l) {
-  const cls = l.severity <= 3 ? " err" : l.severity <= 4 ? " warn" : "";
+function liveRow(l, fresh) {
+  const cls = (l.severity <= 3 ? " err" : l.severity <= 4 ? " warn" : "")
+    + (fresh ? " fresh" : "");
   const t = new Date(l.at);
   const hh = String(t.getHours()).padStart(2, "0");
   const mm = String(t.getMinutes()).padStart(2, "0");
@@ -4783,7 +4821,11 @@ function drawLive(added) {
     let batch = added.filter(shown);
     if (batch.length > LIVE_BATCH) batch = batch.slice(-LIVE_BATCH);
     if (batch.length) {
-      feed.insertAdjacentHTML("beforeend", batch.map(liveRow).join(""));
+      // Animate a handful of new lines; do not animate a flood. A burst of two
+      // hundred all sliding at once reads as a flicker, and paying for the
+      // layout of every one of them is what made this card slow before.
+      const fresh = batch.length <= LIVE_ANIMATE;
+      feed.insertAdjacentHTML("beforeend", batch.map((l) => liveRow(l, fresh)).join(""));
       appended = true;
       // One splice rather than a removeChild per line: at three hundred lines a
       // second the loop itself became the cost.
@@ -4847,6 +4889,40 @@ function liveScrolled() {
     liveState();
   }
 }
+
+// Fill the screen with the feed, and come back out.
+//
+// The native Fullscreen API rather than a fixed-position class, so Escape works,
+// the browser's own chrome goes away, and nothing here has to guess at a z-index
+// that beats everything else on the page. Where it is unavailable or refused -
+// some browsers only grant it inside a user gesture, and an iframe may not have
+// the permission at all - the card stays where it is and says so, which is better
+// than half-applying a layout nobody can get out of.
+async function fullLive() {
+  const card = $("live-card");
+  try {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen();
+    } else {
+      await card.requestFullscreen();
+    }
+  } catch (e) {
+    liveState("this browser would not give the feed the whole screen");
+  }
+}
+
+// Escape leaves full screen without going through the button, so the label and
+// the scroll position are corrected from the event rather than from the click.
+document.addEventListener("fullscreenchange", () => {
+  const on = document.fullscreenElement === $("live-card");
+  $("live-full").textContent = on ? "Leave full screen" : "Full screen";
+  // The visible height just changed, so the bottom is somewhere else now.
+  const feed = $("live-feed");
+  if (!LIVE_HELD) feed.scrollTop = feed.scrollHeight;
+  // Focused on the way in, so PageUp and the arrow keys work against the feed
+  // without having to click it first - there is nothing else on screen to click.
+  if (on) feed.focus();
+});
 
 // Back to following, for a reader who would rather press something than scroll
 // several hundred lines.
