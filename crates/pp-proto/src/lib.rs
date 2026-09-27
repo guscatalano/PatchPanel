@@ -574,7 +574,26 @@ pub enum Command {
         only: Vec<String>,
     },
     /// Sweep the configured CIDRs for undeclared devices.
-    Discover,
+    Discover {
+        /// Addresses the portal already accounts for, which are swept without
+        /// asking SSH to identify itself.
+        ///
+        /// Version detection completes a TCP connection and reads the banner
+        /// without authenticating, and OpenSSH 9.8 and later count that as an
+        /// abuse signal: `srclimit_penalise ... connections without attempting
+        /// authentication`. An hourly sweep was steadily accruing penalties for
+        /// the portal's own address on this fleet's NAS and its controller, which
+        /// escalate and would eventually refuse it. For a machine running an agent
+        /// or a declared appliance the banner buys nothing - the agent reports its
+        /// own version, and the appliance is probed over its API - so the polite
+        /// thing and the useful thing agree.
+        ///
+        /// Only the portal knows the whole fleet, so the list arrives with the
+        /// command. Empty means "sweep everything the usual way", which is what an
+        /// older portal sends.
+        #[serde(default)]
+        light: Vec<String>,
+    },
 
     /// Count what the journal holds at each severity, without forwarding any of
     /// it.

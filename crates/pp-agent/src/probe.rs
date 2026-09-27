@@ -1008,10 +1008,14 @@ fn truncate(s: &str, n: usize) -> String {
 
 /// Sweep the configured ranges for devices nobody has declared, so the fleet
 /// view includes the things people forgot to write down.
-pub async fn discover(scans: &[DiscoveryScan], known: &[DeviceSpec]) -> Vec<DiscoveredHost> {
+pub async fn discover(
+    scans: &[DiscoveryScan],
+    known: &[DeviceSpec],
+    light: &[String],
+) -> Vec<DiscoveredHost> {
     let mut out = Vec::new();
     for scan in scans {
-        match run_scan(scan, known).await {
+        match run_scan(scan, known, light).await {
             Ok(hosts) => out.extend(hosts),
             Err(e) => tracing::warn!(cidr = %scan.cidr, error = %e, "discovery sweep failed"),
         }
@@ -1026,7 +1030,11 @@ pub async fn discover(scans: &[DiscoveryScan], known: &[DeviceSpec]) -> Vec<Disc
 /// question, so every row it produces carries why. The alternative is a Network
 /// tab where "no services identified" and "nothing was looking" render
 /// identically.
-async fn run_scan(scan: &DiscoveryScan, known: &[DeviceSpec]) -> Result<Vec<DiscoveredHost>> {
+async fn run_scan(
+    scan: &DiscoveryScan,
+    known: &[DeviceSpec],
+    light: &[String],
+) -> Result<Vec<DiscoveredHost>> {
     let hosts = range(&scan.cidr)?;
 
     let mut note = String::new();
@@ -1046,7 +1054,7 @@ async fn run_scan(scan: &DiscoveryScan, known: &[DeviceSpec]) -> Result<Vec<Disc
                 ),
             }
         }
-        match crate::nmap::sweep(scan).await {
+        match crate::nmap::sweep(scan, light).await {
             Ok(found) => found,
             Err(e) => {
                 tracing::warn!(

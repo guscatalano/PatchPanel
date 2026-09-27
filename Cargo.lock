@@ -1698,7 +1698,7 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "pp-agent"
-version = "0.5.74"
+version = "0.5.76"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1726,7 +1726,7 @@ dependencies = [
 
 [[package]]
 name = "pp-mcp"
-version = "0.5.74"
+version = "0.5.76"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1739,7 +1739,7 @@ dependencies = [
 
 [[package]]
 name = "pp-portal"
-version = "0.5.74"
+version = "0.5.76"
 dependencies = [
  "anyhow",
  "axum",
@@ -1768,7 +1768,7 @@ dependencies = [
 
 [[package]]
 name = "pp-proto"
-version = "0.5.74"
+version = "0.5.76"
 dependencies = [
  "anyhow",
  "chrono",

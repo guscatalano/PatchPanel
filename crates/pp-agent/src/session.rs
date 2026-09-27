@@ -101,6 +101,13 @@ struct Ctx {
     /// finds a pool that is entirely gone; only a real run finds the four
     /// files out of a hundred that are missing, so keep what it learned.
     unfetchable: Arc<RwLock<Vec<String>>>,
+    /// Addresses the portal accounts for, as of the last sweep it asked for.
+    ///
+    /// Cached because the scheduled sweep has no portal conversation to draw it
+    /// from, and lost on reconnect like anything else held here - which is
+    /// harmless: a sweep with a stale or empty list is a politeness missed, not a
+    /// wrong answer, and the next dispatched sweep refreshes it.
+    light: Arc<RwLock<Vec<String>>>,
     /// Set while a discovery sweep is running, so a second cannot start.
     ///
     /// The scheduled sweep and the Scan now button are separate tasks calling the
@@ -312,6 +319,7 @@ async fn session(
     let forward_severity: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
     let ctx = Ctx {
+        light: Arc::new(RwLock::new(Vec::new())),
         sweeping: Arc::new(AtomicBool::new(false)),
         forward_logs: forward_logs.clone(),
         forward_severity: forward_severity.clone(),
@@ -725,8 +733,31 @@ async fn sweep(ctx: &Ctx, scans: &[pp_proto::DiscoveryScan], p: &Progress) -> Re
     let _guard = Sweeping(ctx.sweeping.clone());
 
     let known = ctx.manifest.read().await.devices.clone();
-    p.line(&format!("sweeping {} range(s)", scans.len()));
-    let found = probe::discover(scans, &known).await;
+    // What the portal last told us it accounts for, plus the appliances this
+    // agent can see for itself in the manifest. The union matters: the manifest
+    // covers declared devices without any portal help - which is what stopped the
+    // penalties accruing on this fleet's NAS - while only the portal can name the
+    // other machines running agents.
+    let light = {
+        let mut set: Vec<String> = ctx.light.read().await.clone();
+        for d in &known {
+            let host = d.target.split(':').next().unwrap_or(&d.target).to_string();
+            if !host.is_empty() && !set.contains(&host) {
+                set.push(host);
+            }
+        }
+        set
+    };
+    p.line(&format!(
+        "sweeping {} range(s){}",
+        scans.len(),
+        if light.is_empty() {
+            String::new()
+        } else {
+            format!(", {} known address(es) without an SSH banner grab", light.len())
+        }
+    ));
+    let found = probe::discover(scans, &known, &light).await;
     let unmanaged = found.iter().filter(|h| h.unmanaged).count();
     let identified = found
         .iter()
@@ -1456,10 +1487,14 @@ async fn execute(cmd: Command, ctx: &Ctx, p: &Progress) -> Result<String> {
             Ok(format!("forwarding journal lines at {sev} and worse"))
         }
 
-        Command::Discover => {
+        Command::Discover { light } => {
             let scans = discovery_scans(ctx).await;
             if scans.is_empty() {
                 anyhow::bail!("no discovery ranges configured for site `{}`", ctx.cfg.site);
+            }
+            // Kept for the scheduled sweeps, which have nobody to ask.
+            if !light.is_empty() {
+                *ctx.light.write().await = light.clone();
             }
             sweep(ctx, &scans, p).await
         }

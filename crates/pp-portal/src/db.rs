@@ -1966,7 +1966,7 @@ pub fn command_kind(cmd: &Command) -> &'static str {
         Command::SelfUpdate { .. } => "self_update",
         Command::Reboot { .. } => "reboot",
         Command::ProbeDevices { .. } => "probe_devices",
-        Command::Discover => "discover",
+        Command::Discover { .. } => "discover",
         // On and off are different actions in a history: "who turned this off"
         // is a question somebody eventually asks.
         Command::JournalVolume => "journal_volume",

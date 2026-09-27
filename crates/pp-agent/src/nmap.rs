@@ -116,79 +116,158 @@ const MAX_SCRIPTS: usize = 6;
 ///
 /// The range is expected to have been size-checked by the caller: nmap will
 /// cheerfully accept a /8 and spend a week on it.
-pub async fn sweep(scan: &DiscoveryScan) -> Result<Vec<DiscoveredHost>> {
+pub async fn sweep(scan: &DiscoveryScan, light: &[String]) -> Result<Vec<DiscoveredHost>> {
+    // Two passes when there is anything to be gentle with: the full treatment on
+    // everything unaccounted for, and a quieter one on the addresses the portal
+    // already knows.
+    //
+    // Two invocations rather than one, because nmap's port list is global to a run
+    // and there is no way to say "these ports for those hosts". The second pass is
+    // cheap - a handful of hosts, no OS detection, no scripts - and skipping it
+    // entirely would cost the Network tab the open ports of every machine in the
+    // fleet, which is the one thing that would notice one of them exposing
+    // something it should not.
+    if light.is_empty() {
+        return one_pass(scan, &[], true).await;
+    }
+    let mut hosts = one_pass(scan, light, true).await?;
+    match one_pass(scan, &[], false).await {
+        Ok(known) => hosts.extend(known),
+        // The accounted hosts are the ones we already know most about, so losing
+        // this pass is a thin row rather than a blind spot. The unaccounted hosts
+        // are the point of the sweep and they are already in hand.
+        Err(e) => tracing::warn!(error = %format!("{e:#}"), "the light pass over known hosts failed"),
+    }
+    Ok(hosts)
+}
+
+/// One nmap invocation.
+///
+/// `exclude` is skipped entirely. `full` asks for OS detection, scripts and
+/// version detection on every port; without it the run is version detection only,
+/// and port 22 is dropped from the list - see `Command::Discover::light`.
+/// The arguments for one nmap invocation.
+///
+/// Separated from running it because every mistake this file has shipped was an
+/// argument mistake: a port form nmap refused outright, a script name it did not
+/// have, a timing flag that silently discarded hosts. None of those were reachable
+/// from a test while the list was assembled inside the function that spawns the
+/// process. An empty result means this pass has nothing to scan.
+fn plan(scan: &DiscoveryScan, exclude: &[String], full: bool) -> Vec<String> {
     let list = |ps: &[u16]| {
         ps.iter()
             .map(u16::to_string)
             .collect::<Vec<_>>()
             .join(",")
     };
-    // A bare list when only TCP is wanted, and the `T:`/`U:` form only when both
-    // are. The prefixed form obliges nmap to be told the TCP scan type
-    // explicitly - without one it refuses the whole scan - so the plain list is
-    // both simpler and one less thing to get wrong in the common case.
-    let ports = if scan.udp_ports.is_empty() {
-        list(&scan.ports)
+
+    // SSH is dropped from the quiet pass, and only from that pass: a banner grab on
+    // port 22 is the thing OpenSSH penalises, and it is the whole reason the quiet
+    // pass exists.
+    let tcp: Vec<u16> = if full {
+        scan.ports.clone()
     } else {
-        format!("T:{},U:{}", list(&scan.ports), list(&scan.udp_ports))
+        scan.ports.iter().copied().filter(|p| *p != 22).collect()
+    };
+    if tcp.is_empty() && scan.udp_ports.is_empty() {
+        return Vec::new();
+    }
+    // A bare list when only TCP is wanted, and the `T:`/`U:` form only when both
+    // are. The prefixed form obliges nmap to be told the TCP scan type explicitly -
+    // without one it refuses the whole scan - so the plain list is both simpler and
+    // one less thing to get wrong in the common case.
+    let ports = if scan.udp_ports.is_empty() {
+        list(&tcp)
+    } else if tcp.is_empty() {
+        format!("U:{}", list(&scan.udp_ports))
+    } else {
+        format!("T:{},U:{}", list(&tcp), list(&scan.udp_ports))
     };
 
-    // `-Pn` because half the point of this is embedded hardware, and a device
-    // that drops ICMP but answers on 502 is exactly the one nobody wrote down.
-    let mut args: Vec<&str> = vec![
-        "-oX", "-",
-        "-Pn",
-        "--open",
-        "-sV",
-        "--version-light",
-        // OS fingerprinting needs raw sockets, and the agent runs as root on
-        // Linux, so it is available here. It costs time and returns a guess
-        // rather than a fact, which is why the accuracy is carried alongside
-        // the name everywhere it is shown.
-        "-O",
-        // Report the best matches it has rather than refusing to answer. The
-        // accuracy travels with the result, so a weak guess is visible as one -
-        // whereas without this a host that is merely unusual gets nothing at
-        // all, which reads as "nothing to see".
-        "--osscan-guess",
-    ];
-    args.extend_from_slice(POLITE);
+    // `-Pn` because half the point of this is embedded hardware, and a device that
+    // drops ICMP but answers on 502 is exactly the one nobody wrote down.
+    //
+    // Reverse DNS is left on. It used to be disabled with `-n` on the grounds that
+    // 254 PTR lookups are the slowest part of a scan, which was a fair trade when
+    // nothing displayed a name - but a PTR record is somebody having already
+    // written down what a machine is, and that is the cheapest identification on
+    // offer. nmap resolves only the hosts that answered, in parallel.
+    let mut args: Vec<String> = ["-oX", "-", "-Pn", "--open", "-sV", "--version-light"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
 
-    // Reverse DNS is left on. It used to be disabled with `-n` on the grounds
-    // that 254 PTR lookups are the slowest part of a scan, which was a fair
-    // trade when nothing displayed a name - but a PTR record is somebody having
-    // already written down what a machine is, and that is the single cheapest
-    // identification on offer. nmap resolves only the hosts that answered, in
-    // parallel, so the cost is a fraction of what refusing it implied.
+    if full {
+        // OS fingerprinting needs raw sockets, and the agent runs as root on Linux.
+        // It costs time and returns a guess rather than a fact, which is why the
+        // accuracy is carried alongside the name everywhere it is shown.
+        // `--osscan-guess` reports the best matches it has rather than refusing to
+        // answer: without it a host that is merely unusual gets nothing at all,
+        // which reads as "nothing to see".
+        args.push("-O".into());
+        args.push("--osscan-guess".into());
+    }
+    args.extend(POLITE.iter().map(|s| s.to_string()));
+
+    // Only the addresses that fall inside this range. The portal sends every
+    // address it accounts for, which includes each machine's docker bridges and
+    // VPN endpoints - real addresses of ours, just not on the network being swept.
+    // nmap ignores an exclusion it never meets, so this is about the command
+    // staying readable and the list staying bounded rather than correctness: it
+    // grows by one entry per container bridge otherwise.
+    let here: Vec<&String> = match scan.cidr.parse::<ipnet::IpNet>() {
+        Ok(net) => exclude
+            .iter()
+            .filter(|a| {
+                a.parse::<std::net::IpAddr>()
+                    .map(|ip| net.contains(&ip))
+                    .unwrap_or(false)
+            })
+            .collect(),
+        // An unparseable CIDR is the caller's problem and `range` will say so;
+        // excluding everything offered is the safe reading here.
+        Err(_) => exclude.iter().collect(),
+    };
+    if !here.is_empty() {
+        args.push("--exclude".into());
+        args.push(here.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(","));
+    }
 
     if !scan.udp_ports.is_empty() {
-        // A UDP scan has no handshake to be refused by, so a silent port is
-        // indistinguishable from a dropped packet and nmap waits out a timeout
-        // on each. One retry instead of the default keeps a sweep that now runs
-        // on a timer from overrunning its window; a missed UDP port is a row
-        // that says less, while an overrunning scan is no rows at all.
         // `-sS` because the `T:`/`U:` port form requires the TCP scan type to be
-        // named rather than defaulted. A SYN scan needs raw sockets, which is
-        // the same privilege `-O` above already relies on.
-        args.push("-sS");
-        args.push("-sU");
+        // named rather than defaulted. A SYN scan needs raw sockets, the same
+        // privilege `-O` relies on.
+        args.push("-sS".into());
+        args.push("-sU".into());
     }
 
-    // A named set, not nmap's `-sC` category: these are the scripts that put a
-    // name to hardware with no readable version banner, and none of them probes
-    // for weaknesses or tries credentials, which has no place in an inventory
-    // sweep that runs unattended twice an hour.
-    if scan.use_scripts {
-        args.push("--script");
-        args.push(SCRIPTS);
+    // A named set, not nmap's `-sC` category: these put a name to hardware with no
+    // readable version banner, and none of them probes for weaknesses or tries
+    // credentials, which has no place in a sweep that runs unattended.
+    if scan.use_scripts && full {
+        args.push("--script".into());
+        args.push(SCRIPTS.into());
     }
 
-    args.push("-p");
-    args.push(&ports);
-    args.push(&scan.cidr);
+    args.push("-p".into());
+    args.push(ports);
+    args.push(scan.cidr.clone());
+    args
+}
+
+async fn one_pass(
+    scan: &DiscoveryScan,
+    exclude: &[String],
+    full: bool,
+) -> Result<Vec<DiscoveredHost>> {
+    let args = plan(scan, exclude, full);
+    // Nothing to ask for - every port was filtered out of this pass.
+    if args.is_empty() {
+        return Ok(Vec::new());
+    }
 
     let run = Command::new("nmap")
-        .args(args)
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -822,6 +901,65 @@ mod tests {
         // Anything that is neither is dropped rather than filed under a
         // protocol it does not belong to.
         assert_eq!(hosts[0].services.len(), 2);
+    }
+
+    /// The quiet pass must not ask SSH to identify itself, and must still ask
+    /// everything else.
+    ///
+    /// Dropping 22 outright, or skipping the pass, would each be wrong in a way
+    /// that is invisible: the first loses the open-port list for every machine in
+    /// the fleet, and the second silently stops reporting them at all.
+    #[test]
+    fn the_quiet_pass_drops_only_ssh() {
+        let scan = DiscoveryScan {
+            cidr: "192.168.6.0/24".into(),
+            ports: vec![22, 80, 443, 8006],
+            udp_ports: vec![],
+            site: String::new(),
+            use_nmap: true,
+            use_scripts: true,
+        };
+
+        let full = plan(&scan, &[], true);
+        assert!(full.contains(&"22,80,443,8006".to_string()), "{full:?}");
+        assert!(full.contains(&"-O".to_string()));
+        assert!(full.contains(&"--script".to_string()));
+
+        let quiet = plan(&scan, &[], false);
+        assert!(quiet.contains(&"80,443,8006".to_string()), "{quiet:?}");
+        // Still a version scan - a controller's web port is worth naming.
+        assert!(quiet.contains(&"-sV".to_string()));
+        // But not fingerprinting or scripting something we already have an agent
+        // on or an API for.
+        assert!(!quiet.contains(&"-O".to_string()));
+        assert!(!quiet.contains(&"--script".to_string()));
+    }
+
+    /// The addresses handed over are excluded from the full pass, so a host is
+    /// swept by exactly one of the two.
+    #[test]
+    fn known_addresses_are_excluded_from_the_full_pass() {
+        let scan = DiscoveryScan {
+            cidr: "192.168.6.0/24".into(),
+            ports: vec![22, 80],
+            udp_ports: vec![],
+            site: String::new(),
+            use_nmap: true,
+            use_scripts: false,
+        };
+        // The third is a docker bridge on one of our own machines: a real address
+        // of ours, on a network this sweep never touches, and it should not appear
+        // in the command.
+        let light = vec![
+            "192.168.6.43".to_string(),
+            "192.168.6.66".to_string(),
+            "172.17.0.1".to_string(),
+        ];
+        let full = plan(&scan, &light, true);
+        let at = full.iter().position(|a| a == "--exclude").expect("--exclude");
+        assert_eq!(full[at + 1], "192.168.6.43,192.168.6.66");
+        // And the quiet pass excludes nothing, or it would sweep no one.
+        assert!(!plan(&scan, &[], false).contains(&"--exclude".to_string()));
     }
 
     /// A printer names itself in an HTTP title and an SNMP description and

@@ -1552,6 +1552,42 @@ struct Known {
     via: &'static str,
 }
 
+/// The addresses a sweep should not ask SSH to identify itself on.
+///
+/// Anything this portal already accounts for. Version detection completes a TCP
+/// connection and reads the banner without authenticating, and OpenSSH 9.8+ counts
+/// that as an abuse signal - an hourly sweep was steadily accruing penalties for
+/// the portal's own address on this fleet's NAS and its controller. For a machine
+/// with an agent or a declared appliance the banner buys nothing anyway.
+fn light_addresses(state: &SharedState) -> Vec<String> {
+    let Ok(devices) = collect_devices(state) else {
+        return Vec::new();
+    };
+    let Ok(rows) = state.db.agents() else {
+        return Vec::new();
+    };
+    let (by_ip, _) = accounted_for(&devices, rows.iter());
+    // Only literal addresses: this becomes nmap's `--exclude`, and a name that
+    // does not resolve on the collector would take the whole pass down with it.
+    let mut out: Vec<String> = by_ip
+        .keys()
+        .filter(|a| a.parse::<std::net::IpAddr>().is_ok())
+        .cloned()
+        .collect();
+    out.sort();
+    out
+}
+
+/// Fill in a Discover command's `light` list, leaving anything else untouched.
+fn with_light(state: &SharedState, cmd: &Command) -> Command {
+    match cmd {
+        Command::Discover { .. } => Command::Discover {
+            light: light_addresses(state),
+        },
+        other => other.clone(),
+    }
+}
+
 /// Every address this portal can account for, and what accounts for it.
 ///
 /// The sweeping agent only knows the manifest devices it was handed, so it
@@ -2128,7 +2164,7 @@ async fn broadcast(
     // `homelab`" - twelve recorded failures every time somebody pressed Scan
     // now, for a sweep that worked. A command that cannot apply to an agent is
     // not dispatched to it rather than dispatched and failed.
-    let sweep_sites: Option<Vec<String>> = if matches!(req.command, Command::Discover) {
+    let sweep_sites: Option<Vec<String>> = if matches!(req.command, Command::Discover { .. }) {
         let m = state.db.manifest()?;
         Some(m.discovery.iter().map(|d| d.site.clone()).collect())
     } else {
@@ -2158,16 +2194,17 @@ async fn broadcast(
 
     // One id across the fan-out would collide in the command log, so each
     // target gets its own.
+    let command = with_light(&state, &req.command);
     let mut dispatched = 0;
     let mut first = None;
     for id in targets {
         let cmd_id = Uuid::new_v4();
-        state.db.record_command(cmd_id, id, &req.command, "manual")?;
+        state.db.record_command(cmd_id, id, &command, "manual")?;
         if state.hub.send(
             id,
             ServerMsg::Command(CommandEnvelope {
                 id: cmd_id,
-                command: req.command.clone(),
+                command: command.clone(),
             }),
         ) {
             dispatched += 1;
