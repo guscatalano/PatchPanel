@@ -273,15 +273,17 @@ const INDEX: &str = r##"<!doctype html>
   .feed .row.warn .m { color: var(--warn); }
   .feed .row.err .m { color: var(--bad); }
 
-  /* A new line rises into place instead of appearing. Short, and only on the
+/* A new line fades up as it arrives. Only a fade: the scroll itself now carries
+     the movement (glideToBottom), and a row lifting while the viewport slides the
+     other way is two motions competing to describe one event. Applied only to the
      lines that actually just arrived - see drawLive, which also declines to
-     animate a burst, because two hundred rows sliding at once is noise rather
-     than motion and costs a layout pass per frame to produce it. */
+     animate a burst, because two hundred rows at once is a flicker rather than
+     motion and costs a layout pass per frame to produce it. */
   @keyframes live-in {
-    from { opacity: 0; transform: translateY(7px); }
-    to   { opacity: 1; transform: none; }
+    from { opacity: 0; }
+    to   { opacity: 1; }
   }
-  .feed .row.fresh { animation: live-in 220ms cubic-bezier(.2,.7,.3,1) both; }
+  .feed .row.fresh { animation: live-in 260ms ease-out both; }
   /* Somebody who has asked for less movement is reading a log, of all things,
      precisely to find something - so this one is not decoration to insist on. */
   @media (prefers-reduced-motion: reduce) {
@@ -4694,6 +4696,12 @@ let LIVE_HELD = false;
 // respects.
 let LIVE_STOPPED = false;
 
+// Whether the reader has asked for less movement. Read once: it is consulted on
+// every batch, and a media query lookup per poll is work for an answer that
+// almost never changes.
+const REDUCED_MOTION = typeof matchMedia === "function"
+  && matchMedia("(prefers-reduced-motion: reduce)").matches;
+
 // What this window keeps.
 //
 // Far smaller than the portal's ring on purpose. Every line is five elements
@@ -4843,7 +4851,7 @@ function drawLive(added) {
   liveCount();
   // Only when something moved. Reading scrollHeight forces layout, and doing it
   // on every poll of an idle feed is a measurable cost for no effect.
-  if (appended && !LIVE_HELD) feed.scrollTop = feed.scrollHeight;
+  if (appended && !LIVE_HELD) glideToBottom();
 }
 
 // The cheap part of a redraw, safe to call on a poll that changed nothing.
@@ -4872,8 +4880,80 @@ function liveCount() {
 // A scroll therefore only counts when a gesture went with it.
 let LIVE_GESTURE = 0;
 
+// Generation counter, and whether a glide is running.
+//
+// A glide sets scrollTop many times, and each of those is reported as a scroll -
+// indistinguishable, at the event, from the reader dragging the bar. So scrolls
+// are ignored while one is in flight, and anything that moves the feed on purpose
+// cancels the glide first, so the reader's own scrolling is never what gets
+// ignored. Declared above their first use rather than below it, which is a
+// mistake this file has already shipped once.
+let LIVE_GLIDE = 0;
+let LIVE_GLIDING = false;
+
+// Abandon a glide in flight. The generation bump is what stops the pending frame:
+// it checks whether it is still the current one before touching anything.
+function cancelGlide() {
+  LIVE_GLIDE += 1;
+  LIVE_GLIDING = false;
+}
+
 function liveGesture() {
   LIVE_GESTURE = Date.now();
+  // The reader has taken hold of it, so stop moving it under them.
+  cancelGlide();
+}
+
+// How far a glide will travel before it gives up and jumps, in pixels.
+//
+// Gliding across a burst of two hundred lines either takes long enough that the
+// next batch has already landed, or moves fast enough to be a blur - neither of
+// which is smoother than simply being there. Roughly two screens.
+const LIVE_GLIDE_MAX = 900;
+
+/// Ease the feed down to the bottom instead of snapping to it.
+///
+/// The jump this replaces was not the rows appearing - they already faded in - but
+/// the viewport moving the whole way in a single frame the moment they were
+/// appended. Holding the old position and then covering the distance over a few
+/// frames is what makes existing lines rise and new ones come up from below,
+/// which is what reading a tail is supposed to look like.
+function glideToBottom() {
+  const feed = $("live-feed");
+  const to = feed.scrollHeight - feed.clientHeight;
+  const from = feed.scrollTop;
+  const dist = to - from;
+
+  const settle = () => {
+    feed.scrollTop = to;
+    LIVE_GLIDING = false;
+  };
+  // Nothing to do, too far to be worth watching, or movement was declined.
+  if (dist <= 1 || dist > LIVE_GLIDE_MAX || REDUCED_MOTION) {
+    settle();
+    return;
+  }
+
+  // Long enough to read as movement, short enough to finish before the next
+  // poll, and proportional in between so one new line is not as slow as thirty.
+  const ms = Math.max(140, Math.min(380, dist * 1.6));
+  const mine = ++LIVE_GLIDE;
+  const started = performance.now();
+  LIVE_GLIDING = true;
+
+  const step = (now) => {
+    // A newer glide, or a gesture, has taken over.
+    if (mine !== LIVE_GLIDE) return;
+    const t = Math.min(1, (now - started) / ms);
+    // Ease out: quick to start moving, unhurried as it arrives.
+    feed.scrollTop = from + dist * (1 - Math.pow(1 - t, 3));
+    if (t < 1) {
+      requestAnimationFrame(step);
+    } else {
+      settle();
+    }
+  };
+  requestAnimationFrame(step);
 }
 
 // Following is a position, not a mode: if the reader is at the bottom we follow,
@@ -4881,6 +4961,8 @@ function liveGesture() {
 // actually is means there is no separate state to get out of step with what they
 // can see.
 function liveScrolled() {
+  // Our own movement, not theirs.
+  if (LIVE_GLIDING) return;
   if (Date.now() - LIVE_GESTURE > 1500) return;
   const feed = $("live-feed");
   const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 24;
@@ -4916,7 +4998,9 @@ async function fullLive() {
 document.addEventListener("fullscreenchange", () => {
   const on = document.fullscreenElement === $("live-card");
   $("live-full").textContent = on ? "Leave full screen" : "Full screen";
-  // The visible height just changed, so the bottom is somewhere else now.
+  // The visible height just changed, so the bottom is somewhere else now, and any
+  // glide still in flight is heading for the old one.
+  cancelGlide();
   const feed = $("live-feed");
   if (!LIVE_HELD) feed.scrollTop = feed.scrollHeight;
   // Focused on the way in, so PageUp and the arrow keys work against the feed
@@ -4928,6 +5012,9 @@ document.addEventListener("fullscreenchange", () => {
 // several hundred lines.
 function followLive() {
   LIVE_HELD = false;
+  // Asked for explicitly, so it goes there now rather than easing - from several
+  // hundred lines up, a glide would be a long wait for something already decided.
+  cancelGlide();
   const feed = $("live-feed");
   feed.scrollTop = feed.scrollHeight;
   liveState();
