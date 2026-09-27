@@ -258,18 +258,32 @@ const INDEX: &str = r##"<!doctype html>
   /* Fixed height, own scrollbar: the feed must not make the page grow without
      bound as lines arrive, and following the tail means scrolling this and not
      the document. */
-  .feed { height: 420px; overflow-y: auto; overflow-x: auto; margin: 0 14px 14px;
+  /* `overflow-x: hidden`, not auto: a single long line - a firewall's filterlog
+     entries are hundreds of characters - brings a horizontal scrollbar into
+     existence, which takes about fifteen pixels off the visible height and shifts
+     every line on screen. That is a second, smaller jump, and it fires whenever
+     the widest line changes. Long messages wrap instead, which is what somebody
+     reading a log wants anyway. */
+  .feed { height: 420px; overflow-y: auto; overflow-x: hidden; margin: 0 14px 14px;
     border: 1px solid var(--line); border-radius: 6px; background: var(--bg);
     font-family: var(--mono); font-size: 12px; line-height: 1.5; }
-  .feed .row { display: flex; gap: 8px; padding: 1px 8px; white-space: pre;
+  /* The row wraps; the message inside it keeps its own spacing. `pre` on the row
+     would stop it wrapping at all and put the scrollbar back. */
+  .feed .row { display: flex; gap: 8px; padding: 1px 8px; align-items: flex-start;
     border-bottom: 1px solid color-mix(in srgb, var(--line) 35%, transparent); }
   .feed .row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
-  .feed .t { color: var(--muted); }
+  .feed .t { color: var(--muted); white-space: nowrap; }
   /* One column so machine names line up and the eye can run down them, which is
      the whole point of a merged feed. */
-  .feed .w { color: var(--accent); min-width: 110px; }
-  .feed .g { color: var(--muted); min-width: 70px; }
-  .feed .m { color: var(--ink); white-space: pre-wrap; word-break: break-word; }
+  .feed .w { color: var(--accent); min-width: 110px; flex: 0 0 auto;
+    white-space: nowrap; }
+  .feed .g { color: var(--muted); min-width: 70px; flex: 0 0 auto;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 130px; }
+  /* Takes the rest, and may use several lines of it. `min-width: 0` because a flex
+     item will otherwise refuse to shrink below its longest word and push the row
+     wider than the feed. */
+  .feed .m { color: var(--ink); white-space: pre-wrap; word-break: break-word;
+    flex: 1 1 auto; min-width: 0; }
   .feed .row.warn .m { color: var(--warn); }
   .feed .row.err .m { color: var(--bad); }
 
@@ -4835,13 +4849,7 @@ function drawLive(added) {
       const fresh = batch.length <= LIVE_ANIMATE;
       feed.insertAdjacentHTML("beforeend", batch.map((l) => liveRow(l, fresh)).join(""));
       appended = true;
-      // One splice rather than a removeChild per line: at three hundred lines a
-      // second the loop itself became the cost.
-      const over = feed.childElementCount - LIVE_MAX;
-      if (over > 0) {
-        const doomed = Array.prototype.slice.call(feed.children, 0, over);
-        for (const el of doomed) el.remove();
-      }
+      trimFeed(feed);
     }
   } else {
     feed.innerHTML = LIVE_LINES.filter(shown).slice(-LIVE_MAX).map(liveRow).join("");
@@ -4852,6 +4860,31 @@ function drawLive(added) {
   // Only when something moved. Reading scrollHeight forces layout, and doing it
   // on every poll of an idle feed is a measurable cost for no effect.
   if (appended && !LIVE_HELD) glideToBottom();
+}
+
+// Drop the oldest rows, without moving the ones still on screen.
+//
+// This was the jump, and it survived two attempts at smoothing the scroll because
+// it is not the scroll. Rows are removed from the *top*, and at that moment
+// scrollTop is deliberately not at its maximum - the glide needs the old position
+// to travel from. Shortening the content above the viewport while scrollTop stays
+// where it is slides every visible line up by exactly the height removed, and in
+// the steady state the amount removed equals the amount just added, so the jump
+// was the same size as the glide that then followed it.
+//
+// Taking that height back out of scrollTop leaves the visible lines exactly where
+// they were. It matters just as much when the reader is holding the feed still:
+// they are parked reading something, and without this every trim yanks it upward.
+function trimFeed(feed) {
+  const over = feed.childElementCount - LIVE_MAX;
+  if (over <= 0) return;
+  const before = feed.scrollHeight;
+  // Collected first: removing from a live HTMLCollection while iterating it skips
+  // every other row.
+  for (const el of Array.prototype.slice.call(feed.children, 0, over)) {
+    el.remove();
+  }
+  feed.scrollTop -= before - feed.scrollHeight;
 }
 
 // The cheap part of a redraw, safe to call on a poll that changed nothing.
@@ -4904,12 +4937,19 @@ function liveGesture() {
   cancelGlide();
 }
 
-// How far a glide will travel before it gives up and jumps, in pixels.
+// Longest a glide may take, in milliseconds.
 //
-// Gliding across a burst of two hundred lines either takes long enough that the
-// next batch has already landed, or moves fast enough to be a blur - neither of
-// which is smoother than simply being there. Roughly two screens.
-const LIVE_GLIDE_MAX = 900;
+// A cap on *time*, not on distance. The first attempt capped the distance and
+// jumped past it, which on this fleet meant the glide never ran at all: one
+// firewall delivers a couple of hundred lines per poll, and two hundred rows is
+// nearly four thousand pixels, far outside any sane distance limit. So every
+// batch took the jump path and the smoothing was invisible.
+//
+// Bounding the duration instead lets a large batch move quickly rather than
+// instantly, which is exactly what a busy `tail -f` looks like and reads as flow.
+// Below the poll interval, so a glide finishes before the next batch lands - and if
+// one does land early, it simply retargets from wherever this had got to.
+const LIVE_GLIDE_MS = 1700;
 
 /// Ease the feed down to the bottom instead of snapping to it.
 ///
@@ -4928,15 +4968,16 @@ function glideToBottom() {
     feed.scrollTop = to;
     LIVE_GLIDING = false;
   };
-  // Nothing to do, too far to be worth watching, or movement was declined.
-  if (dist <= 1 || dist > LIVE_GLIDE_MAX || REDUCED_MOTION) {
+  // Nothing to do, or movement was declined.
+  if (dist <= 1 || REDUCED_MOTION) {
     settle();
     return;
   }
 
-  // Long enough to read as movement, short enough to finish before the next
-  // poll, and proportional in between so one new line is not as slow as thirty.
-  const ms = Math.max(140, Math.min(380, dist * 1.6));
+  // Proportional to the distance, so one new line is not as slow as thirty, and
+  // clamped at both ends: long enough to register as movement, and never past the
+  // ceiling above however far it has to go.
+  const ms = Math.max(140, Math.min(LIVE_GLIDE_MS, dist * 1.6));
   const mine = ++LIVE_GLIDE;
   const started = performance.now();
   LIVE_GLIDING = true;
@@ -4945,8 +4986,16 @@ function glideToBottom() {
     // A newer glide, or a gesture, has taken over.
     if (mine !== LIVE_GLIDE) return;
     const t = Math.min(1, (now - started) / ms);
-    // Ease out: quick to start moving, unhurried as it arrives.
-    feed.scrollTop = from + dist * (1 - Math.pow(1 - t, 3));
+    // Constant speed for a stream, eased for a trickle.
+    //
+    // Easing out decelerates hard at the end of every batch, and when batches
+    // arrive back to back that is a pulse - fast, slow, fast, slow - which is
+    // the opposite of flow. A long distance means lines are pouring in, and the
+    // natural way to read that is at a steady rate. A short one means a handful
+    // arrived on a quiet fleet, where settling into place looks considered
+    // rather than mechanical.
+    const eased = dist > 600 ? t : 1 - Math.pow(1 - t, 3);
+    feed.scrollTop = from + dist * eased;
     if (t < 1) {
       requestAnimationFrame(step);
     } else {
