@@ -720,7 +720,6 @@ const INDEX: &str = r##"<!doctype html>
           </select>
           <span class="msg" id="live-count"></span>
         </div>
-        <div id="live-missed"></div>
         <div class="feed" id="live-feed" onscroll="liveScrolled()"
           onwheel="liveGesture()" ontouchmove="liveGesture()" onmousedown="liveGesture()"
           onkeydown="liveGesture()" tabindex="0"></div>
@@ -4749,23 +4748,29 @@ const REDUCED_MOTION = typeof matchMedia === "function"
 // so its cost is paid sixty times a second rather than once.
 const LIVE_MAX = 400;
 
-// One row per frame, and the queue depth past which lines are skipped rather than
-// shown.
+// The queue is drained at the rate it filled, spread over the poll interval.
 //
-// One, not four. A row is about nineteen pixels, so four of them is a
-// seventy-six-pixel hop - and a browser's own smooth scrolling moves ten to thirty
-// pixels a frame. Four per frame judders whether or not the frames are being hit;
-// one per frame is a step small enough to read as motion.
+// Draining it as fast as possible was still chunky, and one row per *frame* is not
+// the same as one row at a *time*: five lines arriving would empty in eighty
+// milliseconds and then nothing would move for the rest of the two seconds. Burst,
+// pause, burst, pause - which is what a chunk is, just a smaller one.
 //
-// The price is a ceiling: sixty rows a second is all that can be shown. This fleet
-// can exceed that - one firewall's resolver alone will - and the honest response is
-// to stay current and say what was skipped, because a feed running a minute behind
-// is worth less than one that admits it dropped something. Filtering is the real
-// answer to a firehose, and lines are filtered before they are queued, so narrowing
-// to warnings makes the skipping stop rather than merely hiding it.
-const LIVE_PER_FRAME = 1;
+// So each poll sets a rate - the lines it brought, divided by the interval they
+// arrived over - and every frame emits however many rows that rate has earned
+// since the last one, carrying the fraction forward. Four lines in two seconds
+// becomes one row every five hundred milliseconds; a hundred and twenty becomes one
+// per frame. The feed then moves continuously and at the speed the fleet is actually
+// talking, which is the thing that reads as live.
+const LIVE_POLL_MS = 2000;
+// Most rows one frame may emit, however far behind it is. Beyond a couple the step
+// is large enough to judder, and a row is about nineteen pixels.
+const LIVE_PER_FRAME_MAX = 2;
 const LIVE_QUEUE_MAX = 400;
 let LIVE_SKIPPED = 0;
+// Rows per millisecond, and the fraction of a row owed but not yet emitted.
+let LIVE_RATE = 0;
+let LIVE_DUE = 0;
+let LIVE_FRAME_AT = 0;
 // liveCount touches the DOM, so it is not run on every frame - four times a second
 // is faster than anyone reads a counter.
 let LIVE_COUNTED = 0;
@@ -4835,6 +4840,10 @@ async function pollLive() {
     LIVE_QUEUE.splice(0, LIVE_QUEUE.length - LIVE_QUEUE_MAX);
   }
   whoOptions();
+  // Spread whatever just arrived across the interval it arrived over. Anything
+  // still queued from last time is included, so a feed that has fallen behind
+  // catches up rather than stretching the backlog out forever.
+  LIVE_RATE = LIVE_QUEUE.length / LIVE_POLL_MS;
   startDrip();
 }
 
@@ -4865,8 +4874,27 @@ function dripLive() {
     return;
   }
 
+  const now = performance.now();
+  // First frame of a drip, or one after a long gap - a hidden tab stops firing
+  // frames, and treating the whole gap as owed rows would dump the backlog in one
+  // step, which is the burst this exists to avoid.
+  const dt = LIVE_FRAME_AT && now - LIVE_FRAME_AT < 250 ? now - LIVE_FRAME_AT : 16;
+  LIVE_FRAME_AT = now;
+  LIVE_DUE += dt * LIVE_RATE;
+
+  // Clamp first, then pay down only what is actually emitted. Subtracting the whole
+  // debt and then clamping would forget the difference - rows dropped without being
+  // drawn and without being counted, which is the one outcome this file is not
+  // allowed to have. Carrying the debt instead lets the queue grow, and the queue's
+  // own ceiling does the skipping where it can be seen and reported.
+  const want = Math.min(Math.floor(LIVE_DUE), LIVE_PER_FRAME_MAX);
+  if (want > 0) LIVE_DUE -= want;
+  // Bounded so a long stretch of being behind cannot bank an unpayable debt that
+  // then floods the feed the moment the rate drops.
+  LIVE_DUE = Math.min(LIVE_DUE, LIVE_PER_FRAME_MAX * 4);
+
   const feed = $("live-feed");
-  const take = LIVE_QUEUE.splice(0, LIVE_PER_FRAME);
+  const take = want > 0 ? LIVE_QUEUE.splice(0, want) : [];
   if (take.length) {
     feed.insertAdjacentHTML("beforeend", take.map((l) => liveRow(l, true)).join(""));
     // Exactly one forced layout per frame, at the end.
@@ -4883,7 +4911,6 @@ function dripLive() {
   }
   // Not every frame: it writes to the DOM, and the numbers in it are not worth a
   // layout sixty times a second.
-  const now = performance.now();
   if (now - LIVE_COUNTED > LIVE_COUNT_MS) {
     LIVE_COUNTED = now;
     liveCount();
@@ -4892,6 +4919,11 @@ function dripLive() {
   if (LIVE_QUEUE.length) {
     LIVE_RAF = requestAnimationFrame(dripLive);
   } else {
+    // Drained. Reset the pacing so the next poll starts from rest rather than
+    // inheriting a rate and a fraction from the last one.
+    LIVE_RATE = 0;
+    LIVE_DUE = 0;
+    LIVE_FRAME_AT = 0;
     liveCount();
   }
 }
@@ -5009,32 +5041,38 @@ function trimFeed(feed, compensate) {
   if (compensate) feed.scrollTop -= before - feed.scrollHeight;
 }
 
-// The counters and the notes, cheap enough to call on every frame.
+// The counter line. One line of text beside the controls, and no banner.
+//
+// The dropped-line counts used to be a bordered note above the feed, which was two
+// things wrong at once: it is the least interesting thing on the card, and putting
+// it there pushed the feed down the moment it appeared - a layout shift in the one
+// place on this page that is supposed to hold still. Here it is a clause in a line
+// that was already present, with the explanation on hover for anyone who wants it.
 function liveCount() {
-  const feed = $("live-feed");
-  const behind = LIVE_QUEUE.length ? `, ${LIVE_QUEUE.length} arriving` : "";
-  $("live-count").textContent = LIVE_LINES.length
-    ? `${feed.childElementCount} shown, ${LIVE_LINES.length} held${behind}`
-    : "";
-  const notes = [];
-  if (LIVE_MISSED) {
-    notes.push(`${LIVE_MISSED} line(s) arrived faster than this page collected them and are no
-      longer in the portal's window. They are still in the per-sender files above; only this
-      view lost them.`);
+  const el = $("live-count");
+  if (!LIVE_LINES.length) {
+    el.textContent = "";
+    el.title = "";
+    return;
   }
-  if (LIVE_SKIPPED) {
-    // Actionable, not just a count: the skipping is a rate problem, and the filter
-    // is the lever. Lines are filtered before they are queued, so narrowing this
-    // view genuinely stops the skipping rather than hiding it.
-    notes.push(`${LIVE_SKIPPED} line(s) skipped. This shows about sixty lines a second, which
-      is as fast as anything is readable, and more than that is arriving &mdash; so it is
-      staying current rather than falling behind. Narrow it to one machine, or to
-      warnings and worse, and nothing will be skipped. Everything is still in the
-      per-sender files above.`);
-  }
-  setHTML($("live-missed"), notes.map((t) => `<div class="step">
-      <div class="note" style="border-color:var(--warn)">${t}</div>
-    </div>`).join(""));
+  const bits = [`${$("live-feed").childElementCount} shown`, `${LIVE_LINES.length} held`];
+  if (LIVE_QUEUE.length) bits.push(`${LIVE_QUEUE.length} arriving`);
+  if (LIVE_SKIPPED) bits.push(`${LIVE_SKIPPED} skipped`);
+  if (LIVE_MISSED) bits.push(`${LIVE_MISSED} missed`);
+  el.textContent = bits.join(" \u00b7 ");
+  el.title = [
+    "shown: rows on screen. held: lines this page is keeping.",
+    LIVE_QUEUE.length ? "arriving: queued, being drawn in as they came." : "",
+    LIVE_SKIPPED
+      ? "skipped: more is arriving than can be read, so the view stays current"
+        + " instead of falling behind. Narrow it to one machine or to warnings and"
+        + " worse and nothing will be skipped."
+      : "",
+    LIVE_MISSED
+      ? "missed: lines left the portal's window before this page collected them."
+      : "",
+    "Everything is in the per-sender files above either way.",
+  ].filter((x) => x).join("\n");
 }
 
 // ---------------------------------------------------------------------------
