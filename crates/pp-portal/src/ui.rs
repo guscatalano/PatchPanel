@@ -292,27 +292,38 @@ const INDEX: &str = r##"<!doctype html>
   .feed .row.warn .m { color: var(--warn); }
   .feed .row.err .m { color: var(--bad); }
 
-/* A line materialises as it lands. Only opacity, and deliberately brief.
-     The movement belongs to the feed growing a row at a time underneath the
-     viewport (see dripLive) - this just stops each row appearing as a hard edge.
-     Opacity and transform are the two things that animate without forcing layout,
-     which matters here because the drip keeps a few dozen of these in flight at
-     once; animating height instead would be a layout pass per row per frame. */
-  @keyframes live-in {
-    from { opacity: 0; transform: translateX(-12px); }
-    to   { opacity: 1; transform: none; }
+/* A new line is lit as it lands, and then cools. Nothing moves.
+     The feed is already moving vertically as rows arrive, so an entrance that also
+     moves is a second motion per row on top of the column's own - which at fifteen
+     lines a second is noise rather than information. Lighting the row instead says
+     the one thing worth saying about a new line, which is that it is new, and it
+     stays legible at rates where a slide or a blur would smear.
+
+     The tint is on a pseudo-element whose opacity is animated, rather than on the
+     row's own background. Two reasons, both of which bite the obvious version:
+     a filled animation outranks normal declarations, so animating the row's
+     background and retaining the end state would override `.row:hover` on every
+     row that had ever flashed; and background is a paint property while opacity is
+     composited, which matters when the drip keeps several dozen of these in flight
+     at once. The overlay takes no pointer events, so hover still works during the
+     flash as well as after it. */
+  @keyframes live-cool {
+    from { opacity: 1; }
+    to   { opacity: 0; }
   }
-  /* Long enough to actually see. At 150ms it was technically a fade and visually
-     nothing. Sideways rather than upward: the feed is already moving vertically as
-     rows arrive, and a row rising into a rising column is two motions describing
-     one event - going in from the left is unambiguous about which is which.
-     Opacity and transform are the only two properties that animate without forcing
-     layout, which is what makes it affordable a couple of dozen times over. */
-  .feed .row.fresh { animation: live-in 400ms cubic-bezier(.16,.84,.26,1) both; }
-  /* Somebody who has asked for less movement is reading a log, of all things,
-     precisely to find something - so this one is not decoration to insist on. */
+  .feed .row.fresh { position: relative; }
+  .feed .row.fresh::after {
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    box-shadow: inset 3px 0 0 var(--accent);
+    animation: live-cool 1100ms ease-out forwards;
+  }
+  /* Somebody who asked for less movement is reading a log, of all things, precisely
+     to find something - so this is not decoration to insist on. `display: none`
+     rather than `animation: none`: without the animation the overlay would simply
+     sit at full opacity and every row would stay highlighted forever. */
   @media (prefers-reduced-motion: reduce) {
-    .feed .row.fresh { animation: none; }
+    .feed .row.fresh::after { display: none; }
   }
 
   /* Full screen. The feed takes whatever is left after the heading and controls,
