@@ -161,14 +161,7 @@ fn plan(scan: &DiscoveryScan, exclude: &[String], full: bool) -> Vec<String> {
             .join(",")
     };
 
-    // SSH is dropped from the quiet pass, and only from that pass: a banner grab on
-    // port 22 is the thing OpenSSH penalises, and it is the whole reason the quiet
-    // pass exists.
-    let tcp: Vec<u16> = if full {
-        scan.ports.clone()
-    } else {
-        scan.ports.iter().copied().filter(|p| *p != 22).collect()
-    };
+    let tcp = &scan.ports;
     if tcp.is_empty() && scan.udp_ports.is_empty() {
         return Vec::new();
     }
@@ -177,11 +170,11 @@ fn plan(scan: &DiscoveryScan, exclude: &[String], full: bool) -> Vec<String> {
     // without one it refuses the whole scan - so the plain list is both simpler and
     // one less thing to get wrong in the common case.
     let ports = if scan.udp_ports.is_empty() {
-        list(&tcp)
+        list(tcp)
     } else if tcp.is_empty() {
         format!("U:{}", list(&scan.udp_ports))
     } else {
-        format!("T:{},U:{}", list(&tcp), list(&scan.udp_ports))
+        format!("T:{},U:{}", list(tcp), list(&scan.udp_ports))
     };
 
     // `-Pn` because half the point of this is embedded hardware, and a device that
@@ -192,12 +185,27 @@ fn plan(scan: &DiscoveryScan, exclude: &[String], full: bool) -> Vec<String> {
     // nothing displayed a name - but a PTR record is somebody having already
     // written down what a machine is, and that is the cheapest identification on
     // offer. nmap resolves only the hosts that answered, in parallel.
-    let mut args: Vec<String> = ["-oX", "-", "-Pn", "--open", "-sV", "--version-light"]
+    let mut args: Vec<String> = ["-oX", "-", "-Pn", "--open"]
         .iter()
         .map(|s| s.to_string())
         .collect();
 
     if full {
+        // Version detection is the only part of a scan that talks to the service
+        // rather than to the port, and therefore the only part anything logs or
+        // objects to. On the hosts nobody has accounted for it is the whole point -
+        // it is what turns "22 is open" into "Dropbear sshd 2025.89". On the hosts
+        // we already know it buys nothing and costs us a banner grab that OpenSSH
+        // penalises and an empty HTTP request that Proxmox's proxy records as a
+        // client problem, once an hour, forever.
+        //
+        // Leaving it off is also what lets the quiet pass keep every port including
+        // 22: a SYN scan never completes the handshake, so the service is never
+        // spoken to at all. The first version of this dropped port 22 instead,
+        // which stopped the penalties but also lost "22 is open" on our own
+        // machines - solving it in the wrong place.
+        args.push("-sV".into());
+        args.push("--version-light".into());
         // OS fingerprinting needs raw sockets, and the agent runs as root on Linux.
         // It costs time and returns a guess rather than a fact, which is why the
         // accuracy is carried alongside the name everywhere it is shown.
@@ -903,14 +911,14 @@ mod tests {
         assert_eq!(hosts[0].services.len(), 2);
     }
 
-    /// The quiet pass must not ask SSH to identify itself, and must still ask
-    /// everything else.
+    /// The quiet pass asks which ports are open and nothing else.
     ///
-    /// Dropping 22 outright, or skipping the pass, would each be wrong in a way
-    /// that is invisible: the first loses the open-port list for every machine in
-    /// the fleet, and the second silently stops reporting them at all.
+    /// The two wrong ways to do this are both invisible once shipped: skipping those
+    /// hosts loses the open-port list for every machine in the fleet, and dropping
+    /// individual ports loses whether those ports are open while still talking to
+    /// every other one.
     #[test]
-    fn the_quiet_pass_drops_only_ssh() {
+    fn the_quiet_pass_asks_for_port_state_only() {
         let scan = DiscoveryScan {
             cidr: "192.168.6.0/24".into(),
             ports: vec![22, 80, 443, 8006],
@@ -925,12 +933,13 @@ mod tests {
         assert!(full.contains(&"-O".to_string()));
         assert!(full.contains(&"--script".to_string()));
 
+        // Every port, 22 included: without version detection nothing is spoken to,
+        // so there is no reason to give up knowing whether the port is open.
         let quiet = plan(&scan, &[], false);
-        assert!(quiet.contains(&"80,443,8006".to_string()), "{quiet:?}");
-        // Still a version scan - a controller's web port is worth naming.
-        assert!(quiet.contains(&"-sV".to_string()));
-        // But not fingerprinting or scripting something we already have an agent
-        // on or an API for.
+        assert!(quiet.contains(&"22,80,443,8006".to_string()), "{quiet:?}");
+        // Port state only. Each of these three is a conversation with the service,
+        // and a conversation is the thing that gets logged and penalised.
+        assert!(!quiet.contains(&"-sV".to_string()));
         assert!(!quiet.contains(&"-O".to_string()));
         assert!(!quiet.contains(&"--script".to_string()));
     }

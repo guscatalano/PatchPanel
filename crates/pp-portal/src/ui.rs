@@ -417,6 +417,19 @@ const INDEX: &str = r##"<!doctype html>
   .job .facts { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 4px; }
   .job .facts b { font-family: var(--mono); font-weight: 500; }
   .job .when { text-align: right; white-space: nowrap; }
+  /* Two weeks at a glance. Days are equal width so the shape of a schedule -
+     nightly, weekly, nothing - is visible without reading any of it. */
+  .cal { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; margin: 12px 14px; }
+  .cal .day { border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px;
+    min-height: 74px; background: color-mix(in srgb, var(--panel) 45%, transparent); }
+  .cal .day.today { border-color: var(--accent); }
+  .cal .day.past { opacity: .45; }
+  .cal .d { font-size: 11px; color: var(--muted); }
+  .cal .d b { color: var(--ink); font-size: 13px; }
+  .cal .ev { font-size: 11.5px; margin-top: 4px; padding: 2px 5px; border-radius: 5px;
+    background: color-mix(in srgb, var(--accent) 22%, transparent); white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; }
+  .cal .ev.none { background: color-mix(in srgb, var(--muted) 18%, transparent); }
   .devgrid { display: grid; gap: 12px; margin: 12px 14px;
     grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); }
   .dev { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px;
@@ -640,6 +653,16 @@ const INDEX: &str = r##"<!doctype html>
           <span><em style="border-top-style:dotted"></em> a job elsewhere checked in</span>
           <span><em class="next"></em> next occurrence</span>
         </div>
+      </div>
+
+      <div class="card">
+        <h2>What is due</h2>
+        <div class="step">
+          <div class="msg">The next two weeks, in this portal's local time. A pool only acts on
+            machines that have something to install, so a day with a run on it is not
+            necessarily a day anything happens.</div>
+        </div>
+        <div id="pool-calendar" class="cal"></div>
       </div>
 
       <div id="pool-list"></div>
@@ -3732,8 +3755,72 @@ async function forgetJob(name) {
   }
 }
 
+// Every time a schedule fires between two dates.
+//
+// The portal only reports the next occurrence; a calendar needs all of them,
+// and the rule is simple enough to walk day by day rather than inventing a
+// second implementation of it on the server.
+function occurrences(schedule, from, days) {
+  if (!schedule || schedule.kind === "manual") return [];
+  const out = [];
+  for (let i = 0; i < days; i++) {
+    const d = new Date(from);
+    d.setDate(d.getDate() + i);
+    if (schedule.kind === "weekly") {
+      // dow 0 is Monday, as people say it; getDay() has Sunday at 0.
+      const mondayFirst = (d.getDay() + 6) % 7;
+      if (mondayFirst !== schedule.dow) continue;
+    }
+    d.setHours(schedule.hour, schedule.minute, 0, 0);
+    out.push(new Date(d));
+  }
+  return out;
+}
+
+function renderCalendar(pools) {
+  const DAYS = 14;
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+
+  // Bucket every pool's firings by the day they land on.
+  const byDay = new Map();
+  for (const p of pools) {
+    if (p.scope === "none") continue;
+    for (const at of occurrences(p.schedule, start, DAYS)) {
+      const key = at.toDateString();
+      if (!byDay.has(key)) byDay.set(key, []);
+      byDay.get(key).push({ at, pool: p });
+    }
+  }
+
+  const now = new Date();
+  const cells = [];
+  for (let i = 0; i < DAYS; i++) {
+    const day = new Date(start);
+    day.setDate(day.getDate() + i);
+    const events = (byDay.get(day.toDateString()) || []).sort((a, b) => a.at - b.at);
+    const isToday = day.toDateString() === now.toDateString();
+
+    cells.push(`<div class="day${isToday ? " today" : ""}">
+      <div class="d">${day.toLocaleDateString(undefined, { weekday: "short" })}
+        <b>${day.getDate()}</b></div>
+      ${events.map((e) => {
+        const time = e.at.toTimeString().slice(0, 5);
+        const done = e.at < now;
+        const members = e.pool.members.length;
+        return `<div class="ev${done ? " none" : ""}"
+          title="${esc(e.pool.name)} &mdash; ${time}, ${members} machine(s), ${esc(e.pool.scope)}${
+            e.pool.reboot === "if-needed" ? ", may reboot" : ", no reboot"}">
+          ${time} ${esc(e.pool.name)}</div>`;
+      }).join("")}
+    </div>`);
+  }
+  setHTML($("pool-calendar"), cells.join(""));
+}
+
 async function loadPools() {
   const pools = await api("/api/pools");
+  renderCalendar(pools);
   // The past is a separate question from the schedule, and a separate query.
   let past = [];
   try { past = await api("/api/schedule"); } catch (e) { past = []; }
