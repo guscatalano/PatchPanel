@@ -269,7 +269,12 @@ const INDEX: &str = r##"<!doctype html>
     font-family: var(--mono); font-size: 12px; line-height: 1.5; }
   /* The row wraps; the message inside it keeps its own spacing. `pre` on the row
      would stop it wrapping at all and put the scrollbar back. */
+  /* `contain` tells the browser a row's layout cannot affect anything outside it,
+     so appending one at the bottom does not oblige it to reconsider the four
+     hundred above. This container is laid out once per frame while lines arrive,
+     which is the one place in this page where that distinction is worth having. */
   .feed .row { display: flex; gap: 8px; padding: 1px 8px; align-items: flex-start;
+    contain: layout style;
     border-bottom: 1px solid color-mix(in srgb, var(--line) 35%, transparent); }
   .feed .row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
   .feed .t { color: var(--muted); white-space: nowrap; }
@@ -4739,21 +4744,32 @@ const REDUCED_MOTION = typeof matchMedia === "function"
 // a chatty firewall fills that in about two minutes - at which point the whole tab
 // is slow, not just this card. What scrolls off here is still in the per-sender
 // files, so keeping less costs nearly nothing and keeping more costs the page.
-const LIVE_MAX = 800;
+// Halved when the rows were allowed to wrap: wrapped text has to be measured to be
+// laid out, and this container is laid out once per frame while lines are arriving,
+// so its cost is paid sixty times a second rather than once.
+const LIVE_MAX = 400;
 
-// Rows added per frame, and the queue length above which the feed stops trying to
-// show every line.
+// One row per frame, and the queue depth past which lines are skipped rather than
+// shown.
 //
-// At sixty frames a second, four per frame is two hundred and forty lines a
-// second, which is comfortably more than this fleet produces - so in practice the
-// queue drains as fast as it fills and the delay between a line arriving and being
-// seen stays under a second. The ceiling is for the pathological case: if
-// something starts emitting thousands of lines a second, dripping them all would
-// put the feed minutes behind the truth, which is worse than admitting it skipped
-// some. LIVE_SKIPPED says so on screen.
-const LIVE_PER_FRAME = 4;
-const LIVE_QUEUE_MAX = 1200;
+// One, not four. A row is about nineteen pixels, so four of them is a
+// seventy-six-pixel hop - and a browser's own smooth scrolling moves ten to thirty
+// pixels a frame. Four per frame judders whether or not the frames are being hit;
+// one per frame is a step small enough to read as motion.
+//
+// The price is a ceiling: sixty rows a second is all that can be shown. This fleet
+// can exceed that - one firewall's resolver alone will - and the honest response is
+// to stay current and say what was skipped, because a feed running a minute behind
+// is worth less than one that admits it dropped something. Filtering is the real
+// answer to a firehose, and lines are filtered before they are queued, so narrowing
+// to warnings makes the skipping stop rather than merely hiding it.
+const LIVE_PER_FRAME = 1;
+const LIVE_QUEUE_MAX = 400;
 let LIVE_SKIPPED = 0;
+// liveCount touches the DOM, so it is not run on every frame - four times a second
+// is faster than anyone reads a counter.
+let LIVE_COUNTED = 0;
+const LIVE_COUNT_MS = 250;
 
 function toggleLive() {
   LIVE_ON = !LIVE_ON;
@@ -4801,9 +4817,14 @@ async function pollLive() {
     return;
   }
 
+  // Held unfiltered, queued filtered. LIVE_LINES is what a filter change
+  // re-renders from, so it has to keep everything; the queue is what will actually
+  // be drawn, so filtering here means a narrowed view does not spend its sixty rows
+  // a second on lines it is going to discard - and stops skipping entirely.
+  const shown = liveFilter();
   for (const l of r.lines) {
     LIVE_LINES.push(l);
-    LIVE_QUEUE.push(l);
+    if (shown(l)) LIVE_QUEUE.push(l);
     if (!LIVE_WHO.includes(l.who)) LIVE_WHO.push(l.who);
   }
   if (LIVE_LINES.length > LIVE_MAX) LIVE_LINES.splice(0, LIVE_LINES.length - LIVE_MAX);
@@ -4845,17 +4866,33 @@ function dripLive() {
   }
 
   const feed = $("live-feed");
-  const shown = liveFilter();
-  const take = LIVE_QUEUE.splice(0, LIVE_PER_FRAME).filter(shown);
+  const take = LIVE_QUEUE.splice(0, LIVE_PER_FRAME);
   if (take.length) {
     feed.insertAdjacentHTML("beforeend", take.map((l) => liveRow(l, true)).join(""));
-    trimFeed(feed);
+    // Exactly one forced layout per frame, at the end.
+    //
+    // Reading scrollHeight makes the browser lay the container out there and then.
+    // This used to do it three times a frame - twice inside the trim and once to
+    // pin - and laying out four hundred wrapped rows three times per frame is how
+    // a feed ends up dropping the frames it is trying to animate. The trim's
+    // compensation is only needed when the reader is holding the feed still;
+    // while following, pinning to the bottom straight afterwards makes the
+    // position right regardless of what the trim did to it.
+    trimFeed(feed, LIVE_HELD);
     pinLive(feed);
   }
-  liveCount();
+  // Not every frame: it writes to the DOM, and the numbers in it are not worth a
+  // layout sixty times a second.
+  const now = performance.now();
+  if (now - LIVE_COUNTED > LIVE_COUNT_MS) {
+    LIVE_COUNTED = now;
+    liveCount();
+  }
 
   if (LIVE_QUEUE.length) {
     LIVE_RAF = requestAnimationFrame(dripLive);
+  } else {
+    liveCount();
   }
 }
 
@@ -4873,7 +4910,7 @@ function flushLive() {
   LIVE_QUEUE = [];
   if (take.length) {
     feed.insertAdjacentHTML("beforeend", take.map((l) => liveRow(l, false)).join(""));
-    trimFeed(feed);
+    trimFeed(feed, LIVE_HELD);
     pinLive(feed);
   }
   liveCount();
@@ -4958,16 +4995,18 @@ function drawLive() {
 // removed. Taking that height back out of scrollTop leaves them still. It matters
 // as much when the reader is holding the feed: they are parked reading something,
 // and without this every trim yanks it upward.
-function trimFeed(feed) {
+function trimFeed(feed, compensate) {
   const over = feed.childElementCount - LIVE_MAX;
   if (over <= 0) return;
-  const before = feed.scrollHeight;
+  // Two forced layouts, so only paid when it changes the outcome: while following,
+  // the pin immediately afterwards decides the position anyway.
+  const before = compensate ? feed.scrollHeight : 0;
   // Collected first: removing from a live HTMLCollection while iterating it skips
   // every other row.
   for (const el of Array.prototype.slice.call(feed.children, 0, over)) {
     el.remove();
   }
-  feed.scrollTop -= before - feed.scrollHeight;
+  if (compensate) feed.scrollTop -= before - feed.scrollHeight;
 }
 
 // The counters and the notes, cheap enough to call on every frame.
@@ -4984,8 +5023,14 @@ function liveCount() {
       view lost them.`);
   }
   if (LIVE_SKIPPED) {
-    notes.push(`${LIVE_SKIPPED} line(s) were skipped to keep this view current rather than
-      letting it fall minutes behind. They are in the files above.`);
+    // Actionable, not just a count: the skipping is a rate problem, and the filter
+    // is the lever. Lines are filtered before they are queued, so narrowing this
+    // view genuinely stops the skipping rather than hiding it.
+    notes.push(`${LIVE_SKIPPED} line(s) skipped. This shows about sixty lines a second, which
+      is as fast as anything is readable, and more than that is arriving &mdash; so it is
+      staying current rather than falling behind. Narrow it to one machine, or to
+      warnings and worse, and nothing will be skipped. Everything is still in the
+      per-sender files above.`);
   }
   setHTML($("live-missed"), notes.map((t) => `<div class="step">
       <div class="note" style="border-color:var(--warn)">${t}</div>
