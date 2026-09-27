@@ -318,13 +318,11 @@ const INDEX: &str = r##"<!doctype html>
     box-shadow: inset 3px 0 0 var(--accent);
     animation: live-cool 1100ms ease-out forwards;
   }
-  /* Somebody who asked for less movement is reading a log, of all things, precisely
-     to find something - so this is not decoration to insist on. `display: none`
-     rather than `animation: none`: without the animation the overlay would simply
-     sit at full opacity and every row would stay highlighted forever. */
-  @media (prefers-reduced-motion: reduce) {
-    .feed .row.fresh::after { display: none; }
-  }
+  /* Deliberately not behind prefers-reduced-motion. Nothing here moves, scales or
+     travels - it is a tint that stops being there - and that is the class of change
+     reduced motion is explicitly not asking anyone to remove. Hiding it also cost
+     the feature its whole point on those machines: the highlight is what marks a
+     line as one you have not read, which is information rather than ornament. */
 
   /* Full screen. The feed takes whatever is left after the heading and controls,
      rather than keeping its fixed height and leaving the rest of the screen
@@ -4782,12 +4780,6 @@ let LIVE_STOPPED = false;
 let LIVE_GESTURE = 0;
 let LIVE_SET_TO = -1;
 
-// Whether the reader has asked for less movement. Read once: it is consulted on
-// every frame, and a media query lookup per frame is work for an answer that
-// almost never changes.
-const REDUCED_MOTION = typeof matchMedia === "function"
-  && matchMedia("(prefers-reduced-motion: reduce)").matches;
-
 // What this window keeps.
 //
 // Far smaller than the portal's ring on purpose. Every line is five elements once
@@ -4904,11 +4896,14 @@ async function pollLive() {
 
 function startDrip() {
   if (LIVE_RAF !== null) return;
-  // Somebody who asked for less movement gets the lines, just not the pacing.
-  if (REDUCED_MOTION) {
-    flushLive();
-    return;
-  }
+  // No reduced-motion exemption here, and there used to be one, which was a
+  // mistake worth recording. It sent the whole batch straight to the DOM instead -
+  // so on a machine with animation effects turned off, every pacing fix in this
+  // file was bypassed and the feed arrived in exactly the lumps the pacing exists
+  // to prevent. The lines appearing at the rate they were logged is what this view
+  // *is*; the scrolling of a tail is essential to a tail, not decoration applied to
+  // one. What reduced motion should switch off is movement added on top, and after
+  // the entrance became a colour change there is none of that left.
   LIVE_RAF = requestAnimationFrame(dripLive);
 }
 
