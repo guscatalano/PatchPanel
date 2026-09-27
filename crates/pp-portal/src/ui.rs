@@ -252,19 +252,10 @@ const INDEX: &str = r##"<!doctype html>
   td.svc { max-width: 300px; }
   td.what { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
 
-  /* One row of senders, above the controls rather than inside them: it is the
-     thing most often changed and it grows with the fleet, so it gets its own line
-     instead of pushing the filter box around as machines come and go. */
-  .live-picks { display: flex; gap: 6px 14px; align-items: center; flex-wrap: wrap;
-    padding: 0 14px 8px; font-size: 12.5px; }
-  .live-picks label { display: inline-flex; gap: 5px; align-items: center;
-    cursor: pointer; color: var(--muted); white-space: nowrap; }
-  /* A selected sender is named in full colour; an unselected one recedes, so the
-     row reads as "these ones" at a glance rather than needing the boxes checked. */
-  .live-picks label.on { color: var(--ink); }
-  .live-picks .sep { color: var(--line); }
-  .live-picks a { color: var(--accent); text-decoration: none; }
-  .live-picks a:hover { text-decoration: underline; }
+  /* The tick that puts a sender in the live feed. On the row that already names
+     the sender, rather than in a second list of the same machines further down. */
+  .reading .pick { margin-right: 6px; vertical-align: -1px; }
+  .reading.off .k, .reading.off .v { opacity: .55; }
 
   .live-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
     padding: 0 14px 10px; }
@@ -743,6 +734,11 @@ const INDEX: &str = r##"<!doctype html>
             day, in one plain file per sender &mdash; this is not an archive, it is
             the context you read when something looks wrong.</div>
         </div>
+        <div class="step">
+          <div class="msg">Ticked senders appear in the live view below &mdash;
+            <a href="#" onclick="pickAll(true);return false">all</a> /
+            <a href="#" onclick="pickAll(false);return false">none</a></div>
+        </div>
         <div id="log-silent"></div>
         <div id="log-senders"></div>
         <div class="empty" id="log-empty" hidden></div>
@@ -762,7 +758,6 @@ const INDEX: &str = r##"<!doctype html>
             again. This is a window on the last few thousand lines, not the archive
             &mdash; the per-sender files above are the record.</div>
         </div>
-        <div class="live-picks" id="live-picks"></div>
         <div class="live-controls">
           <input id="live-filter" placeholder="filter&hellip;" oninput="drawLive()"
             title="Show only lines containing this text. Applies to what has already arrived as well as what comes next.">
@@ -4089,6 +4084,15 @@ async function loadLogs() {
     <span class="msg">asked, silent</span>
   </div>`).join(""));
 
+  // Seeded from the senders the portal actually has, not from what has happened to
+  // arrive since the page opened, so a machine that is merely quiet is ticked and
+  // waiting rather than absent.
+  LIVE_SENDERS = (d.senders || []).map((s) => s.device || s.source);
+  if (!LIVE_PICK_SEEDED && LIVE_SENDERS.length) {
+    LIVE_SENDERS.forEach((w) => LIVE_PICK.add(w));
+    LIVE_PICK_SEEDED = true;
+  }
+
   setHTML($("log-senders"), (d.senders || []).map((s) => {
     // What is being kept, and who decided the level. Both belong on the row:
     // "42 lines" means something different at `warning` than at `info`, and a
@@ -4096,8 +4100,15 @@ async function loadLogs() {
     const level = s.set_here
       ? `<b>${esc(s.min_severity)}</b> and worse, set here`
       : `level set on the device`;
-    return `<div class="reading">
-      <span class="k">${esc(s.device || "unknown sender")}</span>
+    // The live feed labels a line by the resolved owner where there is one and by
+    // the address otherwise, so the tick has to key on the same thing or it would
+    // select a name the feed never uses.
+    const who = s.device || s.source;
+    const on = LIVE_PICK.has(who);
+    return `<div class="reading${on ? "" : " off"}">
+      <span class="k"><input type="checkbox" class="pick" ${on ? "checked" : ""}
+          title="Show this sender in the live view below."
+          onchange="pickLive(this, ${jsq(who)})">${esc(s.device || "unknown sender")}</span>
       <span class="v">${esc(s.source)}</span>
       <span class="since">${(s.lines || 0).toLocaleString()} lines &middot; ${size(s.bytes)} &middot; ${
         s.last_line_at ? ago(s.last_line_at) : "quiet"}
@@ -4979,13 +4990,14 @@ async function pollLive() {
   const shown = liveFilter();
   for (const l of r.lines) {
     LIVE_LINES.push(l);
-    // Selected on first sight, before the filter is applied to it - a sender seen
-    // for the first time has to get into the picker and into the feed, or the first
-    // lines from a machine that has just started talking are lost to a list that
-    // did not know about it.
     if (!LIVE_WHO.includes(l.who)) {
       LIVE_WHO.push(l.who);
-      LIVE_PICK.add(l.who);
+      // Ticked on first sight only if the reader has never been offered it - that
+      // is, it has no file yet and so was not in the list above. A sender that has
+      // been offered and deliberately unticked while quiet must stay unticked when
+      // it finally speaks, or the choice would be silently undone by the very
+      // event it was made about.
+      if (!LIVE_SENDERS.includes(l.who)) LIVE_PICK.add(l.who);
     }
     if (shown(l)) LIVE_QUEUE.push(l);
   }
@@ -4996,7 +5008,6 @@ async function pollLive() {
     LIVE_SKIPPED += LIVE_QUEUE.length - LIVE_QUEUE_MAX;
     LIVE_QUEUE.splice(0, LIVE_QUEUE.length - LIVE_QUEUE_MAX);
   }
-  whoBoxes();
   // Spread whatever just arrived across the interval it arrived over. Anything
   // still queued from last time is included, so a feed that has fallen behind
   // catches up rather than stretching the backlog out forever.
@@ -5121,51 +5132,32 @@ function pinLive(feed) {
 
 // ---------------------------------------------------------------------------
 
-// Keep the sender row in step without disturbing a choice already made.
-//
-// Rebuilt only when the set of senders changes, not on every poll: this sits above
-// a feed that must hold still, and replacing it four times a second would both
-// flicker and steal focus from a box being clicked.
-let LIVE_PICKS_DRAWN = "";
-
-function whoBoxes() {
-  const names = LIVE_WHO.slice().sort();
-  const key = names.join("\u0000");
-  if (key === LIVE_PICKS_DRAWN) return;
-
-  const wrote = setHTML($("live-picks"), names.length
-    ? names.map((w) => `<label class="${LIVE_PICK.has(w) ? "on" : ""}">
-        <input type="checkbox" ${LIVE_PICK.has(w) ? "checked" : ""}
-          onchange="pickLive(this, ${jsq(w)})"> ${esc(w)}</label>`).join("")
-      + `<span class="sep">|</span>
-         <a href="#" onclick="pickAll(true);return false">all</a>
-         <a href="#" onclick="pickAll(false);return false">none</a>`
-    : "");
-  // Only remember it as drawn if it actually was. setHTML declines while somebody
-  // is typing into this card, and recording the key regardless would mean a sender
-  // that first appeared during that moment never got a box at all.
-  if (wrote) LIVE_PICKS_DRAWN = key;
-}
-
-// The element is passed in so the row does not have to be rebuilt to restyle one
-// label. Rebuilding would also move focus, which makes the row unusable from the
-// keyboard - tab to a box, press space, and the box you were on is gone.
+// The element is passed in so the row does not have to be re-rendered to restyle
+// one of them. Re-rendering would also move focus, which makes the list unusable
+// from the keyboard - tab to a box, press space, and the box you were on has gone.
 function pickLive(box, who) {
   if (box.checked) {
     LIVE_PICK.add(who);
   } else {
     LIVE_PICK.delete(who);
   }
-  const label = box.closest("label");
-  if (label) label.classList.toggle("on", box.checked);
+  const row = box.closest(".reading");
+  if (row) row.classList.toggle("off", !box.checked);
   drawLive();
 }
 
+// Every sender PatchPanel has a file for, whether it has said anything lately or
+// not. Distinct from LIVE_WHO, which only knows the senders that have actually sent
+// a line since this page was opened - a quiet machine still deserves a tick it can
+// be waiting on.
+let LIVE_SENDERS = [];
+// Whether the selection has been seeded. Everything starts ticked; without the flag
+// a poll would keep re-ticking what the reader had just turned off.
+let LIVE_PICK_SEEDED = false;
+
 function pickAll(on) {
-  LIVE_PICK = on ? new Set(LIVE_WHO) : new Set();
-  // Every box changes, so this one is a genuine rebuild.
-  LIVE_PICKS_DRAWN = "";
-  whoBoxes();
+  LIVE_PICK = on ? new Set(LIVE_SENDERS) : new Set();
+  loadLogs();
   drawLive();
 }
 
