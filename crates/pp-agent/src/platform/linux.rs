@@ -1827,6 +1827,8 @@ fn parse_pve(text: &str, kind: &str) -> Vec<Guest> {
             state,
             managed: false,
             last_backup: None,
+            // Portal-derived; an agent only ever reports what it observed.
+            backup_unverified: false,
         });
     }
     out

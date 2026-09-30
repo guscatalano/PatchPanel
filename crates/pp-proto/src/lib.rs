@@ -250,6 +250,20 @@ pub struct Guest {
     /// rather than from a job claiming to have run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_backup: Option<DateTime<Utc>>,
+    /// True when `last_backup` is remembered rather than observed.
+    ///
+    /// Set by the portal, never by an agent. A host whose backup storage is
+    /// offline enumerates no archives, which is indistinguishable at the wire from
+    /// a guest that has genuinely never been backed up - and reporting the second
+    /// when the first is true is the worst mistake this product can make. It said
+    /// `never` for twenty-six guests while twelve terabytes of archives sat on an
+    /// unreachable NAS.
+    ///
+    /// So the portal keeps the last date it did observe and marks it unverified.
+    /// The date is still the most useful thing known; what changes is that nothing
+    /// downstream may treat it as current.
+    #[serde(default)]
+    pub backup_unverified: bool,
 }
 
 /// How a host's backups are going.

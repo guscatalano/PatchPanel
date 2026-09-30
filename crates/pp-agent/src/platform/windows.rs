@@ -355,6 +355,8 @@ pub async fn virtualization(p: &Progress) -> Option<Virtualization> {
                 state: g.state,
                 managed: false,
                 last_backup: None,
+                // Portal-derived; an agent only ever reports what it observed.
+                backup_unverified: false,
             })
             .collect(),
         note: String::new(),

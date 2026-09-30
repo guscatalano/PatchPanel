@@ -3226,6 +3226,7 @@ async function loadBackups() {
     tile(s.unprotected_running, "at risk", "bad") +
     tile(s.stale, "stale") +
     tile(s.never, "never") +
+    (s.unknown ? tile(s.unknown, "can't tell", "bad") : "") +
     (s.exempt ? tile(s.exempt, "not tracked") : "") +
     tile(s.jobs_running, "running") +
     tile(s.jobs_stuck, "stuck", "bad") +
@@ -3270,6 +3271,9 @@ async function loadBackups() {
       : g.status === "exempt"
       ? `<span class="pill" title="${esc(g.reason || "Deliberately not tracked.")}">not tracked</span>${
           g.last_backup ? ` <span class="msg">last ${ago(g.last_backup)}</span>` : ""}`
+      : g.status === "unknown"
+      ? `<span class="pill bad" title="The backup storage for this host cannot be read, so whether a current backup exists is unknown. The date is the last one actually seen - it is not a confirmation.">can't tell</span>
+         <span class="msg">last seen ${ago(g.last_backup)}</span>${cadence}`
       : g.status === "fresh"
         ? `<span class="pill ok">${ago(g.last_backup)}</span>${cadence}`
         : g.status === "stale"

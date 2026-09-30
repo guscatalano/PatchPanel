@@ -909,6 +909,10 @@ struct BackupSummary {
     fresh: usize,
     stale: usize,
     never: usize,
+    /// Had a backup once and the storage cannot currently be read, so whether it
+    /// still has one is unknown. Counted apart from `never` because conflating the
+    /// two is how a page ends up claiming nothing has ever been backed up.
+    unknown: usize,
     /// Deliberately not backed up.
     exempt: usize,
     /// Running guests with no recent backup: the number that matters.
@@ -1058,7 +1062,10 @@ pub fn at_risk_guests(state: &SharedState) -> Vec<crate::attention::RiskyGuest> 
             let age = g
                 .last_backup
                 .map(|t| now.signed_duration_since(t).num_days());
-            if age.is_some_and(|d| d <= window) {
+            // Unreadable storage is a problem, but it is a different problem from a
+            // missing backup, and saying the wrong one sends somebody to look in the
+            // wrong place. It gets a row either way - see `why` below.
+            if age.is_some_and(|d| d <= window) && !g.backup_unverified {
                 continue;
             }
             at_risk.push(crate::attention::RiskyGuest {
@@ -1069,9 +1076,17 @@ pub fn at_risk_guests(state: &SharedState) -> Vec<crate::attention::RiskyGuest> 
                     g.name.clone()
                 },
                 kind: format!("{} {}", g.kind, g.id),
-                why: match age {
-                    Some(d) => format!("last backup {d} days ago, wanted every {window}"),
-                    None => "never backed up".into(),
+                why: match (g.backup_unverified, age) {
+                    // The honest sentence. It names what is broken - the storage -
+                    // rather than blaming the guest for a gap nobody can confirm.
+                    (true, Some(d)) => format!(
+                        "backup storage cannot be read; last one seen {d} days ago"
+                    ),
+                    (true, None) => "backup storage cannot be read".into(),
+                    (false, Some(d)) => {
+                        format!("last backup {d} days ago, wanted every {window}")
+                    }
+                    (false, None) => "never backed up".into(),
                 },
             });
         }
@@ -1120,6 +1135,11 @@ async fn backups(State(state): State<SharedState>) -> ApiResult<Json<BackupsResp
                 // Not tracking it is a decision about the guest, not about the
                 // backup, so it wins over how old the last one is.
                 (0, _) => "exempt",
+                // Remembered rather than observed. Deliberately not "fresh" even
+                // when the remembered date is recent: the whole point is that the
+                // storage could not be read, and a green row would be the same lie
+                // in a different colour.
+                (_, Some(_)) if g.backup_unverified => "unknown",
                 // A snooze only silences a gap; it never makes a fresh backup
                 // look stale, and it never hides one that is fine anyway.
                 (w, Some(t)) if now.signed_duration_since(t).num_days() <= w => "fresh",
@@ -1133,9 +1153,14 @@ async fn backups(State(state): State<SharedState>) -> ApiResult<Json<BackupsResp
                 "fresh" => summary.fresh += 1,
                 "stale" => summary.stale += 1,
                 "exempt" => summary.exempt += 1,
+                "unknown" => summary.unknown += 1,
                 _ => summary.never += 1,
             }
             let running = g.state.to_lowercase().starts_with("running");
+            // `unknown` is not counted here on purpose. This number means "running
+            // and demonstrably unprotected", and a guest whose storage cannot be
+            // read is not demonstrably anything - it earns its own row saying the
+            // storage is unreadable, which is the thing to go and fix.
             if running && matches!(status, "stale" | "never") {
                 summary.unprotected_running += 1;
             }

@@ -1073,8 +1073,53 @@ impl Db {
     /// taking that at face value wiped every device off the page after each
     /// deploy. An empty list is "not asked yet", not "nothing is there"; each
     /// report carries its own `checked_at`, so a stale one says so honestly.
+/// Keep the last backup date we actually observed for any guest now reporting none.
+///
+/// Absence of news is not news. A host whose backup storage has gone unreadable
+/// enumerates no archives, which on the wire is identical to a guest that has never
+/// been backed up - and reporting the second when the first is true is the worst
+/// mistake this product can make. It claimed `never` for twenty-six guests while
+/// twelve terabytes of archives sat on an unreachable NAS.
+///
+/// The remembered date is kept because it is still the most useful thing known, and
+/// flagged so that nothing downstream may treat it as current.
+fn carry_backups(
+    guests: &mut [pp_proto::Guest],
+    before: &std::collections::HashMap<String, DateTime<Utc>>,
+) {
+    for g in guests.iter_mut() {
+        if g.last_backup.is_some() {
+            continue;
+        }
+        if let Some(was) = before.get(&g.id) {
+            g.last_backup = Some(*was);
+            g.backup_unverified = true;
+        }
+    }
+}
+
     pub fn store_inventory(&self, id: AgentId, inv: &Inventory) -> Result<()> {
         let mut inv = inv.clone();
+        // Backup dates carry forward for the same reason device results do:
+        // absence of news is not news. A guest that reported a date and now reports
+        // none has almost certainly had its storage go unreadable, not had every
+        // archive deleted - and the second reading, `never backed up`, is both
+        // false and quieter than the truth.
+        if let Some(virt) = inv.virt.as_mut() {
+            if virt.guests.iter().any(|g| g.last_backup.is_none()) {
+                let before = self
+                    .inventory(id)?
+                    .and_then(|p| p.virt)
+                    .map(|v| {
+                        v.guests
+                            .into_iter()
+                            .filter_map(|g| g.last_backup.map(|t| (g.id, t)))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Self::carry_backups(&mut virt.guests, &before);
+            }
+        }
         if inv.devices.is_empty() || inv.discovered.is_empty() || inv.swept_at.is_none() {
             if let Some(prev) = self.inventory(id)? {
                 if inv.devices.is_empty() {
@@ -1993,4 +2038,65 @@ fn parse_time(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
         .unwrap_or_else(|_| DateTime::UNIX_EPOCH)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn guest(id: &str, last: Option<DateTime<Utc>>) -> pp_proto::Guest {
+        pp_proto::Guest {
+            id: id.into(),
+            name: id.into(),
+            kind: "qemu".into(),
+            state: "running".into(),
+            managed: false,
+            last_backup: last,
+            backup_unverified: false,
+        }
+    }
+
+    /// The bug this exists for: storage goes unreadable, every guest reports no
+    /// archives, and the page announces that nothing has ever been backed up.
+    #[test]
+    fn an_unreadable_storage_does_not_become_never_backed_up() {
+        let seen = Utc::now() - chrono::Duration::days(11);
+        let before: std::collections::HashMap<String, DateTime<Utc>> =
+            [("101".to_string(), seen)].into_iter().collect();
+
+        let mut guests = vec![guest("101", None)];
+        Db::carry_backups(&mut guests, &before);
+
+        assert_eq!(guests[0].last_backup, Some(seen), "the date must be kept");
+        assert!(guests[0].backup_unverified, "and marked as not current");
+    }
+
+    /// A fresh observation is the truth and must not be overwritten or flagged -
+    /// otherwise a working fleet would permanently read as unverified.
+    #[test]
+    fn an_observed_date_is_left_alone() {
+        let old = Utc::now() - chrono::Duration::days(30);
+        let now = Utc::now();
+        let before: std::collections::HashMap<String, DateTime<Utc>> =
+            [("101".to_string(), old)].into_iter().collect();
+
+        let mut guests = vec![guest("101", Some(now))];
+        Db::carry_backups(&mut guests, &before);
+
+        assert_eq!(guests[0].last_backup, Some(now));
+        assert!(!guests[0].backup_unverified);
+    }
+
+    /// A guest we have never had a date for stays `never`. That reading is correct
+    /// and must survive the fix - a new template with no backups is not a storage
+    /// fault, and blurring the two would trade one wrong answer for another.
+    #[test]
+    fn a_genuinely_new_guest_stays_never() {
+        let before = std::collections::HashMap::new();
+        let mut guests = vec![guest("999", None)];
+        Db::carry_backups(&mut guests, &before);
+
+        assert_eq!(guests[0].last_backup, None);
+        assert!(!guests[0].backup_unverified);
+    }
 }
